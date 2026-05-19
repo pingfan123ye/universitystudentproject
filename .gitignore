@@ -1,0 +1,14 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+*.db
+*.db-journal
+.env
+.DS_Store
+Thumbs.db
+*.mp3
+*.wav
+*.mp4
+.reasonix/sessions/
+_test_approval.py

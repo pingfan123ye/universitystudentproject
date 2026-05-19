@@ -1,0 +1,89 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&family=DM+Serif+Display&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-root: #08060d;
+  --bg-surface: #0f0b1a;
+  --bg-elevated: #15102a;
+  --bg-card: rgba(21, 16, 42, 0.7);
+  --text-primary: #e8e0f0;
+  --text-secondary: #a098b8;
+  --text-muted: #5c5078;
+  --border-subtle: rgba(255, 255, 255, 0.05);
+  --border-card: rgba(255, 255, 255, 0.07);
+  --accent-amber: #a78bfa;
+  --accent-blue: #818cf8;
+  --accent-green: #6ee7b7;
+  --glow-amber: rgba(167, 139, 250, 0.15);
+  --glow-blue: rgba(129, 140, 248, 0.1);
+  --radius-sm: 10px;
+  --radius-md: 16px;
+  --radius-lg: 24px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  background: var(--bg-root);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+#root {
+  width: 100%;
+  height: 100vh;
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+/* 毛玻璃卡片 */
+@layer components {
+  .glass {
+    background: rgba(22, 22, 31, 0.6);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .glass-elevated {
+    background: rgba(28, 28, 40, 0.75);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  }
+}
+
+/* 紫光 */
+.dot-amber {
+  box-shadow: 0 0 8px rgba(167, 139, 250, 0.6), 0 0 20px rgba(167, 139, 250, 0.2);
+}
+
+/* 文字渐变 */
+.text-gradient-amber {
+  background: linear-gradient(135deg, #a78bfa, #c4b5fd);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
