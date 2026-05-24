@@ -3,7 +3,7 @@
 
 路由路径:
   reasonix  → 编程/工作助手
-  xiaoai    → 设备控制/音乐/场景（小爱可完成）
+  xiaoai    → 设备控制/音乐/场景
   info_query → 信息查询（天气/新闻/百科等，进双引擎调度）
   mixed     → 混合意图（拆分子任务分别路由）
   llm       → 大模型兜底（含强制走大模型）
@@ -34,7 +34,7 @@ FORCE_LLM_PREFIX = [
 
 
 def _check_force_llm(text: str) -> bool:
-    """用户明确要求不要小爱，直接走大模型"""
+    """用户明确要求直接走大模型"""
     for p in FORCE_LLM_PREFIX:
         if p.search(text):
             return True
@@ -75,7 +75,7 @@ def _check_reasonix(text: str) -> RouteDecision | None:
 
 
 # ═══════════════════════════════════════
-# 小爱能力定义
+# 设备控制能力定义
 # ═══════════════════════════════════════
 
 DEVICE_ACTIONS_BY_TYPE = {
@@ -118,7 +118,7 @@ VOLUME_KEYWORDS = ["音量", "大声", "小声", "静音", "声音"]
 
 SCENE_KEYWORDS = ["离家模式", "回家模式", "晚安", "起床模式", "观影模式", "阅读模式"]
 
-# 小爱可处理的基础查询（仅保留虚拟设备能回答的）
+# 设备可处理的基础查询
 XIAOAI_QUERY = ["时间", "几点"]
 XIAOAI_UTILITY = ["闹钟", "提醒", "倒计时", "计时"]
 
@@ -215,7 +215,7 @@ def _is_info_query(text: str) -> bool:
 
 def _detect_mixed(text: str) -> RouteDecision | None:
     """
-    检测混合意图：既有小爱操作，又有信息查询/创作需求。
+    检测混合意图：既有设备操作，又有信息查询/创作需求。
     例如："写首诗然后播放音乐" → 拆分
          "打开灯帮我查一下明天天气" → 拆分
     """
@@ -230,10 +230,10 @@ def _detect_mixed(text: str) -> RouteDecision | None:
     is_creative = any(kw in text for kw in ["写", "创作", "生成", "画", "编", "作曲"])
 
     if has_xiaoai and (is_info or is_creative) and has_connector:
-        # 拆分：小爱部分 + 大模型部分
+        # 拆分：设备部分 + 大模型部分
         sub_tasks = []
 
-        # 小爱子任务
+        # 设备子任务
         xiaoai_task = {
             "path": "xiaoai",
             "device_actions": device,
@@ -249,7 +249,7 @@ def _detect_mixed(text: str) -> RouteDecision | None:
         return RouteDecision(
             path="mixed",
             confidence=0.8,
-            reason="混合意图: 小爱+大模型",
+            reason="混合意图: 设备+大模型",
             sub_tasks=sub_tasks,
             device_actions=device,
             music_action=music,
@@ -259,7 +259,7 @@ def _detect_mixed(text: str) -> RouteDecision | None:
 
 
 # ═══════════════════════════════════════
-# 小爱检测（纯设备/音乐/场景）
+# 设备检测（纯设备/音乐/场景）
 # ═══════════════════════════════════════
 
 def _check_xiaoai(text: str) -> RouteDecision | None:
@@ -285,7 +285,7 @@ def _check_xiaoai(text: str) -> RouteDecision | None:
             music_action=music,
         )
 
-    # 小爱能回答的简单查询
+    # 设备能回答的简单查询
     for kw in XIAOAI_QUERY:
         if kw in text:
             return RouteDecision(path="xiaoai", confidence=0.5, reason=f"查询: {kw}", matched_key="查询")
@@ -307,8 +307,8 @@ def classify(text: str) -> RouteDecision:
     路由顺序:
       1. 强制走大模型前缀 → llm (force_llm=True)
       2. Reasonix 编程任务 → reasonix
-      3. 混合意图（既有小爱又有大模型需求）→ mixed
-      4. 小爱可执行 → xiaoai
+      3. 混合意图（既有设备又有大模型需求）→ mixed
+      4. 设备可执行 → xiaoai
       5. 信息查询（天气/百科等，进双引擎）→ info_query
       6. 大模型兜底 → llm
     """
@@ -333,7 +333,7 @@ def classify(text: str) -> RouteDecision:
     if d:
         return d
 
-    # 4. 小爱（用户没要求走大模型）
+    # 4. 设备（用户没要求走大模型）
     d = _check_xiaoai(text)
     if d:
         return d

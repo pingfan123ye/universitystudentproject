@@ -5,7 +5,7 @@ const pathBadge: Record<string, string> = {
   reasonix: 'bg-teal-100 text-teal-700', cache: 'bg-green-100 text-green-700',
 };
 const pathLabel: Record<string, string> = {
-  xiaoai: '小爱', llm: 'AI', reasonix: 'Reasonix', cache: '缓存',
+  xiaoai: '小智', llm: 'AI', reasonix: 'Reasonix', cache: '缓存',
 };
 
 // 模型标签映射
@@ -14,7 +14,7 @@ const modelLabel: Record<string, string> = {
   'deepseek:deepseek-v4-pro': 'DeepSeek',
   'ollama:qwen2.5:7b': 'Qwen',
   'ollama:qwen2.5:14b': 'Qwen',
-  xiaoai: '小爱', reasonix: 'Reasonix', cache: '缓存',
+  xiaoai: '小智', reasonix: 'Reasonix', cache: '缓存',
 };
 const modelColor: Record<string, string> = {
   'deepseek:deepseek-v4-flash': 'bg-green-100 text-green-700',

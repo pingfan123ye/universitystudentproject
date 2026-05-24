@@ -110,7 +110,7 @@ async def lifespan(app: FastAPI):
     banner = f"""
 ========================================
   智能音箱后端 v{APP_VERSION}
-  三道路由: 小爱 | 大模型 | Reasonix
+  三道路由: 设备 | 大模型 | Reasonix
 ========================================
 """
     print(banner)
@@ -558,7 +558,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 "message": "我记住了这个对话习惯，下次可以直接回答",
                             })
 
-                # ===== 路径 A：小爱先尝试 =====
+                # ===== 路径 A：设备控制 =====
                 if decision.path == "xiaoai":
                     result = xiaoai_execute(
                         virtual_home=virtual_home,
@@ -578,9 +578,9 @@ async def websocket_endpoint(ws: WebSocket):
                             await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
                         continue
                     else:
-                        # 小爱无法处理 → 直接调大模型
-                        logger.info(f"小爱无法处理，直接调用大模型: {text[:50]}")
-                        await ws.send_json({"type": "route", "path": "llm", "reason": "小爱无法处理，转交大模型"})
+                        # 设备无法处理 → 直接调大模型
+                        logger.info(f"设备无法处理，直接调用大模型: {text[:50]}")
+                        await ws.send_json({"type": "route", "path": "llm", "reason": "设备无法处理，转交大模型"})
                         await call_llm(text, "llm")
                         continue
 
@@ -592,13 +592,13 @@ async def websocket_endpoint(ws: WebSocket):
                     await call_llm(text, "llm", auto_search=True)
                     continue
 
-                # ===== 路径 C：混合意图（先小爱后大模型） =====
+                # ===== 路径 C：混合意图（先设备后大模型） =====
                 if decision.path == "mixed":
                     await ws.send_json({
                         "type": "route", "path": "mixed",
                         "reason": "混合意图，拆分子任务执行",
                     })
-                    # 1. 先执行小爱部分
+                    # 1. 先执行设备部分
                     for sub in decision.sub_tasks:
                         if sub["path"] == "xiaoai":
                             sub_result = xiaoai_execute(

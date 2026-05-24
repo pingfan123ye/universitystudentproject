@@ -1,5 +1,5 @@
 """
-小爱服务封装 —— 虚拟设备执行 + 音乐控制 + 场景
+设备控制服务 —— 虚拟设备执行 + 音乐控制 + 场景
 """
 from models.virtual_home import VirtualHome
 

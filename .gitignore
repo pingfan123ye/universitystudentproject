@@ -11,6 +11,7 @@ Thumbs.db
 *.wav
 *.mp4
 .reasonix/sessions/
+.reasonix/config.json
 _test_approval.py
 备份/
 备份*

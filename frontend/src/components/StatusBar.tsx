@@ -18,7 +18,7 @@ const statusMap: Record<ConnectionStatus, { label: string; cls: string }> = {
 };
 
 const pathBadge: Record<string, { text: string; cls: string }> = {
-  xiaoai:  { text: '小爱', cls: 'bg-blue-100 text-blue-700' },
+  xiaoai:  { text: '小智', cls: 'bg-blue-100 text-blue-700' },
   llm:     { text: 'AI', cls: 'bg-purple-100 text-purple-700' },
   reasonix:{ text: 'Reasonix', cls: 'bg-teal-100 text-teal-700' },
   cache:   { text: '缓存', cls: 'bg-green-100 text-green-700' },
