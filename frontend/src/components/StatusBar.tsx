@@ -1,42 +1,53 @@
 import { ConnectionStatus } from '../hooks/useWebSocket';
 import { RoutePath } from '../types';
+import { useTheme } from '../hooks/useTheme';
+import { FiSun, FiMoon, FiBell, FiBellOff } from 'react-icons/fi';
 
 interface StatusBarProps {
   status: ConnectionStatus;
   modelName?: string;
   lastPath?: RoutePath;
+  alertsEnabled?: boolean;
+  onToggleAlerts?: (enabled: boolean) => void;
 }
 
-const statusMap: Record<ConnectionStatus, { label: string; dot: string }> = {
-  connected:    { label: '在线', dot: 'bg-accent-green dot-amber' },
-  connecting:   { label: '连接中', dot: 'bg-accent-amber animate-breathe' },
-  disconnected: { label: '离线', dot: 'bg-accent-rose' },
+const statusMap: Record<ConnectionStatus, { label: string; cls: string }> = {
+  connected:    { label: '在线', cls: 'bg-green-400' },
+  connecting:   { label: '连接中', cls: 'bg-yellow-400 animate-pulse' },
+  disconnected: { label: '离线', cls: 'bg-red-400' },
 };
 
-const pathLabels: Record<string, { text: string; bg: string; textColor: string }> = {
-  xiaoai:  { text: '小爱', bg: 'bg-blue-500/10', textColor: 'text-blue-400' },
-  llm:     { text: 'AI', bg: 'bg-purple-500/10', textColor: 'text-purple-400' },
-  reasonix:{ text: 'Reasonix', bg: 'bg-teal-500/10', textColor: 'text-teal-400' },
-  cache:   { text: '缓存', bg: 'bg-green-500/10', textColor: 'text-green-400' },
-  unknown: { text: '--', bg: 'bg-white/5', textColor: 'text-gray-500' },
+const pathBadge: Record<string, { text: string; cls: string }> = {
+  xiaoai:  { text: '小爱', cls: 'bg-blue-100 text-blue-700' },
+  llm:     { text: 'AI', cls: 'bg-purple-100 text-purple-700' },
+  reasonix:{ text: 'Reasonix', cls: 'bg-teal-100 text-teal-700' },
+  cache:   { text: '缓存', cls: 'bg-green-100 text-green-700' },
+  unknown: { text: '--', cls: 'bg-gray-100 text-gray-500' },
 };
 
-export default function StatusBar({ status, modelName = 'Qwen2.5:7B', lastPath = 'unknown' }: StatusBarProps) {
+export default function StatusBar({ status, modelName = 'Qwen2.5:7B', lastPath = 'unknown', alertsEnabled = true, onToggleAlerts }: StatusBarProps) {
   const s = statusMap[status];
-  const p = pathLabels[lastPath] || pathLabels.unknown;
+  const p = pathBadge[lastPath] || pathBadge.unknown;
+  const { theme, toggle } = useTheme();
 
   return (
-    <header className="flex items-center gap-3 px-5 py-2.5 border-b border-white/5 bg-surface-1/80 backdrop-blur-xl text-xs">
-      <span className={`inline-block w-2 h-2 rounded-full ${s.dot}`} />
-      <span className="font-medium text-white/80 tracking-wide">{s.label}</span>
-      <span className="text-white/10">·</span>
-      <span className="text-white/40 font-mono text-[11px]">{modelName}</span>
-      <span className="text-white/10">·</span>
-      <span className={`px-2 py-0.5 rounded-full text-[11px] font-medium ${p.bg} ${p.textColor}`}>
-        {p.text}
-      </span>
+    <header className="flex items-center gap-3 px-5 py-2 text-xs font-medium border-b" style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)', color: 'var(--text-primary)' }}>
+      <span className={`inline-block w-2 h-2 rounded-full ${s.cls}`} />
+      <span style={{ color: 'var(--text-secondary)' }}>{s.label}</span>
+      <span style={{ color: 'var(--border-strong)' }}>|</span>
+      <span className="font-mono text-[11px]" style={{ color: 'var(--text-muted)' }}>{modelName}</span>
+      <span style={{ color: 'var(--border-strong)' }}>|</span>
+      <span className={`px-2 py-0.5 rounded text-[11px] font-medium ${p.cls}`}>{p.text}</span>
       <div className="flex-1" />
-      <span className="text-white/20 text-[11px] tracking-widest uppercase">Voice Hub</span>
+      {onToggleAlerts && (
+        <button onClick={() => onToggleAlerts(!alertsEnabled)} className="flex items-center gap-1 px-2 py-1 rounded hover:opacity-80 transition-opacity" style={{ color: alertsEnabled ? 'var(--accent)' : 'var(--text-muted)' }} title={alertsEnabled ? '关闭提醒' : '开启提醒'}>
+          {alertsEnabled ? <FiBell size={14} /> : <FiBellOff size={14} />}
+        </button>
+      )}
+      <button onClick={toggle} className="flex items-center gap-1 px-2 py-1 rounded hover:opacity-80 transition-opacity" style={{ color: 'var(--accent)' }} title={theme === 'dark' ? '切换浅色' : '切换深色'}>
+        {theme === 'dark' ? <FiSun size={14} /> : <FiMoon size={14} />}
+      </button>
+      <span className="tracking-widest text-[10px]" style={{ color: 'var(--text-muted)' }}>VOICE HUB</span>
     </header>
   );
 }

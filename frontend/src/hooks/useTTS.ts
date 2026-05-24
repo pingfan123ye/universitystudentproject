@@ -8,15 +8,16 @@ interface TTSOptions {
 }
 
 export function useTTS(options: TTSOptions = {}) {
-  const { lang = 'zh-CN', rate = 1.0, pitch = 1.0, volume = 1.0 } = options;
+  const { lang = 'zh-CN', rate = 1.05, pitch = 1.0, volume = 1.0 } = options;
   const [speaking, setSpeaking] = useState(false);
   const [autoSpeak, setAutoSpeak] = useState(true);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const isSupported =
     typeof window !== 'undefined' && 'speechSynthesis' in window;
 
-  // 等待语音列表加载（某些浏览器异步加载）
+  // ===== 浏览器 SpeechSynthesis（降级方案） =====
   const getVoices = useCallback((): Promise<SpeechSynthesisVoice[]> => {
     return new Promise((resolve) => {
       const voices = window.speechSynthesis.getVoices();
@@ -30,58 +31,99 @@ export function useTTS(options: TTSOptions = {}) {
     });
   }, []);
 
-  // 选择最佳中文语音
   const pickVoice = useCallback(async (): Promise<SpeechSynthesisVoice | null> => {
     const voices = await getVoices();
-    // 优先级：简体中文 > 台湾中文 > 任何含中文的
     const priorities = ['zh-CN', 'zh-Hans', 'zh-TW', 'zh-HK', 'zh'];
-    for (const lang of priorities) {
-      const match = voices.find((v) => v.lang.startsWith(lang));
+    for (const l of priorities) {
+      const match = voices.find((v) => v.lang.startsWith(l));
       if (match) return match;
     }
-    // 有些语音虽然标注为 zh-CN 但 lang 不同
-    const anyChinese = voices.find(
-      (v) => v.lang.includes('zh') || v.name.includes('Tingting') || v.name.includes('Yaoyao')
-    );
-    return anyChinese || null;
+    return voices.find((v) => v.lang.includes('zh')) || null;
   }, [getVoices]);
 
-  const speak = useCallback(async (text: string) => {
+  const speakBrowser = useCallback(async (text: string) => {
     if (!isSupported || !text.trim()) return;
-
-    // 先停掉当前正在播放的
     window.speechSynthesis.cancel();
-
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = lang;
     utterance.rate = rate;
     utterance.pitch = pitch;
     utterance.volume = volume;
-
     const voice = await pickVoice();
-    if (voice) {
-      utterance.voice = voice;
-    }
-
+    if (voice) utterance.voice = voice;
     utterance.onstart = () => setSpeaking(true);
     utterance.onend = () => setSpeaking(false);
     utterance.onerror = () => setSpeaking(false);
-
     utteranceRef.current = utterance;
     window.speechSynthesis.speak(utterance);
   }, [isSupported, lang, rate, pitch, volume, pickVoice]);
 
+  // ===== 后端 Edge TTS 音频播放（主力） =====
+  const playAudioBase64 = useCallback((base64: string) => {
+    try {
+      // 停止当前播放
+      window.speechSynthesis.cancel();
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+
+      const audio = new Audio();
+      audioRef.current = audio;
+
+      // base64 → blob → object URL
+      const byteChars = atob(base64);
+      const byteNums = new Array(byteChars.length);
+      for (let i = 0; i < byteChars.length; i++) {
+        byteNums[i] = byteChars.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNums);
+      const blob = new Blob([byteArray], { type: 'audio/mpeg' });
+      const url = URL.createObjectURL(blob);
+
+      audio.src = url;
+      audio.onended = () => {
+        setSpeaking(false);
+        URL.revokeObjectURL(url);
+        audioRef.current = null;
+      };
+      audio.onerror = () => {
+        setSpeaking(false);
+        URL.revokeObjectURL(url);
+        audioRef.current = null;
+      };
+      audio.oncanplay = () => {
+        audio.play().catch(() => setSpeaking(false));
+      };
+      setSpeaking(true);
+      audio.load();
+    } catch {
+      setSpeaking(false);
+    }
+  }, []);
+
+  // ===== 统一接口：优先后端 TTS，降级浏览器 =====
+  const speak = useCallback((text: string, backendAudio?: string) => {
+    if (!autoSpeak) return;
+    if (backendAudio) {
+      playAudioBase64(backendAudio);
+    } else {
+      speakBrowser(text);
+    }
+  }, [autoSpeak, playAudioBase64, speakBrowser]);
+
   const stop = useCallback(() => {
     window.speechSynthesis.cancel();
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
     setSpeaking(false);
   }, []);
 
   const toggleAutoSpeak = useCallback(() => {
     setAutoSpeak((prev) => {
-      if (prev) {
-        // 关闭自动播报，同时停止当前播放
-        stop();
-      }
+      if (prev) stop();
       return !prev;
     });
   }, [stop]);
@@ -93,5 +135,6 @@ export function useTTS(options: TTSOptions = {}) {
     speak,
     stop,
     toggleAutoSpeak,
+    playAudioBase64,
   };
 }

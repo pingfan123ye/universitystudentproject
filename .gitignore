@@ -12,3 +12,11 @@ Thumbs.db
 *.mp4
 .reasonix/sessions/
 _test_approval.py
+备份/
+备份*
+*.doc
+*.txt
+SAPI.txt
+config.js
+.mi.json
+frontend/public/music/*.mp3

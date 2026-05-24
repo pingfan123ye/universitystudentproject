@@ -1,0 +1,32 @@
+{
+  "default_mode": "local_only",
+  "timeout_seconds": 8,
+  "force_cloud_keywords": [
+    "搜索",
+    "查询",
+    "实时",
+    "今天",
+    "最新",
+    "股票",
+    "汇率",
+    "新闻",
+    "头条",
+    "热搜"
+  ],
+  "force_local_keywords": [
+    "我的密码",
+    "家里的",
+    "隐私",
+    "私密",
+    "保密",
+    "我的地址",
+    "我的电话",
+    "我的身份证"
+  ],
+  "cloud_model": "deepseek-v4-flash",
+  "local_model": "qwen2.5:7b",
+  "enable_search": true,
+  "search_provider": "duckduckgo",
+  "searxng_url": "",
+  "long_text_threshold": 0
+}

@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>MiGPT 家用智能音箱 — 发布会</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700&family=DM+Serif+Display:ital@0;1&display=swap" rel="stylesheet">
+<style>
+/* ═══ Reset ═══ */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;margin:0;padding:0;overflow:hidden}
+body{font-family:'Inter','PingFang SC','Microsoft YaHei',sans-serif;background:#080a0e;color:#e8e4e0;-webkit-font-smoothing:antialiased}
+
+/* ═══ 缩放容器 ═══ */
+.presentation{width:100vw;height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#080a0e}
+.stage{position:relative;overflow:hidden;background:radial-gradient(ellipse at 30% 50%, rgba(232,168,76,0.03) 0%, transparent 60%),radial-gradient(ellipse at 80% 20%, rgba(245,158,11,0.02) 0%, transparent 50%);font-size:clamp(14px,2.8vmin,32px);width:min(100vw,calc(100vh*16/9));height:min(100vh,calc(100vw*9/16))}
+.stage::before{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,0.008) 1px, transparent 1px),linear-gradient(90deg, rgba(255,255,255,0.008) 1px, transparent 1px);background-size:4em 4em;pointer-events:none;z-index:0}
+
+/* ═══ 幻灯片 ═══ */
+.slide{position:absolute;inset:0;display:flex;flex-direction:column;padding:2.5em 3em;opacity:0;transform:translateY(1.2em);transition:opacity 0.5s cubic-bezier(0.4,0,0.2,1),transform 0.5s cubic-bezier(0.4,0,0.2,1);overflow:hidden;z-index:1}
+.slide.active{opacity:1;transform:translateY(0);z-index:2}
+.slide.exit{opacity:0;transform:translateY(-0.8em);z-index:1}
+
+/* ═══ 背景层 ═══ */
+.slide-bg{position:absolute;inset:0;z-index:0;background:var(--bg,linear-gradient(135deg,#0a0c12,#0e1018))}
+.slide-bg::after{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 40em 30em at 30% 50%, rgba(232,168,76,0.04) 0%, transparent 60%),radial-gradient(ellipse 25em 25em at 80% 30%, rgba(245,158,11,0.02) 0%, transparent 50%);animation:ambGlow 6s ease-in-out infinite alternate;pointer-events:none}
+@keyframes ambGlow{0%{opacity:0.4}100%{opacity:1}}
+.slide-grid{position:absolute;inset:0;z-index:0;opacity:0.08;background-image:linear-gradient(rgba(255,255,255,0.006) 1px, transparent 1px),linear-gradient(90deg, rgba(255,255,255,0.006) 1px, transparent 1px);background-size:4em 4em;pointer-events:none}
+
+/* ═══ 导航 ═══ */
+.nav-btn{position:absolute;top:50%;z-index:10;transform:translateY(-50%);width:2.4em;height:2.4em;border-radius:50%;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.04);color:#5c5048;font-size:1em;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.3s;backdrop-filter:blur(0.6em)}
+.nav-btn:hover{background:rgba(232,168,76,0.08);border-color:rgba(232,168,76,0.12);color:#f0dca0;transform:translateY(-50%) scale(1.08)}
+.nav-btn:active{transform:translateY(-50%) scale(0.92)!important}
+.nav-btn.prev{left:1.2em}.nav-btn.next{right:1.2em}.nav-btn.hidden{opacity:0;pointer-events:none}
+
+/* ═══ 底部 ═══ */
+.bottom{position:absolute;bottom:0;left:0;right:0;z-index:10;height:3.5em;display:flex;align-items:center;justify-content:center;gap:0.15em;padding:0 1em;border-top:1px solid rgba(255,255,255,0.02);background:linear-gradient(0deg,rgba(10,12,18,0.95),transparent)}
+.nav-dot{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.08em;padding:0.25em 0.6em;cursor:pointer;font-size:0.6em;color:#3c3430;transition:all 0.25s;border-radius:0.4em;min-width:3.2em;position:relative;font-family:'Space Grotesk',sans-serif}
+.nav-dot:hover{color:#6c5c50;background:rgba(255,255,255,0.015)}
+.nav-dot.active{color:#e8c8a0}
+.nav-dot.active::after{content:'';position:absolute;top:-1px;left:20%;right:20%;height:1.5px;border-radius:1px;background:#e8a84c}
+.nav-dot .nd-label{font-size:0.7em;letter-spacing:0.02em;white-space:nowrap;font-family:'Inter',sans-serif}
+.nav-dot .nd-num{opacity:0.35;font-size:0.6em}
+.bot-desc{position:absolute;bottom:3em;left:50%;transform:translateX(-50%);z-index:10;padding:0.3em 0.8em;border-radius:0.3em;background:rgba(0,0,0,0.5);border:1px solid rgba(232,168,76,0.05);font-size:0.5em;color:#6c5c50;text-align:center;backdrop-filter:blur(0.6em);pointer-events:none;white-space:nowrap;opacity:0;transition:opacity 0.3s}
+.bot-desc.show{opacity:1}
+
+/* ═══ 内容样式 ═══ */
+.slide-content{position:relative;z-index:1;width:100%;height:100%;display:flex;flex-direction:column}
+.slide-label{font-family:'Space Grotesk',sans-serif;font-size:0.65em;font-weight:600;color:#e8a84c;letter-spacing:0.2em;text-transform:uppercase;margin-bottom:0.3em;flex-shrink:0}
+.slide-title{font-family:'DM Serif Display','Space Grotesk',serif;font-size:clamp(1.4em,3.2em,4em);font-weight:400;line-height:1.1;margin-bottom:0.15em;flex-shrink:0}
+.slide-desc{font-size:0.7em;color:#6c5c50;line-height:1.5;margin-bottom:0.5em;max-width:30em;flex-shrink:0}
+
+/* 入场动画 */
+.slide.active .anim-up{animation:fadeUp 0.4s ease both}
+.slide.active .anim-up-1{animation:fadeUp 0.4s ease 0.06s both}
+.slide.active .anim-up-2{animation:fadeUp 0.4s ease 0.12s both}
+.slide.active .anim-up-3{animation:fadeUp 0.4s ease 0.2s both}
+@keyframes fadeUp{from{opacity:0;transform:translateY(0.6em)}to{opacity:1;transform:translateY(0)}}
+
+/* ═══ 组件 ═══ */
+.card{border-radius:0.6em;background:linear-gradient(135deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.03);transition:all 0.3s;cursor:pointer;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(232,168,76,0.1),transparent);opacity:0;transition:opacity 0.3s}
+.card:hover{transform:translateY(-0.15em);border-color:rgba(232,168,76,0.06);box-shadow:0 0.4em 1.2em rgba(0,0,0,0.1)}
+.card:hover::before{opacity:1}.card:active{transform:translateY(-0.05em) scale(0.98)}
+.stat-card{border-radius:0.6em;background:linear-gradient(135deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.03);cursor:pointer;transition:all 0.3s;padding:0.6em 0.8em}
+.stat-card:hover{transform:translateY(-0.15em);border-color:rgba(232,168,76,0.08);box-shadow:0 0.4em 1.2em rgba(0,0,0,0.1)}
+.stat-card:active{transform:translateY(-0.05em) scale(0.97)}
+.stat-card .num{font-family:'Space Grotesk',sans-serif;font-size:clamp(0.8em,1.8em,2.4em);font-weight:700;line-height:1;display:inline-block}
+.stat-card .lbl{font-size:0.45em;color:#4c443c;text-transform:uppercase;letter-spacing:0.06em;margin-top:0.1em}
+.img-wrap{border-radius:0.5em;overflow:hidden;position:relative;transition:transform 0.4s ease;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.img-wrap img{max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain;padding:0.15em}
+.img-wrap::after{content:'';position:absolute;inset:0;border-radius:0.5em;background:radial-gradient(ellipse at center, transparent 55%, rgba(10,12,18,0.2) 100%);pointer-events:none;transition:opacity 0.3s}
+.img-wrap:hover{transform:scale(1.004)}.img-wrap:hover::after{opacity:0.4}.img-wrap:active{transform:scale(0.99)}
+.pbar{height:0.15em;border-radius:0.1em;background:rgba(255,255,255,0.02);overflow:hidden;margin:0.15em 0}
+.pfill{height:100%;border-radius:0.1em;background:linear-gradient(90deg,#e8a84c,#f59e0b);transition:width 1.2s cubic-bezier(0.4,0,0.2,1);position:relative}
+.pfill.shine::after{content:'';position:absolute;top:0;right:0;width:0.8em;height:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.2));border-radius:0.1em;animation:pshine 2s ease-in-out infinite}
+@keyframes pshine{0%,100%{opacity:0.3}50%{opacity:1}}
+.sdot{display:inline-block;width:0.3em;height:0.3em;border-radius:50%;margin-right:0.2em;vertical-align:middle}
+.sdot.green{background:#34d399;animation:spulse 1.5s ease-in-out infinite;box-shadow:0 0 0.25em rgba(52,211,153,0.3)}
+.sdot.gold{background:#e8a84c;animation:spulse 2.5s ease-in-out infinite;box-shadow:0 0 0.25em rgba(232,168,76,0.2)}
+@keyframes spulse{0%,100%{opacity:0.4;transform:scale(1)}50%{opacity:1;transform:scale(1.4)}}
+.light-pulse{width:0.3em;height:0.3em;border-radius:50%;background:#e8a84c;display:inline-block;animation:lb 2.5s ease-in-out infinite;box-shadow:0 0 0.3em rgba(232,168,76,0.3);vertical-align:middle}
+@keyframes lb{0%,100%{opacity:0.3;transform:scale(1)}50%{opacity:1;transform:scale(1.3);box-shadow:0 0 0.6em rgba(232,168,76,0.4)}}
+.corner-dots{position:absolute;z-index:2;pointer-events:none;width:1.2em;height:1.2em}
+.corner-dots::before,.corner-dots::after{content:'';position:absolute;background:rgba(232,168,76,0.05);border-radius:50%}
+.corner-dots.tr{top:0.3em;right:0.3em}.corner-dots.tr::before{top:0;right:0;width:0.2em;height:0.2em}.corner-dots.tr::after{top:0;right:0.45em;width:0.12em;height:0.12em}
+.corner-dots.bl{bottom:0.3em;left:0.3em}.corner-dots.bl::before{bottom:0;left:0;width:0.2em;height:0.2em}.corner-dots.bl::after{bottom:0;left:0.45em;width:0.12em;height:0.12em}
+.floating-orb{position:absolute;border-radius:50%;pointer-events:none;z-index:0;background:radial-gradient(circle,rgba(232,168,76,0.025),transparent 70%);animation:orbF 10s ease-in-out infinite}
+@keyframes orbF{0%,100%{transform:translate(0,0)}33%{transform:translate(0.6em,-0.4em)}66%{transform:translate(-0.4em,0.3em)}}
+.hero-glow{position:absolute;width:25em;height:25em;border-radius:50%;background:radial-gradient(circle,rgba(232,168,76,0.025),transparent 70%);top:50%;left:50%;transform:translate(-50%,-50%);animation:gp 4s ease-in-out infinite;pointer-events:none}
+@keyframes gp{0%,100%{transform:translate(-50%,-50%) scale(1);opacity:0.5}50%{transform:translate(-50%,-50%) scale(1.3);opacity:1}}
+.hero-title{font-family:'DM Serif Display',serif;font-size:clamp(1.8em,4.5em,6em);font-weight:400;line-height:1.06;margin-bottom:0.2em;background:linear-gradient(135deg,#e8e4e0 0%,#e8a84c 60%,#d4922a 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hero-sub{font-size:clamp(0.5em,1.2em,1.6em);color:#7a6c5c;font-weight:300;margin-bottom:0.8em}
+.hero-badge{display:inline-block;padding:0.2em 0.7em;border-radius:1em;margin-bottom:0.8em;background:rgba(0,0,0,0.2);border:1px solid rgba(232,168,76,0.08);font-size:0.45em;color:#e8c8a0;letter-spacing:0.15em;font-weight:500;backdrop-filter:blur(0.5em)}
+.hero-tags{display:flex;gap:0.4em;justify-content:center;flex-wrap:wrap}
+.hero-tag{padding:0.2em 0.5em;border-radius:0.3em;font-size:0.5em;color:#8a7c70;background:rgba(0,0,0,0.1);border:1px solid rgba(255,255,255,0.02);animation:tf 3s ease-in-out infinite;transition:all 0.3s}
+.hero-tag:nth-child(2){animation-delay:0.3s}.hero-tag:nth-child(3){animation-delay:0.6s}.hero-tag:nth-child(4){animation-delay:0.9s}
+.hero-tag:hover{background:rgba(232,168,76,0.1)!important;border-color:rgba(232,168,76,0.1)!important;transform:scale(1.03);color:#e8c8a0}
+@keyframes tf{0%,100%{transform:translateY(0)}50%{transform:translateY(-0.15em)}}
+.footer-slide{text-align:center;align-items:center;justify-content:center;gap:0.5em}
+.footer-title{font-family:'DM Serif Display',serif;font-size:clamp(1.2em,3.2em,4.5em);font-weight:400;background:linear-gradient(135deg,#e8e4e0,#e8a84c);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.footer-sub{color:#4c443c;font-size:0.6em;max-width:20em;line-height:1.5}
+.footer-line{width:1.5em;height:1.5px;border-radius:1px;margin:0 auto 0.6em;background:linear-gradient(90deg,#e8a84c,#f59e0b)}
+
+@media(max-width:768px){.nav-btn{display:none}.slide{padding:1.5em 1.2em}.nav-dot{min-width:1.8em;padding:0.1em 0.2em}.nav-dot .nd-label{font-size:0.5em}}
+</style>
+</head>
+<body>
+<div class="presentation">
+<div class="stage" id="stage">
+
+  <!-- 导航 -->
+  <button class="nav-btn prev" id="prevBtn">‹</button>
+  <button class="nav-btn next" id="nextBtn">›</button>
+  <div class="bottom" id="bottom"></div>
+  <div class="bot-desc" id="botDesc"></div>
+
+  <div id="slidesContainer">
+
+    <!-- ═══ P1 封面 ═══ -->
+    <div class="slide active" data-index="0" style="justify-content:center">
+      <div style="position:absolute;inset:0;z-index:0;overflow:hidden"><img src="images/hero.jpg" alt="" style="width:100%;height:100%;object-fit:cover"><div style="position:absolute;inset:0;background:linear-gradient(to bottom,rgba(10,12,18,0.55),rgba(10,12,18,0.15) 35%,rgba(10,12,18,0.35) 70%,rgba(10,12,18,0.75) 100%)"></div></div>
+      <div class="floating-orb" style="width:16em;height:16em;top:15%;left:-3%"></div>
+      <div class="hero-glow"></div><div class="slide-grid"></div>
+      <div class="slide-content" style="position:relative;z-index:1;align-items:center;justify-content:center;text-align:center">
+        <div class="hero-badge anim-up">🚀 CRAIC 2026</div>
+        <h1 class="hero-title anim-up-1">MiGPT 家用智能音箱</h1>
+        <p class="hero-sub anim-up-2"><span id="heroRot" style="transition:all 0.3s">AI 语音助手</span> · 智能家居中枢 · 桌面信息中心</p>
+        <div class="hero-tags anim-up-3">
+          <span class="hero-tag"><span class="light-pulse" style="margin-right:0.15em"></span>双引擎驱动</span>
+          <span class="hero-tag">🧠 自学习 SOP</span>
+          <span class="hero-tag">💾 渐进式记忆</span>
+          <span class="hero-tag">🔧 Reasonix</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ P2 产品 ═══ -->
+    <div class="slide" data-index="1">
+      <div style="position:absolute;inset:0;z-index:0;overflow:hidden"><img src="images/hero.jpg" alt="" style="width:100%;height:100%;object-fit:cover;filter:blur(6px);opacity:0.1"><div style="position:absolute;inset:0;background:rgba(10,12,18,0.55)"></div></div>
+      <div class="slide-bg"></div><div class="slide-grid"></div>
+      <div class="slide-content">
+        <div class="slide-label anim-up"><span class="light-pulse" style="margin-right:0.25em"></span>About</div>
+        <h2 class="slide-title anim-up-1">不只是音箱</h2>
+        <div class="anim-up-2" style="display:flex;gap:1.5em;flex:1;min-height:0;align-items:stretch">
+          <div class="img-wrap" style="flex:5.5;min-height:6em"><div class="corner-dots tr"></div><div class="corner-dots bl"></div><img src="images/slide2.jpg" alt=""></div>
+          <div style="flex:4.5;display:flex;flex-direction:column;justify-content:center;gap:0.4em">
+            <p style="font-size:0.55em;line-height:1.5;color:#6c5c50;margin-bottom:0.15em">双引擎系统 — <b style="color:#e8d8c0">本地秒级 + 云端深度</b></p>
+            <div class="stat-card" style="padding:0.4em 0.6em"><div><span class="sdot green"></span><span style="font-size:0.5em;color:#6c5c50">响应速度</span></div><div class="num" data-target="80">0</div><div class="pbar"><div class="pfill shine" data-pct="80" style="width:0%"></div></div><div class="lbl">毫秒级本地执行</div></div>
+            <div class="stat-card" style="padding:0.4em 0.6em"><div><span class="sdot gold"></span><span style="font-size:0.5em;color:#6c5c50">场景覆盖</span></div><div style="display:flex;align-items:baseline;gap:0.3em"><span class="num" data-target="95">0</span><span style="font-size:0.45em;color:#4c443c">% 日常需求</span></div><div class="pbar"><div class="pfill shine" data-pct="95" style="width:0%"></div></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ P3 架构 ═══ -->
+    <div class="slide" data-index="2">
+      <div style="position:absolute;inset:0;z-index:0;overflow:hidden"><img src="images/hero.jpg" alt="" style="width:100%;height:100%;object-fit:cover;filter:blur(6px);opacity:0.1"><div style="position:absolute;inset:0;background:rgba(10,12,18,0.55)"></div></div>
+      <div class="slide-bg"></div><div class="slide-grid"></div>
+      <div class="slide-content">
+        <div class="slide-label anim-up"><span class="light-pulse" style="margin-right:0.25em"></span>Architecture</div>
+        <h2 class="slide-title anim-up-1">三道路由架构</h2>
+        <p class="slide-desc anim-up-2" style="margin-bottom:0.3em">语音输入后自动判断路径</p>
+        <div class="anim-up-3" style="display:flex;gap:1.2em;flex:1;min-height:0;align-items:stretch">
+          <div class="img-wrap" style="flex:5.5;min-height:6em"><div class="corner-dots tr"></div><div class="corner-dots bl"></div><img src="images/slide3.jpg" alt=""><div style="position:absolute;inset:0;pointer-events:none;background:linear-gradient(to right,transparent,rgba(10,12,18,0.06) 90%,rgba(10,12,18,0.12) 100%)"></div></div>
+          <div style="flex:4.5;display:flex;flex-direction:column;gap:0.4em;justify-content:center">
+            <div class="card" style="padding:0.5em 0.7em"><div style="display:flex;align-items:center;justify-content:space-between"><span style="color:#3a9e8c;font-weight:600;font-size:0.55em">🏠 小爱优先</span><span class="sdot green"></span></div><div style="font-size:0.5em;color:#4c443c;margin-top:0.05em">关键词 → 直接执行 · 零延迟</div><div class="pbar"><div class="pfill" data-pct="100" style="width:0%"></div></div></div>
+            <div class="card" style="padding:0.5em 0.7em"><div style="display:flex;align-items:center;justify-content:space-between"><span style="color:#e8a84c;font-weight:600;font-size:0.55em">🧠 大模型兜底</span><span class="sdot gold"></span></div><div style="font-size:0.5em;color:#4c443c;margin-top:0.05em">复杂语义 → Qwen2.5 → 回复+指令</div><div class="pbar"><div class="pfill" data-pct="85" style="width:0%"></div></div></div>
+            <div class="card" style="padding:0.5em 0.7em"><div style="display:flex;align-items:center;justify-content:space-between"><span style="color:#5cb85c;font-weight:600;font-size:0.55em">🔧 Reasonix</span><span class="sdot gold"></span></div><div style="font-size:0.5em;color:#4c443c;margin-top:0.05em">编程前缀 → 审批 → 执行播报</div><div class="pbar"><div class="pfill" data-pct="60" style="width:0%"></div></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ P4 特性 ═══ -->
+    <div class="slide" data-index="3">
+      <div style="position:absolute;inset:0;z-index:0;overflow:hidden"><img src="images/hero.jpg" alt="" style="width:100%;height:100%;object-fit:cover;filter:blur(6px);opacity:0.1"><div style="position:absolute;inset:0;background:rgba(10,12,18,0.55)"></div></div>
+      <div class="slide-bg"></div><div class="slide-grid"></div>
+      <div class="slide-content">
+        <div class="slide-label anim-up"><span class="light-pulse" style="margin-right:0.25em"></span>Features</div>
+        <h2 class="slide-title anim-up-1" style="margin-bottom:0.2em">四大核心特性</h2>
+        <div class="anim-up-2" style="display:grid;grid-template-columns:1.3fr 1fr;grid-template-rows:1fr 1fr;gap:0.6em;flex:1;min-height:0">
+          <div class="img-wrap" style="grid-row:1/3"><div class="corner-dots tr"></div><div class="corner-dots bl"></div><img src="images/slide4.jpg" alt=""></div>
+          <div class="stat-card" style="padding:0.5em 0.7em;display:flex;flex-direction:column;justify-content:center"><div><span class="sdot green"></span><span style="font-size:0.5em;color:#6c5c50">路由响应</span></div><div class="num" data-target="80">0</div><div class="pbar"><div class="pfill shine" data-pct="80" style="width:0%"></div></div><div class="lbl">80% 毫秒级</div></div>
+          <div class="stat-card" style="padding:0.5em 0.7em;display:flex;flex-direction:column;justify-content:center"><div><span class="sdot gold"></span><span style="font-size:0.5em;color:#6c5c50">缓存命中</span></div><div style="display:flex;align-items:baseline;gap:0.3em"><span class="num" data-target="4">0</span><span style="font-size:0.45em;color:#4c443c">次·3次学习</span></div><div class="lbl">LRU + SQLite</div></div>
+          <div class="card" style="padding:0.5em 0.7em;display:flex;flex-direction:column;justify-content:center"><div style="font-weight:600;font-size:0.55em;color:#f0dca0">🔄 自学习 SOP</div><div style="font-size:0.5em;color:#4c443c;margin-top:0.05em">观察固化·秒级执行</div></div>
+          <div class="card" style="padding:0.5em 0.7em;display:flex;flex-direction:column;justify-content:center"><div style="font-weight:600;font-size:0.55em;color:#fb923c">💡 主动关怀</div><div style="font-size:0.5em;color:#4c443c;margin-top:0.05em">记忆+传感器·全天候</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ P5 详解 ═══ -->
+    <div class="slide" data-index="4">
+      <div style="position:absolute;inset:0;z-index:0;overflow:hidden"><img src="images/hero.jpg" alt="" style="width:100%;height:100%;object-fit:cover;filter:blur(6px);opacity:0.1"><div style="position:absolute;inset:0;background:rgba(10,12,18,0.55)"></div></div>
+      <div class="slide-bg"></div><div class="slide-grid"></div>
+      <div class="slide-content">
+        <div class="slide-label anim-up"><span class="light-pulse" style="margin-right:0.25em"></span>Deep Dive</div>
+        <h2 class="slide-title anim-up-1">技术架构详解</h2>
+        <div class="anim-up-2" style="display:flex;gap:1.5em;flex:1;min-height:0;align-items:stretch">
+          <div style="flex:4;display:flex;flex-direction:column;justify-content:center;gap:0.4em">
+            <div class="card" style="padding:0.4em 0.6em;border-left:0.15em solid #f0dca0"><div style="font-size:0.55em;color:#f0dca0">🌐 前端展示层</div><div style="font-size:0.45em;color:#4c443c">React 18 + TypeScript + Tailwind</div></div>
+            <div class="card" style="padding:0.4em 0.6em;border-left:0.15em solid #3a9e8c"><div style="font-size:0.55em;color:#3a9e8c">⚙️ 后端路由层</div><div style="font-size:0.45em;color:#4c443c">FastAPI + WebSocket + 三道路由</div></div>
+            <div class="card" style="padding:0.4em 0.6em;border-left:0.15em solid #5cb85c"><div style="font-size:0.55em;color:#5cb85c">🏗️ 设备模拟层</div><div style="font-size:0.45em;color:#4c443c">VirtualHome · 米家兼容</div></div>
+            <div class="card" style="padding:0.4em 0.6em;border-left:0.15em solid #fb923c"><div style="font-size:0.55em;color:#fb923c">🔒 安全隐私层</div><div style="font-size:0.45em;color:#4c443c">审批 · 一键清除 · 可关闭</div></div>
+          </div>
+          <div class="img-wrap" style="flex:6;min-height:6em"><div class="corner-dots tr"></div><div class="corner-dots bl"></div><img src="images/slide5.jpg" alt=""><div style="position:absolute;inset:0;pointer-events:none;background:linear-gradient(to left,transparent,rgba(10,12,18,0.06) 90%,rgba(10,12,18,0.12) 100%)"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ P6 SOP ═══ -->
+    <div class="slide" data-index="5">
+      <div style="position:absolute;inset:0;z-index:0;overflow:hidden"><img src="images/slide6.jpg" alt="" style="width:100%;height:100%;object-fit:cover;filter:brightness(0.25)"><div style="position:absolute;inset:0;background:linear-gradient(to top,rgba(10,12,18,0.3),transparent)"></div></div>
+      <div class="slide-grid"></div>
+      <div class="slide-content" style="justify-content:flex-end;padding-bottom:4em">
+        <div class="slide-label anim-up"><span class="light-pulse" style="margin-right:0.25em"></span>Optimization</div>
+        <h2 class="slide-title anim-up-1" style="color:#e8e4e0">越用越聪明</h2>
+        <p class="slide-desc anim-up-2" style="color:#6c5c50">自学习 SOP + 高频缓存引擎</p>
+        <div class="anim-up-3" style="display:flex;gap:1em;margin-top:0.3em">
+          <div class="stat-card" style="flex:1;padding:0.6em 0.8em;background:rgba(0,0,0,0.25);backdrop-filter:blur(0.5em);border:1px solid rgba(255,255,255,0.03)"><div style="display:flex;align-items:center;gap:0.3em"><span class="sdot green"></span><span style="font-size:0.5em;color:#f0dca0">自学习 SOP</span></div><div style="font-size:0.45em;color:#6c5c50;margin:0.05em 0">观察 → 聚类 → 固化指令</div><div class="pbar"><div class="pfill" data-pct="100" style="width:0%"></div></div></div>
+          <div class="stat-card" style="flex:1;padding:0.6em 0.8em;background:rgba(0,0,0,0.25);backdrop-filter:blur(0.5em);border:1px solid rgba(255,255,255,0.03)"><div style="display:flex;align-items:center;gap:0.3em"><span class="sdot gold"></span><span style="font-size:0.5em;color:#f0dca0">高频缓存</span></div><div style="font-size:0.45em;color:#6c5c50;margin:0.05em 0">≥3次 → 自动写入 → 秒回</div><div class="pbar"><div class="pfill" data-pct="95" style="width:0%"></div></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ P7 关怀 ═══ -->
+    <div class="slide" data-index="6">
+      <div style="position:absolute;inset:0;z-index:0;overflow:hidden"><img src="images/hero.jpg" alt="" style="width:100%;height:100%;object-fit:cover;filter:blur(6px);opacity:0.1"><div style="position:absolute;inset:0;background:rgba(10,12,18,0.55)"></div></div>
+      <div class="slide-bg"></div><div class="slide-grid"></div>
+      <div class="slide-content">
+        <div class="slide-label anim-up"><span class="light-pulse" style="margin-right:0.25em"></span>Proactive Care</div>
+        <h2 class="slide-title anim-up-1">记住你，关心你</h2>
+        <div class="anim-up-2" style="display:flex;gap:1.5em;flex:1;min-height:0;align-items:stretch">
+          <div style="flex:4;display:flex;flex-direction:column;justify-content:center;gap:0.5em">
+            <p style="font-size:0.55em;line-height:1.5;color:#6c5c50">在对话中学习习惯，结合传感器<b style="color:#e8d8c0">主动伸出援手</b></p>
+            <div class="card" style="padding:0.6em;background:rgba(251,146,60,0.02)"><div style="font-size:0.5em;color:#fb923c;font-weight:600;margin-bottom:0.1em">🌅 主动提醒示例</div><div style="font-size:0.5em;color:#e8d8c0;line-height:1.4">"主人，7:10了，按您通勤时间，要开窗帘吗？"</div></div>
+            <div style="display:flex;gap:0.2em;flex-wrap:wrap">
+              <span style="padding:0.1em 0.3em;border-radius:0.2em;font-size:0.4em;background:rgba(255,255,255,0.015);border:1px solid rgba(255,255,255,0.02);color:#6c5c50">🧠 知识图谱</span>
+              <span style="padding:0.1em 0.3em;border-radius:0.2em;font-size:0.4em;background:rgba(255,255,255,0.015);border:1px solid rgba(255,255,255,0.02);color:#6c5c50">📡 传感器融合</span>
+              <span style="padding:0.1em 0.3em;border-radius:0.2em;font-size:0.4em;background:rgba(255,255,255,0.015);border:1px solid rgba(255,255,255,0.02);color:#6c5c50">🔒 隐私随时关</span>
+            </div>
+          </div>
+          <div class="img-wrap" style="flex:6;min-height:6em"><div class="corner-dots tr"></div><div class="corner-dots bl"></div><img src="images/slide7.jpg" alt=""><div style="position:absolute;inset:0;pointer-events:none;background:linear-gradient(to left,transparent,rgba(10,12,18,0.06) 90%,rgba(10,12,18,0.12) 100%)"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ P8 技术 ═══ -->
+    <div class="slide" data-index="7">
+      <div style="position:absolute;inset:0;z-index:0;overflow:hidden"><img src="images/hero.jpg" alt="" style="width:100%;height:100%;object-fit:cover;filter:blur(6px);opacity:0.1"><div style="position:absolute;inset:0;background:rgba(10,12,18,0.55)"></div></div>
+      <div class="slide-bg"></div><div class="slide-grid"></div>
+      <div class="slide-content">
+        <div class="slide-label anim-up"><span class="light-pulse" style="margin-right:0.25em"></span>Tech Stack</div>
+        <h2 class="slide-title anim-up-1">技术选型一览</h2>
+        <div class="anim-up-2" style="display:flex;align-items:center;gap:0.6em;flex:1;min-height:0">
+          <div style="flex:2;display:flex;flex-direction:column;gap:0.25em;text-align:right">
+            <div class="card" style="padding:0.25em 0.4em"><span style="font-size:0.45em;color:#f0dca0">⚛️ React 18 + TS</span><br><span style="font-size:0.35em;color:#4c443c">前端框架</span></div>
+            <div class="card" style="padding:0.25em 0.4em"><span style="font-size:0.45em;color:#3a9e8c">🐍 FastAPI</span><br><span style="font-size:0.35em;color:#4c443c">后端+WebSocket</span></div>
+            <div class="card" style="padding:0.25em 0.4em"><span style="font-size:0.45em;color:#5cb85c">🦙 Qwen2.5:7B</span><br><span style="font-size:0.35em;color:#4c443c">本地大模型</span></div>
+            <div class="card" style="padding:0.25em 0.4em"><span style="font-size:0.45em;color:#fb923c">🎤 Web Speech API</span><br><span style="font-size:0.35em;color:#4c443c">语音识别</span></div>
+          </div>
+          <div style="flex:6;display:flex;align-items:center;justify-content:center"><img src="images/slide8.jpg" alt="" style="width:100%;height:auto;max-height:26em;object-fit:contain;border-radius:0.3em"></div>
+          <div style="flex:2;display:flex;flex-direction:column;gap:0.25em">
+            <div class="card" style="padding:0.25em 0.4em"><span style="font-size:0.45em;color:#f0dca0">🔊 Edge TTS</span><br><span style="font-size:0.35em;color:#4c443c">语音合成</span></div>
+            <div class="card" style="padding:0.25em 0.4em"><span style="font-size:0.45em;color:#3a9e8c">💾 SQLite + LRU</span><br><span style="font-size:0.35em;color:#4c443c">双层缓存</span></div>
+            <div class="card" style="padding:0.25em 0.4em"><span style="font-size:0.45em;color:#5cb85c">🔧 Reasonix</span><br><span style="font-size:0.35em;color:#4c443c">编程执行</span></div>
+            <div class="card" style="padding:0.25em 0.4em"><span style="font-size:0.45em;color:#fb923c">🐳 Docker</span><br><span style="font-size:0.35em;color:#4c443c">一键部署</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ P9 场景 ═══ -->
+    <div class="slide" data-index="8">
+      <div style="position:absolute;inset:0;z-index:0;overflow:hidden"><img src="images/hero.jpg" alt="" style="width:100%;height:100%;object-fit:cover;filter:blur(6px);opacity:0.1"><div style="position:absolute;inset:0;background:rgba(10,12,18,0.55)"></div></div>
+      <div class="slide-bg"></div><div class="slide-grid"></div>
+      <div class="slide-content">
+        <div class="slide-label anim-up"><span class="light-pulse" style="margin-right:0.25em"></span>Demo</div>
+        <h2 class="slide-title anim-up-1">五大演示场景</h2>
+        <p class="slide-desc anim-up-2" style="margin-bottom:0.2em">覆盖全部核心能力</p>
+        <div class="anim-up-3" style="display:flex;gap:1.2em;flex:1;min-height:0;align-items:stretch">
+          <div class="img-wrap" style="flex:5.5;min-height:6em"><div class="corner-dots tr"></div><div class="corner-dots bl"></div><img src="images/slide9.jpg" alt=""><div style="position:absolute;inset:0;pointer-events:none;background:linear-gradient(to right,transparent,rgba(10,12,18,0.06) 90%,rgba(10,12,18,0.12) 100%)"></div></div>
+          <div style="flex:4.5;display:flex;flex-direction:column;gap:0.25em;justify-content:center">
+            <div class="card" style="padding:0.3em 0.5em;border-left:0.1em solid #5cb85c"><span style="font-size:0.5em;font-weight:600">A 本地秒级</span><span style="font-size:0.4em;color:#4c443c;margin-left:0.3em">"开灯" → 0.2s</span></div>
+            <div class="card" style="padding:0.3em 0.5em;border-left:0.1em solid #e8a84c"><span style="font-size:0.5em;font-weight:600">B 复杂语义</span><span style="font-size:0.4em;color:#4c443c;margin-left:0.3em">大模型 + 设备组合</span></div>
+            <div class="card" style="padding:0.3em 0.5em;border-left:0.1em solid #3a9e8c"><span style="font-size:0.5em;font-weight:600">C Reasonix</span><span style="font-size:0.4em;color:#4c443c;margin-left:0.3em">审批 → 执行 → 播报</span></div>
+            <div class="card" style="padding:0.3em 0.5em;border-left:0.1em solid #5cb85c"><span style="font-size:0.5em;font-weight:600">D 高频缓存</span><span style="font-size:0.4em;color:#4c443c;margin-left:0.3em">3次学 → 4次秒回</span></div>
+            <div class="card" style="padding:0.3em 0.5em;border-left:0.1em solid #fb923c"><span style="font-size:0.5em;font-weight:600">E 主动提醒</span><span style="font-size:0.4em;color:#4c443c;margin-left:0.3em">记忆+传感器 → 问询</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ P10 尾页 ═══ -->
+    <div class="slide" data-index="9" style="justify-content:center">
+      <div style="position:absolute;inset:0;z-index:0;overflow:hidden"><img src="images/slide10.jpg" alt="" style="width:100%;height:100%;object-fit:cover"><div style="position:absolute;inset:0;background:linear-gradient(to bottom,rgba(10,12,18,0.25),rgba(10,12,18,0.55))"></div></div>
+      <div class="slide-grid"></div>
+      <div class="slide-content footer-slide" style="position:relative;z-index:1">
+        <div class="footer-line anim-up"></div>
+        <div class="footer-title anim-up-1">双引擎驱动 · 更懂你的家</div>
+        <div class="footer-sub anim-up-2">MiGPT 家用智能音箱 — CRAIC 2026</div>
+        <div class="anim-up-3" style="color:#4c443c;font-size:0.45em;margin-top:0.15em">纯软件方案 · 三道路由 · 自学习SOP · 隐私可控</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+</div>
+</div>
+
+<script>
+(function(){
+  const data = [
+    {id:0,desc:'封面 · MiGPT 双引擎智能音箱',label:'封面'},{id:1,desc:'产品定义 · 双引擎 + 四大核心能力',label:'产品'},{id:2,desc:'三道路由 · 小爱 → 大模型 → Reasonix',label:'架构'},{id:3,desc:'四大特性 · 路由·缓存·SOP·关怀',label:'特性'},{id:4,desc:'四层架构 · 前端→后端→设备→安全',label:'详解'},{id:5,desc:'自学习SOP + 高频缓存 · 越用越聪明',label:'SOP'},{id:6,desc:'渐进式记忆 + 传感器 · 主动提醒',label:'关怀'},{id:7,desc:'React · FastAPI · Qwen2.5 · Docker',label:'技术'},{id:8,desc:'五大场景 · 覆盖全部核心能力演示',label:'场景'},{id:9,desc:'双引擎驱动 · 更懂你的家',label:'尾页'}
+  ];
+  const slides = document.querySelectorAll('.slide');
+  const total = slides.length; let current = 0;
+  const prevBtn = document.getElementById('prevBtn');
+  const nextBtn = document.getElementById('nextBtn');
+  const bottom = document.getElementById('bottom');
+  const botDesc = document.getElementById('botDesc');
+  let hideDescTimer;
+
+  // Build bottom nav
+  data.forEach((d,i)=>{
+    const el = document.createElement('div');
+    el.className = 'nav-dot' + (i===0?' active':'');
+    el.setAttribute('data-slide',i);
+    el.setAttribute('data-desc',d.desc);
+    el.innerHTML = `<span class="nd-num">${String(i+1).padStart(2,'0')}</span><span class="nd-label">${d.label}</span>`;
+    el.addEventListener('click',()=>goTo(i));
+    el.addEventListener('mouseenter',()=>{botDesc.textContent=d.desc;botDesc.classList.add('show');clearTimeout(hideDescTimer)});
+    el.addEventListener('mouseleave',()=>{hideDescTimer=setTimeout(()=>botDesc.classList.remove('show'),300)});
+    bottom.appendChild(el);
+  });
+
+  function update(){
+    slides.forEach((s,i)=>s.classList.toggle('active',i===current));
+    document.querySelectorAll('.nav-dot').forEach((n,i)=>n.classList.toggle('active',i===current));
+    prevBtn.classList.toggle('hidden',current===0);
+    nextBtn.classList.toggle('hidden',current===total-1);
+    const as = slides[current];
+    as.querySelectorAll('[data-target]').forEach(el=>{if(!el.dataset.counted){el.dataset.counted='1';animateCount(el,el.getAttribute('data-target'))}});
+    as.querySelectorAll('.pfill[data-pct]').forEach(el=>{if(!el.dataset.filled){el.dataset.filled='1';setTimeout(()=>{el.style.width=el.getAttribute('data-pct')+'%'},200)}});
+  }
+  function goTo(i){if(i<0)i=0;if(i>=total)i=total-1;if(i===current)return;current=i;update()}
+  prevBtn.addEventListener('click',()=>goTo(current-1));
+  nextBtn.addEventListener('click',()=>goTo(current+1));
+  document.addEventListener('keydown',e=>{if(e.key==='ArrowLeft'||e.key==='PageUp')goTo(current-1);if(e.key==='ArrowRight'||e.key==='PageDown'||e.key===' '){e.preventDefault();goTo(current+1)}if(e.key==='Home')goTo(0);if(e.key==='End')goTo(total-1)});
+  let tx=0;document.addEventListener('touchstart',e=>{tx=e.changedTouches[0].screenX});document.addEventListener('touchend',e=>{const d=tx-e.changedTouches[0].screenX;if(Math.abs(d)>50)goTo(current+(d>0?1:-1))});
+
+  function animateCount(el,target){const ip=String(target).includes('%');const n=parseFloat(target);const dur=1200;const s=performance.now();function st(now){const p=Math.min((now-s)/dur,1);const e=1-Math.pow(1-p,3);el.textContent=ip?Math.round(e*n)+'%':Math.round(e*n).toLocaleString();if(p<1)requestAnimationFrame(st)}requestAnimationFrame(st)}
+
+  // Hero rotator
+  const words=['AI 语音助手','智能家居中枢','桌面信息中心'];const rot=document.getElementById('heroRot');let wi=0;
+  if(rot)setInterval(()=>{wi=(wi+1)%words.length;rot.style.opacity='0';rot.style.transform='translateY(0.2em)';setTimeout(()=>{rot.textContent=words[wi];rot.style.opacity='1';rot.style.transform='translateY(0)'},250)},3000);
+
+  // Click ripple
+  document.addEventListener('click',e=>{const r=document.createElement('div');const s=Math.random()*0.8+0.6;r.style.cssText=`position:fixed;pointer-events:none;z-index:9999;width:${s}em;height:${s}em;border-radius:50%;border:1px solid rgba(232,168,76,0.12);left:${e.clientX}px;top:${e.clientY}px;transform:translate(-50%,-50%) scale(0);animation:rip 0.5s ease-out forwards`;document.body.appendChild(r);setTimeout(()=>r.remove(),600)});
+  const ss=document.createElement('style');ss.textContent='@keyframes rip{to{transform:translate(-50%,-50%) scale(3);opacity:0}}';document.head.appendChild(ss);
+  update();
+})();
+</script>
+</body>
+</html>

@@ -1,7 +1,9 @@
 """
 虚拟家居设备层 —— 用 Python 字典模拟米家设备状态，
 提供与真实米家 API 参数完全一致的接口。
+包含虚拟时间系统，支持加速/暂停/设定。
 """
+import time as real_time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -129,3 +131,129 @@ class VirtualHome:
                 "status": d.status, "properties": d.properties,
             }
         return None
+
+
+# ═══════════════════════════════════════
+# 虚拟时间系统
+# ═══════════════════════════════════════
+
+class VirtualTime:
+    """
+    模拟时间系统，支持加速/暂停/手动设定。
+
+    工作原理：
+    - simulated = base_simulated + (real_now - base_real) * speed
+    - 暂停时模拟时间停止流逝
+    """
+
+    def __init__(self):
+        self._simulated = False        # 是否启用模拟时间
+        self._base_real = 0.0          # 上次变更时的真实时间戳
+        self._base_simulated = 0.0     # 上次变更时的模拟时间戳
+        self._speed = 1.0              # 加速比 (1=实时, 60=1秒=1分钟)
+        self._paused = False           # 是否暂停
+
+        # 默认初始化为当前真实时间
+        now = real_time.time()
+        self._base_real = now
+        self._base_simulated = now
+
+    @property
+    def simulated(self) -> bool:
+        return self._simulated
+
+    def now(self) -> float:
+        """获取当前（模拟）时间戳"""
+        if not self._simulated or self._paused:
+            return self._base_simulated
+        elapsed = (real_time.time() - self._base_real) * self._speed
+        return self._base_simulated + elapsed
+
+    def now_struct(self) -> dict:
+        """返回格式化的当前时间"""
+        t = self.now()
+        import datetime
+        dt = datetime.datetime.fromtimestamp(t)
+        return {
+            "simulated": self._simulated,
+            "current_time": dt.strftime("%H:%M"),
+            "current_datetime": dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "speed": self._speed,
+            "paused": self._paused,
+            "hour": dt.hour,
+            "minute": dt.minute,
+        }
+
+    def enable(self, enabled: bool = True):
+        """启用/禁用模拟时间"""
+        if enabled == self._simulated:
+            return
+        now = real_time.time()
+        if enabled:
+            # 从当前真实时间开始模拟
+            self._base_real = now
+            self._base_simulated = now
+            self._simulated = True
+        else:
+            # 禁用：将模拟时间的当前值冻结为基准
+            self._base_simulated = self.now()
+            self._base_real = now
+            self._simulated = False
+
+    def set_time(self, target_hour: int, target_minute: int = 0):
+        """手动设定模拟时间"""
+        import datetime
+        now = self.now()
+        base_dt = datetime.datetime.fromtimestamp(now)
+        # 保持日期不变，只改小时和分钟
+        new_dt = base_dt.replace(hour=target_hour % 24, minute=target_minute % 60, second=0, microsecond=0)
+        real_now = real_time.time()
+        self._base_simulated = new_dt.timestamp()
+        self._base_real = real_now
+        self._simulated = True
+
+    def set_speed(self, speed: float):
+        """设置加速比 (0.1 ~ 300)"""
+        # 调整前先更新基准
+        now_real = real_time.time()
+        self._base_simulated = self.now()
+        self._base_real = now_real
+        self._speed = max(0.1, min(300.0, speed))
+
+    def toggle_pause(self) -> bool:
+        """暂停/继续，返回新状态"""
+        if self._paused:
+            # 恢复：更新基准
+            now_real = real_time.time()
+            self._base_real = now_real
+            self._paused = False
+        else:
+            # 暂停：冻结当前模拟时间
+            self._base_simulated = self.now()
+            self._paused = True
+        return self._paused
+
+    def to_dict(self) -> dict:
+        """前端可用的时间状态"""
+        t = self.now()
+        import datetime
+        dt = datetime.datetime.fromtimestamp(t)
+        return {
+            "simulated": self._simulated,
+            "current_time": dt.strftime("%H:%M"),
+            "speed": self._speed,
+            "paused": self._paused,
+            "hour": dt.hour,
+            "minute": dt.minute,
+        }
+
+
+# 全局单例
+_virtual_time: VirtualTime | None = None
+
+
+def get_virtual_time() -> VirtualTime:
+    global _virtual_time
+    if _virtual_time is None:
+        _virtual_time = VirtualTime()
+    return _virtual_time

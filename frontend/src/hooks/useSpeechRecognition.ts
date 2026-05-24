@@ -1,5 +1,20 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 
+// Web Speech API 类型（浏览器内置，但 TS lib 未覆盖）
+interface SpeechRecognitionInstance {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  maxAlternatives: number;
+  start(): void;
+  stop(): void;
+  abort(): void;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+  onstart: (() => void) | null;
+}
+
 type RecorderState = 'idle' | 'listening' | 'error' | 'denied';
 
 interface UseSpeechRecognitionOptions {
@@ -13,7 +28,7 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
   const [state, setState] = useState<RecorderState>('idle');
   const [interimText, setInterimText] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const finalTextRef = useRef('');
   const streamRef = useRef<MediaStream | null>(null);
 
@@ -71,12 +86,12 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
     if (!hasPermission) return;
 
     const SpeechRecognitionAPI =
-      (window as unknown as Record<string, typeof SpeechRecognition>).SpeechRecognition ||
-      (window as unknown as Record<string, typeof SpeechRecognition>).webkitSpeechRecognition;
+      (window as unknown as { SpeechRecognition?: unknown }).SpeechRecognition ||
+      (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition;
 
     if (!SpeechRecognitionAPI) return;
 
-    const rec = new SpeechRecognitionAPI();
+    const rec = new (SpeechRecognitionAPI as unknown as { new(): SpeechRecognitionInstance })();
     rec.lang = lang;
     rec.continuous = false;
     rec.interimResults = true;
