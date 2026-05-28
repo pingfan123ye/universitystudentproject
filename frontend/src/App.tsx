@@ -9,6 +9,7 @@ import RouteLog from './components/RouteLog';
 import MemoryPanel from './components/MemoryPanel';
 import SafetyDialog from './components/SafetyDialog';
 import SettingsPanel from './components/SettingsPanel';
+import MusicPlayer from './components/MusicPlayer';
 
 export default function App() {
   const {
@@ -19,11 +20,16 @@ export default function App() {
     timeState, setTime, setTimeSpeed, toggleTimePause, toggleTimeSim, toggleSuppressAlerts,
     sendMessage, clearMessages, fetchCacheList, deleteCache,
     fetchMemoryList, deleteMemory, clearMemories,
+    sendAudioChunk, transcriptionText, ttsFallbackText,
   } = useWebSocket();
 
-  const { playerState, trackName, doAction } = useMusicPlayer();
+  const {
+    playerState, currentSong, queue, currentIndex, volume, progress, error, searchResults, setSearchResults,
+    play, pause, duckForRecording, restoreVolumeAfterRecording, next, prev, seek, setVolume, setQueueAndPlay,
+    handleMusicControl,
+  } = useMusicPlayer();
 
-  useEffect(() => { if (musicAction) doAction(musicAction); }, [musicAction, doAction]);
+  useEffect(() => { if (musicAction) handleMusicControl(musicAction); }, [musicAction, handleMusicControl]);
 
   // Edge TTS 音频播放（ttsAudio 变化时触发）
   const [pendingTts, setPendingTts] = useState<{ text: string; audio: string } | null>(null);
@@ -32,6 +38,12 @@ export default function App() {
       setPendingTts({ text: ttsAudio.text, audio: ttsAudio.audio });
     }
   }, [ttsAudio]);
+
+  // TTS 降级文本（后端 TTS 失败时触发浏览器 speechSynthesis）
+  const [pendingTtsFallback, setPendingTtsFallback] = useState('');
+  useEffect(() => {
+    if (ttsFallbackText) setPendingTtsFallback(ttsFallbackText);
+  }, [ttsFallbackText]);
 
   // 本地实时时钟（非模拟时间时使用）
   const [localTime, setLocalTime] = useState('');
@@ -75,7 +87,11 @@ export default function App() {
           style={!isMobile ? { borderRight: '1px solid var(--border)' } : {}}>
           <ChatPanel messages={messages} pendingTask={pendingTask ? { task: pendingTask } : null} onSend={sendMessage} onClear={clearMessages}
             pendingTts={pendingTts} onTtsPlayed={() => setPendingTts(null)}
-            isMobile={isMobile} onToggleSidebar={() => setSidebarOpen(true)} />
+            pendingTtsFallback={pendingTtsFallback} onTtsFallbackConsumed={() => setPendingTtsFallback('')}
+            onSendAudioFinal={(b64: string) => sendAudioChunk(b64)} streamText={transcriptionText}
+            onDuckMusic={duckForRecording} onRestoreMusic={restoreVolumeAfterRecording}
+            isMobile={isMobile} onToggleSidebar={() => setSidebarOpen(true)}
+            musicPlayerVisible={playerState !== 'idle' || currentSong !== null || queue.length > 0 || searchResults.length > 0} />
         </div>
 
         {/* 侧栏：桌面固定显示，手机为抽屉覆盖层 */}
@@ -122,22 +138,24 @@ export default function App() {
         />
       )}
 
-      {playerState !== 'idle' && (
-        <div className="fixed bottom-5 left-5 px-4 py-3 rounded-2xl border flex items-center gap-3 z-50 animate-slide-up shadow-lg"
-          style={{ background: 'var(--bg-elevated)', borderColor: 'var(--border)' }}>
-          <div className="w-9 h-9 rounded flex items-center justify-center text-sm" style={{ background: playerState === 'playing' ? 'var(--accent-glow)' : 'var(--bg-input)', color: 'var(--accent)' }}>
-            {playerState === 'playing' ? '▶' : '⏸'}
-          </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>正在播放</div>
-            <div className="text-xs font-medium">{trackName}</div>
-          </div>
-          <button onClick={() => doAction(playerState === 'playing' ? 'pause' : 'play')} className="ml-2 text-[11px] px-3 py-1.5 rounded border transition-colors"
-            style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)' }}>
-            {playerState === 'playing' ? '暂停' : '播放'}
-          </button>
-        </div>
-      )}
+      <MusicPlayer
+        playerState={playerState}
+        currentSong={currentSong}
+        queue={queue}
+        currentIndex={currentIndex}
+        volume={volume}
+        progress={progress}
+        error={error}
+        searchResults={searchResults}
+        onPlay={play}
+        onPause={pause}
+        onNext={next}
+        onPrev={prev}
+        onSeek={seek}
+        onSetVolume={setVolume}
+        onSetQueueAndPlay={setQueueAndPlay}
+        onSearchResults={setSearchResults}
+      />
     </div>
   );
 }

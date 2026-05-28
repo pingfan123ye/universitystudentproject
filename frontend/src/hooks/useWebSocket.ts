@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Message, WSResponse, DeviceInfo, CacheEntry, RoutePath, TTSAudio, TimeState, SafetyConfirm } from '../types';
+import { Message, WSResponse, DeviceInfo, CacheEntry, RoutePath, TTSAudio, TimeState, SafetyConfirm, MusicControlData } from '../types';
 
 export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
 
@@ -15,18 +15,24 @@ export function useWebSocket() {
   const [cacheEntries, setCacheEntries] = useState<CacheEntry[]>([] as CacheEntry[]);
   const [lastPath, setLastPath] = useState<RoutePath>('unknown');
   const [routeLog, setRouteLog] = useState<Array<{ time: number; text: string; path: string; reason: string }>>([]);
-  const [musicAction, setMusicAction] = useState<string | null>(null);
+  const musicActionIdRef = useRef(0);
+  const [musicAction, setMusicAction] = useState<(MusicControlData & { id: number }) | null>(null);
   const [memoryEntries, setMemoryEntries] = useState<Array<{id:number;category:string;value:string;source:string;created_at:number}>>([]);
   const [pendingTask, setPendingTask] = useState<string | null>(null);
   const [engineConfig, setEngineConfig] = useState<Record<string, unknown>>({});
   const [safetyConfirm, setSafetyConfirm] = useState<SafetyConfirm | null>(null);
+  const [transcriptionText, setTranscriptionText] = useState<string>('');
   const [ttsAudio, setTtsAudio] = useState<TTSAudio | null>(null);
+  const [ttsFallbackText, setTtsFallbackText] = useState<string>('');
   const [timeState, setTimeState] = useState<TimeState>({
     simulated: false, current_time: '', speed: 1, paused: false,
   });
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const currentAiMsgRef = useRef<string>('');
+  // Refs 用于在 connect 闭包中获取最新的函数引用
+  const fetchMemoryListRef = useRef<() => void>(() => {});
+  const fetchCacheListRef = useRef<() => void>(() => {});
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -59,7 +65,42 @@ export function useWebSocket() {
         if (data.type === 'pong') return;
 
         if (data.type === 'music_control' && data.action) {
-          setMusicAction(data.action);
+          musicActionIdRef.current += 1;
+          setMusicAction({
+            id: musicActionIdRef.current,
+            action: data.action,
+            song_id: data.song_id,
+            song_name: data.song_name,
+            singers: data.singers,
+            album: data.album,
+            source: data.source,
+            duration: data.duration,
+            duration_s: data.duration_s,
+            cover_url: data.cover_url,
+            download_url: data.download_url,
+            ext: data.ext,
+            songs: data.songs as MusicControlData['songs'],
+          });
+          return;
+        }
+
+        if (data.type === 'transcription_text') {
+          setTranscriptionText(data.text || '');
+          return;
+        }
+
+        if (data.type === 'stt_result') {
+          setTranscriptionText(data.text || '');
+          // 自动发送转写结果（类似浏览器 ASR 的 isFinal 行为）
+          if (data.text?.trim() && wsRef.current?.readyState === WebSocket.OPEN) {
+            const text = data.text.trim();
+            // 添加用户消息到列表
+            setMessages((prev) => [...prev, {
+              id: nextId(), role: 'user' as const, content: text, timestamp: Date.now(),
+            }]);
+            // 发送到后端
+            wsRef.current.send(JSON.stringify({ type: 'chat', text }));
+          }
           return;
         }
 
@@ -69,11 +110,12 @@ export function useWebSocket() {
         }
 
         if (data.type === 'memory_learned' || data.type === 'memory_deleted' || data.type === 'memory_cleared') {
-          fetchMemoryList();
+          fetchMemoryListRef.current();
           return;
         }
 
         if (data.type === 'route') {
+          setTranscriptionText('');  // STT 结果已发送，清空输入框
           const path = data.path as RoutePath || 'unknown';
           setLastPath(path);
           setRouteLog((prev) => [{
@@ -96,7 +138,7 @@ export function useWebSocket() {
         }
 
         if (data.type === 'cache_learned') {
-          fetchCacheList();
+          fetchCacheListRef.current();
           return;
         }
 
@@ -106,7 +148,7 @@ export function useWebSocket() {
         }
 
         if (data.type === 'cache_deleted') {
-          fetchCacheList();
+          fetchCacheListRef.current();
           return;
         }
 
@@ -177,6 +219,11 @@ export function useWebSocket() {
           return;
         }
 
+        if (data.type === 'tts_failed') {
+          setTtsFallbackText(data.text || '');
+          return;
+        }
+
         if (data.type === 'token') {
           currentAiMsgRef.current += data.text || '';
           setMessages((prev) => {
@@ -238,6 +285,18 @@ export function useWebSocket() {
               id: nextId(),
               role: 'system',
               content: `错误：${data.error || '未知错误'}`,
+              timestamp: Date.now(),
+            },
+          ]);
+        }
+
+        if (data.type === 'chat_error') {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: nextId(),
+              role: 'system',
+              content: data.message || '操作失败',
               timestamp: Date.now(),
             },
           ]);
@@ -362,6 +421,18 @@ export function useWebSocket() {
     safeSend({ type: 'toggle_suppress_alerts', suppressed });
   }, [safeSend]);
 
+  const sendAudioChunk = useCallback((audioBase64: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'audio_stream', audio: audioBase64, final: false }));
+    }
+  }, []);
+
+  const sendAudioFinal = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'audio_stream', final: true }));
+    }
+  }, []);
+
   const safetyReply = useCallback((accept: boolean) => {
     setSafetyConfirm(null);
     safeSend({ type: 'safety_reply', accept });
@@ -377,13 +448,18 @@ export function useWebSocket() {
     safeSend({ type: 'reset_config' });
   }, [safeSend]);
 
+  // 同步 refs，确保 connect 闭包中始终拿到最新的函数引用
+  fetchMemoryListRef.current = fetchMemoryList;
+  fetchCacheListRef.current = fetchCacheList;
+
   return {
     status, messages, devices, cacheEntries, lastPath, routeLog, musicAction,
-    memoryEntries, pendingTask, ttsAudio, consumeTts,
+    memoryEntries, pendingTask, ttsAudio, consumeTts, transcriptionText, ttsFallbackText,
     safetyConfirm, safetyReply,
     engineConfig, fetchEngineConfig, setEngineConfigItem, resetEngineConfig,
     timeState, setTime, setTimeSpeed, toggleTimePause, toggleTimeSim, toggleSuppressAlerts,
     sendMessage, clearMessages, fetchCacheList, deleteCache,
     fetchMemoryList, deleteMemory, clearMemories,
+    sendAudioChunk, sendAudioFinal,
   };
 }

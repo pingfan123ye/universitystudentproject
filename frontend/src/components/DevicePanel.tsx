@@ -28,6 +28,8 @@ const DEFAULT_DEVICES: Record<string, DeviceInfo> = {
   living_curtain: { name: '客厅窗帘', type: 'curtain', room: 'living', status: 'closed', properties: { position: 0 } },
   water_heater: { name: '热水器', type: 'heater', room: 'bathroom', status: 'off', properties: { temperature: 40 } },
   ac: { name: '空调', type: 'ac', room: 'living', status: 'off', properties: { temperature: 26 } },
+  fan: { name: '风扇', type: 'fan', room: 'living', status: 'off', properties: { speed: 1 } },
+  tv: { name: '电视', type: 'tv', room: 'living', status: 'off', properties: { volume: 20 } },
 };
 
 const roomNames: Record<string, string> = { bedroom: '卧室', living: '客厅', kitchen: '厨房', bathroom: '卫浴', study: '书房' };

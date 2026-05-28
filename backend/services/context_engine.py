@@ -175,13 +175,11 @@ class ContextEngine:
         rules = [
             ("leave_reminder", _check_leave_reminder),
             ("wake_reminder", _check_wake_reminder),
-            ("night_reminder", _check_night_mode),
         ]
 
         for rule_id, check_fn in rules:
             result = check_fn(hour, minute, schedule, sensors)
             if result and self._alert_callback:
-                # 防重复：同规则 15 分钟内不再触发
                 last = self._last_alert_times.get(rule_id, 0)
                 if time.time() - last < 900:
                     continue
@@ -189,6 +187,16 @@ class ContextEngine:
                 result["timestamp"] = time.time()
                 logger.info(f"情境引擎触发: {rule_id} — {result['reason']}")
                 await self._alert_callback(result)
+
+        # _check_night_mode 需要额外 devices 参数，单独处理
+        night_result = _check_night_mode(hour, minute, schedule, sensors, devices)
+        if night_result and self._alert_callback:
+            last = self._last_alert_times.get("night_reminder", 0)
+            if time.time() - last >= 900:
+                self._last_alert_times["night_reminder"] = time.time()
+                night_result["timestamp"] = time.time()
+                logger.info(f"情境引擎触发: night_reminder — {night_result['reason']}")
+                await self._alert_callback(night_result)
 
     async def start(self, interval_seconds: int = 30):
         """启动循环检查"""

@@ -19,7 +19,7 @@ DEFAULT_CONFIG = {
     # cloud_first: 云端优先，离线切本地（用户有 API Key 时推荐）
     # local_only:  强制本地
     # cloud_only:  强制云端
-    "default_mode": "cloud_first",
+    "default_mode": "local_first",
 
     # 本地模型超时（秒），超时后自动切换到云端
     "timeout_seconds": 8,

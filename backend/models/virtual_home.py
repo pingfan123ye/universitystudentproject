@@ -55,6 +55,14 @@ class VirtualHome:
                 device_id="ac", name="空调", device_type="ac",
                 room="living", status="off", properties={"temperature": 26, "mode": "cool"}
             ),
+            "fan": DeviceState(
+                device_id="fan", name="风扇", device_type="fan",
+                room="living", status="off", properties={"speed": 1, "oscillate": False}
+            ),
+            "tv": DeviceState(
+                device_id="tv", name="电视", device_type="tv",
+                room="living", status="off", properties={"volume": 20, "channel": "CCTV-1"}
+            ),
         }
 
         # 传感器

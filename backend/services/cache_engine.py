@@ -130,11 +130,11 @@ class CacheEngine:
         # 查冷层
         conn = sqlite3.connect(_get_db_path())
         row = conn.execute(
-            "SELECT id, reply, hit_count FROM cache WHERE id = ? AND is_cached = 1", (key,)
+            "SELECT id, reply, hit_count, last_hit_at FROM cache WHERE id = ? AND is_cached = 1", (key,)
         ).fetchone()
         conn.close()
         if row:
-            entry = {"id": row[0], "reply": row[1], "hit_count": row[2], "last_hit_at": now, "is_cached": True}
+            entry = {"id": row[0], "reply": row[1], "hit_count": row[2], "last_hit_at": row[3], "is_cached": True}
             if now - entry["last_hit_at"] > 7 * 24 * 3600:
                 self.delete(text)
                 return None

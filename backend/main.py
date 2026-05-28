@@ -2,6 +2,8 @@
 智能音箱_无实物 —— 后端服务入口 (v0.2.0)
 FastAPI + WebSocket 实现 AI 语音交互中枢（三道路由分发）
 """
+import asyncio
+import base64
 import json
 import logging
 import os
@@ -11,8 +13,9 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import JSONResponse, StreamingResponse
+import httpx
 
 from services.intent_router import classify
 from services.llm_service import generate_stream, check_model_available, check_deepseek_available, DEFAULT_MODEL
@@ -20,11 +23,12 @@ from services.xiaoai_service import execute as xiaoai_execute
 from services.reasonix_executor import execute as reasonix_execute, is_reasonix_available, get_pending_manager
 from services.cache_engine import get_cache
 from services.memory_engine import get_memory
+from services.whisper_stt import transcribe_audio_base64 as stt_transcribe, is_available as stt_available
 from services.tts_service import text_to_speech_base64
 from services.context_engine import get_context_engine
 from services.search_service import search_to_context
 from services.safety_filter import assess_risk, format_confirm_message, requires_confirmation
-from services.llm_service import strip_search_tags
+from services.llm_service import strip_search_tags, parse_actions
 from services.engine_config import get_config
 from models.virtual_home import VirtualHome, get_virtual_time
 
@@ -37,26 +41,40 @@ PORT = 8000
 
 def _kill_old_process():
     """杀掉占用目标端口的旧进程，确保新代码能启动"""
-    if sys.platform != "win32":
-        return
     try:
-        result = subprocess.run(
-            ["netstat", "-ano"], capture_output=True, text=True, timeout=10
-        )
-        killed = False
-        for line in result.stdout.splitlines():
-            if f":{PORT}" in line and "LISTENING" in line:
-                parts = line.strip().split()
-                pid = parts[-1]
-                print(f"[启动] 发现旧进程 PID={pid} 占用端口 {PORT}，正在终止...")
-                subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
-                killed = True
-        if killed:
-            import time
-            time.sleep(1)  # 等一下让 OS 释放端口
-            print("[启动] 旧进程已清理，端口已释放")
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["netstat", "-ano"], capture_output=True, text=True, timeout=10
+            )
+            killed = False
+            for line in result.stdout.splitlines():
+                if f":{PORT}" in line and "LISTENING" in line:
+                    parts = line.strip().split()
+                    pid = parts[-1]
+                    print(f"[启动] 发现旧进程 PID={pid} 占用端口 {PORT}，正在终止...")
+                    subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+                    killed = True
+            if killed:
+                import time
+                time.sleep(1)
+                print("[启动] 旧进程已清理，端口已释放")
+            else:
+                print(f"[启动] 端口 {PORT} 空闲")
         else:
-            print(f"[启动] 端口 {PORT} 空闲")
+            # Linux/macOS: 使用 fuser/lsof
+            result = subprocess.run(
+                ["lsof", "-ti", f":{PORT}"], capture_output=True, text=True, timeout=10
+            )
+            pids = result.stdout.strip().splitlines()
+            if pids and pids[0]:
+                for pid in pids:
+                    print(f"[启动] 发现旧进程 PID={pid} 占用端口 {PORT}，正在终止...")
+                    subprocess.run(["kill", "-9", pid], capture_output=True)
+                import time
+                time.sleep(1)
+                print("[启动] 旧进程已清理，端口已释放")
+            else:
+                print(f"[启动] 端口 {PORT} 空闲")
     except Exception as e:
         print(f"[启动] 清理旧进程时出错: {e}")
 
@@ -65,7 +83,7 @@ _kill_old_process()
 
 # ===== 非阻塞 TTS 辅助 =====
 async def _maybe_tts(ws: WebSocket, reply: str, path: str):
-    """非阻塞发送 TTS 音频（Edge TTS），静默失败 → 前端自动降级 speechSynthesis"""
+    """非阻塞发送 TTS 音频，失败时通知前端降级 speechSynthesis"""
     if not reply or not reply.strip():
         return
     try:
@@ -77,26 +95,115 @@ async def _maybe_tts(ws: WebSocket, reply: str, path: str):
                 "text": reply[:120],
                 "path": path,
             })
+        else:
+            await ws.send_json({
+                "type": "tts_failed",
+                "text": reply[:200],
+                "reason": "TTS 合成失败，请前端降级",
+            })
     except Exception:
-        pass  # 静默降级
+        await ws.send_json({
+            "type": "tts_failed",
+            "text": reply[:200],
+            "reason": "TTS 异常",
+        })
 
 
-def _is_suggestion(text: str) -> bool:
-    """判断文本是否为建议性语句（AI的提议而不是用户指令）"""
-    suggestion_markers = [
-        "要不要", "好吗", "好不好", "如何", "怎么样",
-        "想不想", "需要我帮你", "是否要", "要不要我",
-        "我建议", "推荐你", "你可以试试", "你觉得呢",
-        "需要我为你", "可以为你",
-    ]
-    for m in suggestion_markers:
-        if m in text:
-            return True
-    # 以问号结尾的较短语句多为建议/询问
-    text_clean = text.strip()
-    if len(text_clean) < 50 and text_clean.endswith(("？", "?", "吧")):
-        return True
-    return False
+# ===== 音乐搜索缓存（供"换一首"使用） =====
+_search_cache: dict[str, list[dict]] = {}  # query → 前3条外部搜索结果
+
+
+def _clean_song_query(text: str) -> str:
+    """清理搜索词：移除指令词、语气词，只保留歌名关键词"""
+    import re as _re
+    cleaned = _re.sub(r"^(播放|放|来一首|我想听|我要听|点一首|给我放|给我播|播)\s*", "", text)
+    cleaned = _re.sub(r"[啊哦嗯呀吧啦呗么]+$", "", cleaned)
+    return cleaned.strip()
+
+
+# ===== 音乐控制辅助 =====
+async def _send_music_control(ws, music_action: dict):
+    """发送音乐控制消息，如果 play 时携带 query 则先搜索歌曲"""
+    from services.music_service import MusicService
+    from playlist_service import get_all_songs, search_local
+
+    action = music_action.get("action", "play")
+    query = music_action.get("query", "")
+
+    if action == "play" and query:
+        # 清理搜索关键词
+        clean_query = _clean_song_query(query)
+        logger.info(f"搜索歌曲: '{query}' (清理后: '{clean_query}')")
+
+        # 1. 优先本地歌单搜索（含 difflib 模糊匹配）
+        local_hit = search_local(clean_query) if clean_query else None
+        if local_hit:
+            song = {
+                "song_id": f"local_{local_hit['filename']}",
+                "song_name": local_hit["song_name"], "singers": local_hit["artist"],
+                "album": "", "source": "local", "duration": "", "duration_s": 0,
+                "cover_url": "", "download_url": local_hit["url"], "ext": "mp3",
+                "file_size": "", "file_size_bytes": 0, "quality": "", "lyric": "",
+            }
+            await ws.send_json({
+                "type": "music_control", "action": "play",
+                "song_id": song["song_id"], "song_name": song["song_name"],
+                "singers": song["singers"], "download_url": song["download_url"],
+                "source": "local", "songs": [song],
+            })
+            logger.info(f"本地命中: {song['song_name']} - {song['singers']}")
+            return
+
+        # 2. 外部 API 搜索
+        ms = MusicService()
+        songs = await ms.search_songs(clean_query)
+        if songs:
+            first = songs[0]
+            # 缓存前3条结果用于"换一首"
+            _search_cache[clean_query] = songs[:3]
+            await ws.send_json({
+                "type": "music_control", "action": "play",
+                "song_id": first.get("song_id", ""), "song_name": first.get("song_name", ""),
+                "singers": first.get("singers", ""), "album": first.get("album", ""),
+                "source": first.get("source", ""), "duration": first.get("duration", ""),
+                "duration_s": first.get("duration_s", 0),
+                "cover_url": first.get("cover_url", ""), "download_url": first.get("download_url", ""),
+                "ext": first.get("ext", "mp3"), "songs": songs,
+            })
+            logger.info(f"音乐结果: {first.get('song_name', '')} by {first.get('singers', '')} ({len(songs)}条, 缓存前{len(songs[:3])}条)")
+        else:
+            logger.info(f"音乐搜索无结果: {query}，不触发播放")
+            await ws.send_json({
+                "type": "chat_error",
+                "message": f"未找到歌曲「{query}」，请换个关键词试试",
+            })
+    elif action == "play" and not query:
+        all_local = get_all_songs()
+        if all_local:
+            songs = []
+            for s in all_local:
+                songs.append({
+                    "song_id": f"local_{s['filename']}", "song_name": s["song_name"],
+                    "singers": s["artist"], "album": "", "source": "local",
+                    "duration": "", "duration_s": 0, "cover_url": "",
+                    "download_url": s["url"], "ext": "mp3",
+                    "file_size": "", "file_size_bytes": 0, "quality": "", "lyric": "", "bitrate": "", "local": True,
+                })
+            first = songs[0]
+            await ws.send_json({
+                "type": "music_control", "action": "play",
+                "song_name": first["song_name"], "singers": first["singers"],
+                "download_url": first["download_url"], "songs": songs,
+            })
+            logger.info(f"播放全部本地歌单: {len(songs)} 首")
+        else:
+            logger.info("本地歌单为空，不触发播放")
+            await ws.send_json({
+                "type": "chat_error",
+                "message": "本地歌单为空，请先添加音乐文件到 public/music/ 目录",
+            })
+    else:
+        await ws.send_json({"type": "music_control", "action": action})
 
 
 # ===== 全局虚拟家庭实例 =====
@@ -121,6 +228,9 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning(f"模型 {DEFAULT_MODEL} 未找到")
     logger.info(f"Reasonix CLI 可用: {is_reasonix_available()}")
+    logger.info("预加载 Whisper STT 模型（后台下载）...")
+    from services.whisper_stt import preload_model
+    await preload_model()
     logger.info("三道路由分发已启用")
     yield
 
@@ -144,6 +254,26 @@ async def health_check():
         "router": "xiaoai | info_query | mixed | reasonix | llm",
         "last_route": d.path,
     })
+
+
+@app.get("/api/proxy/music")
+async def proxy_music(url: str = Query(..., description="要代理的音乐URL")):
+    """代理第三方音乐资源，解决跨域播放问题"""
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            })
+            return StreamingResponse(
+                resp.aiter_bytes(),
+                status_code=200,
+                media_type=resp.headers.get("content-type", "audio/mpeg"),
+                headers={"Content-Length": resp.headers.get("content-length", ""),
+                         "Accept-Ranges": "bytes"},
+            )
+    except Exception as e:
+        logger.warning(f"音乐代理失败: {e}")
+        return JSONResponse({"error": "代理失败"}, status_code=502)
 
 
 @app.websocket("/api/ws")
@@ -301,7 +431,6 @@ async def websocket_endpoint(ws: WebSocket):
                 accept = data.get("accept", False)
                 if accept and _pending_safety_cmd:
                     logger.info(f"安全确认通过，执行: {_pending_safety_cmd[:50]}...")
-                    import asyncio
                     proc = await asyncio.create_subprocess_shell(
                         _pending_safety_cmd,
                         stdout=asyncio.subprocess.PIPE,
@@ -346,6 +475,21 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "engine_config", "config": cfg.to_dict(), "reset": True})
                 continue
 
+            # ===== 流式 STT：分段发到后端，实时返回转写结果 =====
+            # ===== 语音转写：一次性接收完整音频，一次转写 =====
+            if msg_type == "audio_stream":
+                audio_b64 = data.get("audio", "")
+                if not audio_b64:
+                    continue
+                logger.info("STT 转写 (%d bytes)", len(audio_b64))
+                text = await stt_transcribe(audio_b64)
+                if text:
+                    await ws.send_json({"type": "stt_result", "text": text})
+                else:
+                    await ws.send_json({"type": "error", "error": "语音转写失败"})
+                continue
+
+
             if msg_type == "chat":
                 text = data.get("text", "").strip()
                 if not text:
@@ -360,16 +504,16 @@ async def websocket_endpoint(ws: WebSocket):
                     "允许", "批准",                                    # 正式
                     "开始", "开始吧", "开工", "开干", "搞起", "走起",   # 启动
                     "可以", "可以了", "行", "行吧",                     # 同意
-                    "好的", "好", "好啊", "好吧", "好呀", "好嘞",       # 好字辈
-                    "来", "来吧", "上", "上吧",                        # 来/上
+                    "好的", "好啊", "好吧", "好呀", "好嘞",             # 好字辈
+                    "来吧", "上吧",                                    # 来/上
                     "做吧", "弄吧", "干吧",                             # 干活
                     "确定", "确认",                                     # 确认
                     "就这样", "就这么办",                               # 就这样
                     "ok", "OK", "okay", "go", "yes",                   # 英文
                 }
                 _clean = re.sub(r'[\s,，。！？、；：""''《》!?;:\'()\u3000]+', '', text)
-                # 精确匹配 或 短句（≤6字）前缀命中
-                _matched = _clean in APPROVAL_WORDS or (len(_clean) <= 6 and any(_clean.startswith(w) for w in APPROVAL_WORDS if len(w) <= len(_clean)))
+                # 精确匹配，避免口语短词误触发
+                _matched = _clean in APPROVAL_WORDS
                 if _matched:
                     # 先检查是否有待安全确认的任务
                     pm = get_pending_manager()
@@ -423,7 +567,7 @@ async def websocket_endpoint(ws: WebSocket):
                         logger.info(f"缓存命中: {prompt[:30]}...")
                         await ws.send_json({"type": "token", "text": cached["reply"]})
                         await ws.send_json({"type": "done", "path": "cache", "reply": cached["reply"], "model": "cache"})
-                        await _maybe_tts(ws, cached["reply"], "cache")
+                        asyncio.create_task(_maybe_tts(ws, cached["reply"], "cache"))
                         return
 
                     # 0.5 自动搜索（信息查询类）
@@ -486,12 +630,31 @@ async def websocket_endpoint(ws: WebSocket):
                                 else:
                                     full_reply = full_reply.replace(f'[SEARCH]{q}[/SEARCH]', '（搜索无结果）', 1)
 
+                    # 处理 [ACTIONS] 标签：模型主动输出的设备/音乐操作
+                    llm_actions = None
+                    if '[ACTIONS]' in full_reply:
+                        full_reply, llm_actions = parse_actions(full_reply)
+                        if llm_actions:
+                            logger.info(f"LLM 输出 [ACTIONS]: {json.dumps(llm_actions, ensure_ascii=False)[:200]}")
+
                     full_reply = strip_search_tags(full_reply)
                     actual_model = model_used[0] if model_used else "unknown"
                     logger.info(f"大模型回复完成, 模型: {actual_model}")
                     await ws.send_json({"type": "done", "path": route_path, "reply": full_reply.strip(), "model": actual_model})
 
-                    await _maybe_tts(ws, full_reply.strip(), route_path)
+                    asyncio.create_task(_maybe_tts(ws, full_reply.strip(), route_path))
+
+                    # 执行 LLM 通过 [ACTIONS] 标签输出的操作
+                    if llm_actions:
+                        music_act = llm_actions.get("music")
+                        device_acts = llm_actions.get("devices", [])
+                        if music_act and isinstance(music_act, dict):
+                            await _send_music_control(ws, music_act)
+                            logger.info(f"[ACTIONS] 执行音乐: {music_act}")
+                        if device_acts:
+                            for da in device_acts:
+                                virtual_home.execute(da.get("device", ""), da.get("action", "toggle"))
+                            await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
 
                     # 5. 更新对话历史（非缓存路径）
                     reply_text = full_reply.strip()
@@ -502,34 +665,32 @@ async def websocket_endpoint(ws: WebSocket):
                         if len(conversation_history) > 20:
                             conversation_history[:2] = []  # 裁掉最早的一轮（user+assistant）
 
-                    # 2. 大模型回复后：从「用户原文 + LLM回复」两端提取设备/音乐操作
-                    #    规则：用户原文隐含意图（如"我想放松一下"）→ 执行
-                    #          LLM建议性回复（如"要不要播放音乐"）→ 不执行，仅文本展示
+                    # 2. 用户原文隐含意图提取（仅从用户输入提取，不碰 LLM 回复）
+                    #    LLM 若判定用户有明确操作意图 → 必须通过 [ACTIONS] 标签输出（上方已处理）
+                    #    此处的 classify(prompt) 只处理用户原文中已有关键词但走了 llm 路由的情况
                     if route_path == "llm" and full_reply.strip():
                         implicit = classify(prompt)
-                        # 如果用户原文没提取到，从 LLM 回复中再试（但过滤建议性语句）
-                        if implicit.path != "xiaoai" or (not implicit.device_actions and not implicit.music_action):
-                            from_reply = classify(full_reply.strip())
-                            if (from_reply.path == "xiaoai"
-                                    and (from_reply.device_actions or from_reply.music_action)
-                                    and not _is_suggestion(full_reply)):
-                                implicit = from_reply
-                                logger.info(f"从LLM回复中提取到操作: {full_reply[:60]}...")
-
                         if implicit.path == "xiaoai" and (implicit.device_actions or implicit.music_action):
-                            implicit_result = xiaoai_execute(
-                                virtual_home=virtual_home,
-                                device_actions=implicit.device_actions,
-                                text=prompt,
-                                matched_key=implicit.matched_key,
-                                music_action=implicit.music_action,
-                            )
-                            if implicit_result["handled"]:
-                                if implicit_result.get("music_action"):
-                                    await ws.send_json({"type": "music_control", "action": implicit_result["music_action"]["action"]})
-                                if implicit_result["results"]:
-                                    await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
-                                logger.info(f"LLM回复后自动执行: devices={implicit.device_actions} music={implicit.music_action}")
+                            # 校验音乐查询质量：拒绝明显不是歌曲名的 query
+                            if implicit.music_action:
+                                q = implicit.music_action.get("query", "")
+                                if q and (len(q) > 30 or any(p in q for p in ["。", "！", "？", "，", "希望", "如果", "推荐", "告诉", "比如", "或", "之类"])):
+                                    logger.info(f"用户原文音乐查询无效({q[:40]})，丢弃")
+                                    implicit.music_action = None
+                            if implicit.device_actions or implicit.music_action:
+                                implicit_result = xiaoai_execute(
+                                    virtual_home=virtual_home,
+                                    device_actions=implicit.device_actions,
+                                    text=prompt,
+                                    matched_key=implicit.matched_key,
+                                    music_action=implicit.music_action,
+                                )
+                                if implicit_result["handled"]:
+                                    if implicit_result.get("music_action"):
+                                        await _send_music_control(ws, implicit_result["music_action"])
+                                    if implicit_result["results"]:
+                                        await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
+                                    logger.info(f"用户原文隐含操作执行: devices={implicit.device_actions} music={implicit.music_action}")
 
                     # 3. 记忆提取（用户原文 + LLM 回复双向提取）
                     if route_path == "llm" and full_reply.strip():
@@ -571,9 +732,9 @@ async def websocket_endpoint(ws: WebSocket):
                     if result["handled"]:
                         await ws.send_json({"type": "token", "text": result["reply"]})
                         await ws.send_json({"type": "done", "path": "xiaoai", "reply": result["reply"], "model": "xiaoai"})
-                        await _maybe_tts(ws, result["reply"], "xiaoai")
+                        asyncio.create_task(_maybe_tts(ws, result["reply"], "xiaoai"))
                         if result.get("music_action"):
-                            await ws.send_json({"type": "music_control", "action": result["music_action"]["action"]})
+                            await _send_music_control(ws, result["music_action"])
                         if result["results"]:
                             await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
                         continue
@@ -611,7 +772,7 @@ async def websocket_endpoint(ws: WebSocket):
                             if sub_result["handled"]:
                                 await ws.send_json({"type": "token", "text": sub_result["reply"]})
                                 if sub_result.get("music_action"):
-                                    await ws.send_json({"type": "music_control", "action": sub_result["music_action"]["action"]})
+                                    await _send_music_control(ws, sub_result["music_action"])
                                 if sub_result["results"]:
                                     await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
 
@@ -660,3 +821,8 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         # 停止情境引擎
         await ce.stop()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level="info")

@@ -128,15 +128,24 @@ async def execute(prompt: str, cwd: str | None = None) -> AsyncIterator[str]:
 
     try:
         # reasonix run <task> — 流式输出到 stdout
-        # 使用 -m/--model 指定快速模型
-        proc = await asyncio.create_subprocess_exec(
-            reasonix_path, "run", prompt,
-            "--model", "deepseek-v4-flash",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=work_dir,
-            env=env,
-        )
+        # Windows .cmd 文件需要通过 shell 运行
+        if sys.platform == "win32" and reasonix_path.endswith(".cmd"):
+            proc = await asyncio.create_subprocess_shell(
+                f'"{reasonix_path}" run "{prompt}" --model deepseek-v4-flash',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=work_dir,
+                env=env,
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                reasonix_path, "run", prompt,
+                "--model", "deepseek-v4-flash",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=work_dir,
+                env=env,
+            )
 
         if proc.stdout:
             async for line in proc.stdout:

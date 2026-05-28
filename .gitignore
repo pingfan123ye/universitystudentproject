@@ -21,3 +21,28 @@ SAPI.txt
 config.js
 .mi.json
 frontend/public/music/*.mp3
+
+# 图片 / 截图
+*.jpg
+*.jpeg
+*.png
+
+# 压缩包
+*.tar.gz
+*.zip
+
+# 日志
+backend/logs/
+
+# 生成输出
+musicdl_outputs/
+backend/musicdl_outputs/
+
+# 临时调试脚本
+_*.py
+_check_*.py
+_fix_*.py
+
+# 其他
+UserApp/
+aichain_sdk-latest.tar.gz

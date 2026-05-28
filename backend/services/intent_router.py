@@ -106,38 +106,143 @@ MUSIC_ACTIONS = {
               "放背景音乐", "播放背景音乐", "播放轻音乐", "来点音乐", "来首",
               "放轻松音乐", "放点歌", "放首歌", "来点歌", "播点音乐", "播点歌",
               "来段音乐", "想听音乐", "想听歌", "放个歌", "给我放", "给我唱",
-              "来点背景音乐", "放些音乐", "放些歌", "播一下音乐", "播一下歌"],
+              "来点背景音乐", "放些音乐", "放些歌", "播一下音乐", "播一下歌",
+              # 简化匹配：具体歌曲名引用
+              "播放", "我想听", "想听", "我要听", "给我放", "放一个", "放个",
+              "唱一个", "点歌", "点一首", "来一个", "来一曲", "来一首",
+              # 繁體中文（Whisper 可能输出繁体）
+              "聽歌", "聽音樂", "想聽", "我想聽", "我要聽", "來首歌", "唱首歌",
+              "放音樂", "放個音樂", "放點音樂", "來點音樂", "播音樂", "播歌",
+              "播放音樂", "播放歌曲", "點歌", "點一首", "來一曲", "給我放", "給我唱"],
     "pause": ["暂停音乐", "暂停播放", "暂停", "停止播放", "停止音乐",
               "关掉音乐", "关闭音乐", "关音乐", "停掉音乐", "别放了", "别唱了",
-              "停了音乐", "把音乐关了", "把音乐关掉", "关背景音乐", "别播了", "别放了"],
-    "next":  ["下一首", "下一曲", "换一首", "切歌", "换首歌", "换个歌"],
+              "停了音乐", "把音乐关了", "把音乐关掉", "关背景音乐", "别播了", "别放了",
+              # 繁體中文
+              "暫停音樂", "暫停播放", "暫停", "關掉音樂", "關閉音樂", "關音樂",
+              "停掉音樂", "別放了", "別唱了", "把音樂關了", "把音樂關掉", "別播了"],
+    "next":  ["下一首", "下一曲", "换一首", "切歌", "换首歌", "换个歌",
+              # 繁體中文
+              "下一首", "下一曲", "換一首", "切歌", "換首歌", "換個歌"],
     "prev":  ["上一首", "上一曲"],
+    "resume": ["继续播放", "继续", "恢复播放",
+               # 繁體中文
+               "繼續播放", "繼續", "恢復播放"],
+    "stop": ["停了", "停止", "关掉音乐", "关闭音乐",
+             # 繁體中文
+             "停了", "關掉音樂", "關閉音樂"],
 }
 
 VOLUME_KEYWORDS = ["音量", "大声", "小声", "静音", "声音"]
 
 SCENE_KEYWORDS = ["离家模式", "回家模式", "晚安", "起床模式", "观影模式", "阅读模式"]
 
+# 严格的音乐播放意图正则：必须包含 动作词 + 歌名/描述
+# "你喜欢音乐吗"、"听歌识曲" → 不匹配；"播放夜空中最亮的星" → 匹配
+MUSIC_PLAY_PATTERNS = [
+    re.compile(r"(播放|放|来一首|我想听|我要听|点一首|给我放|给我播)\s*[一-龥a-zA-Z0-9]+"),
+    re.compile(r"听\s*[一-龥a-zA-Z0-9]+\s*(这首歌|这首)"),
+    re.compile(r"播\s*[一-龥a-zA-Z0-9]+"),
+]
+
+
+def _is_music_play_intent(text: str) -> bool:
+    """只有同时包含动作词+歌名内容才算音乐播放意图"""
+    for p in MUSIC_PLAY_PATTERNS:
+        if p.search(text):
+            return True
+    return False
+
 # 设备可处理的基础查询
 XIAOAI_QUERY = ["时间", "几点"]
 XIAOAI_UTILITY = ["闹钟", "提醒", "倒计时", "计时"]
 
 
+def _extract_music_query(text: str) -> str:
+    """
+    从文本中提取歌曲搜索关键词。
+    例如：
+      "播放周杰伦的晴天" -> "周杰伦 晴天"
+      "来一首七里香" -> "七里香"
+      "我想听陈奕迅的歌" -> "陈奕迅"
+      "我想听歌了请帮我播放歌曲" -> ""（播放本地歌单）
+    """
+    # 去掉通用音乐关键词前缀（按长度降序匹配最长的）
+    play_prefixes = sorted(MUSIC_ACTIONS["play"], key=len, reverse=True)
+    query = text
+    for p in play_prefixes:
+        if p in query:
+            query = query.replace(p, "", 1)
+            break
+    # 去掉标点和无意义字符
+    PUNCT_RE = re.compile(r"[\s,，。！？、；：“”‘’《》!?;:'()]+")
+    query = PUNCT_RE.sub(' ', query).strip()
+    # 去掉自然语言碎片（不是歌曲名/歌手名的一部分）
+    noise = [
+        '请帮我', '请帮助', '帮我', '给我', '我想', '我要', '请你',
+        '来一首', '来一个', '来一段', '来一曲', '来个',
+        '一首', '一个', '一段', '一曲',
+        '听歌', '聽歌', '听音乐', '聽音樂', '放歌', '放音樂',
+    ]
+    for w in sorted(noise, key=len, reverse=True):
+        query = query.replace(w, ' ')
+    # 去掉末尾语气词
+    query = re.sub(r'[吧啊呀哦啦呗么嗯了]$', '', query).strip()
+    # 去掉末尾的"的歌"、"的音乐"、"的歌曲"
+    query = re.sub(r'的(歌|音乐|歌曲)$', '', query).strip()
+    # 合并多余空格
+    query = re.sub(r'\s+', ' ', query).strip()
+    # 如果清洗后只剩无意义词，返回空（触发本地歌单/默认播放）
+    if query in ("", "歌", "音乐", "一首", "个", "点", "下", "首", "曲", "歌曲", "听歌", "聽歌", "听音乐", "聽音樂"):
+        return ""
+    # 太短（单字）或太长（>40字）不靠谱
+    if len(query) < 2 or len(query) > 40:
+        return ""
+    return query
 def _detect_music_action(text: str) -> dict | None:
-    for kw in MUSIC_ACTIONS["pause"]:
+    action = None
+    for kw in MUSIC_ACTIONS["resume"]:
         if kw in text:
-            return {"action": "pause"}
-    for kw in MUSIC_ACTIONS["play"]:
-        if kw in text:
-            return {"action": "play"}
-    for kw in MUSIC_ACTIONS["next"]:
-        if kw in text:
-            return {"action": "next"}
-    for kw in MUSIC_ACTIONS["prev"]:
-        if kw in text:
-            return {"action": "prev"}
-    if any(kw in text for kw in VOLUME_KEYWORDS):
-        return {"action": "play"}
+            action = "resume"
+            break
+    if not action:
+        for kw in MUSIC_ACTIONS["pause"]:
+            if kw in text:
+                action = "pause"
+                break
+    if not action:
+        for kw in MUSIC_ACTIONS["stop"]:
+            if kw in text:
+                action = "stop"
+                break
+    if not action:
+        for kw in MUSIC_ACTIONS["play"]:
+            if kw in text:
+                # 播放意图需要严格匹配：动作词 + 歌名内容
+                if _is_music_play_intent(text):
+                    action = "play"
+                break
+    if not action:
+        for kw in MUSIC_ACTIONS["next"]:
+            if kw in text:
+                action = "next"
+                break
+    if not action:
+        for kw in MUSIC_ACTIONS["prev"]:
+            if kw in text:
+                action = "prev"
+                break
+    # 纯音量调节不自动触发播放
+    if not action and any(kw in text for kw in VOLUME_KEYWORDS):
+        if _is_music_play_intent(text):
+            action = "play"
+
+    if action:
+        result = {"action": action}
+        if action == "play":
+            query = _extract_music_query(text)
+            if query:
+                result["query"] = query
+        return result
     return None
 
 

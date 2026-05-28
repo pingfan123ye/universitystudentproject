@@ -46,7 +46,7 @@ export interface WSResponse {
     | 'tts_audio' | 'time_sync'
     | 'proactive_alert' | 'alerts_suppressed'
     | 'safety_confirm' | 'engine_config'
-    | 'search_status';
+    | 'search_status' | 'transcription_text' | 'stt_result' | 'tts_failed';
   text?: string;
   path?: RoutePath;
   reply?: string;
@@ -54,6 +54,19 @@ export interface WSResponse {
   error?: string;
   action?: string;
   model?: string;
+  // music_control payload
+  song_id?: string;
+  song_name?: string;
+  singers?: string;
+  album?: string;
+  source?: string;
+  duration?: string;
+  duration_s?: number;
+  cover_url?: string;
+  download_url?: string;
+  ext?: string;
+  songs?: SongInfo[];
+  // device
   devices?: Record<string, DeviceInfo>;
   entries?: CacheEntry[];
   id?: string;
@@ -103,4 +116,37 @@ export interface TimeState {
   current_time: string;   // HH:MM
   speed: number;          // 加速比, 1 = 实时
   paused: boolean;
+}
+
+// ── 音乐播放 ──
+export interface SongInfo {
+  song_id: string;
+  song_name: string;
+  singers: string;
+  album: string;
+  source: string;
+  duration: string;
+  duration_s: number;
+  cover_url: string;
+  download_url: string;
+  ext: string;
+  file_size: string;
+  file_size_bytes: number;
+  quality: string;
+  lyric: string;
+}
+
+export interface MusicControlData {
+  action: string;
+  song_id?: string;
+  song_name?: string;
+  singers?: string;
+  album?: string;
+  source?: string;
+  duration?: string;
+  duration_s?: number;
+  cover_url?: string;
+  download_url?: string;
+  ext?: string;
+  songs?: SongInfo[];
 }
