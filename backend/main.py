@@ -24,6 +24,7 @@ from services.reasonix_executor import execute as reasonix_execute, is_reasonix_
 from services.cache_engine import get_cache
 from services.memory_engine import get_memory
 from services.whisper_stt import transcribe_audio_base64 as stt_transcribe, is_available as stt_available
+from services.stt_corrector import correct as stt_correct
 from services.tts_service import text_to_speech_base64
 from services.context_engine import get_context_engine
 from services.search_service import search_to_context
@@ -114,93 +115,230 @@ _search_cache: dict[str, list[dict]] = {}  # query → 前3条外部搜索结果
 
 
 def _clean_song_query(text: str) -> str:
-    """清理搜索词：移除指令词、语气词，只保留歌名关键词"""
+    """清理搜索词：移除指令词、唤醒词、礼貌前缀、语气词，只保留歌名关键词"""
     import re as _re
-    cleaned = _re.sub(r"^(播放|放|来一首|我想听|我要听|点一首|给我放|给我播|播)\s*", "", text)
-    cleaned = _re.sub(r"[啊哦嗯呀吧啦呗么]+$", "", cleaned)
+    # 1. 去掉唤醒词前缀
+    cleaned = _re.sub(r"^(小智小智|小智|小字小字|小字|小子小子|小子)\s*(帮我|给我|來|来|)\s*", "", text)
+    # 2. 去掉礼貌/填充前缀
+    cleaned = _re.sub(r"^(好的|好|帮我|给我|能不能|可不可以|可以|麻烦你|请你|請你|幫我|給我|帮忙|幫忙|请|請|那个|这个)\s*", "", cleaned)
+    # 3. 去掉指令词前缀
+    cleaned = _re.sub(r"^(播放|放|来一首|我想听|我要听|点一首|给我放|给我播|播|来首|来点|想听|听)\s*", "", cleaned)
+    # 4. 去掉任意位置的唤醒词（如"我想听歌了小智"中的"小智"）
+    cleaned = _re.sub(r"\s*(小智小智|小智|小字小字|小字|小子小子|小子)\s*", " ", cleaned)
+    # 5. 去掉首尾虚词
+    cleaned = _re.sub(r"^[了吧啊呀哦啦呗么嗯了]+", "", cleaned)
+    cleaned = _re.sub(r"[了吧啊呀哦啦呗么嗯了]+$", "", cleaned)
+    # 6. 如果是纯泛化请求，返回空串让上游随机播放
+    if _re.match(r"^(歌曲|歌|音乐|音樂|一首歌|几首歌|来首歌|随便|随便来|随便听|随便听歌|来点音乐|什么歌|啥歌|点儿歌|点歌|听歌|想听歌|什么都行|啥都行|都可以|随便什么|什么都可|随意|随机|任意)\s*$", cleaned):
+        return ""
+    # 7. 去掉尾部的语气词
+    cleaned = _re.sub(r"[啊哦嗯呀吧啦呗么]$", "", cleaned)
+    # 8. 去掉口语功能词（永远不可能是歌名/歌手名的词）
+    cleaned = _re.sub(r'\b(好的|进行|一下|那个|这个|选首|选个|来帮我|帮我选|选手|选手给|随机|随机多|多放|多|我让|我讓|让你|讓你|随便|隨便|随意|隨意|字幕)\b', ' ', cleaned)
+    cleaned = _re.sub(r'\s+', ' ', cleaned)
     return cleaned.strip()
 
 
 # ===== 音乐控制辅助 =====
+def _is_chinese_query(query: str) -> bool:
+    """检测 query 是否包含中文字符（用于版权拦截判断）"""
+    return bool(re.search(r'[一-鿿]', query))
+
+
+async def _announce_and_play(ws, song: dict):
+    """发送播放指令 + TTS 语音播报歌名"""
+    name = song.get("song_name", "")
+    singer = song.get("singers", "")
+    await ws.send_json({
+        "type": "music_control", "action": "play",
+        "song_id": song.get("song_id", ""),
+        "song_name": name,
+        "singers": singer,
+        "album": song.get("album", ""),
+        "source": song.get("source", ""),
+        "duration": song.get("duration", ""),
+        "duration_s": song.get("duration_s", 0),
+        "cover_url": song.get("cover_url", ""),
+        "download_url": song.get("download_url", ""),
+        "ext": song.get("ext", "mp3"),
+        "songs": [song],
+    })
+    # TTS 播报：告诉用户正在播放什么
+    if singer:
+        announce_text = f"好的，为你播放{singer}的{name}"
+    else:
+        announce_text = f"好的，为你播放{name}"
+    asyncio.create_task(_maybe_tts(ws, announce_text, "music"))
+    logger.info(f"播放: {name} - {singer}")
+
+
+def _build_local_song(picked: dict) -> dict:
+    return {
+        "song_id": f"local_{picked['filename']}",
+        "song_name": picked["song_name"], "singers": picked["artist"],
+        "album": "", "source": "local", "duration": "", "duration_s": 0,
+        "cover_url": "", "download_url": picked["url"], "ext": "mp3",
+        "file_size": "", "file_size_bytes": 0, "quality": "", "lyric": "",
+    }
+
+
 async def _send_music_control(ws, music_action: dict):
     """发送音乐控制消息，如果 play 时携带 query 则先搜索歌曲"""
-    from services.music_service import MusicService
+    from services.music_service import MusicService, _search_jamendo
     from playlist_service import get_all_songs, search_local
 
     action = music_action.get("action", "play")
     query = music_action.get("query", "")
 
+    # ── 切歌/上一首：无播放列表时给出反馈 ──
+    if action in ("next", "prev"):
+        if not _search_cache:
+            # 没有搜索缓存，无法切歌
+            msg = "当前没有正在播放的歌曲，你想听什么？"
+            await ws.send_json({"type": "chat_error", "message": msg})
+            asyncio.create_task(_maybe_tts(ws, msg, "music"))
+            logger.info("切歌请求但无播放缓存，提示用户")
+            return
+        # 有缓存 → 正常切歌（前端当前播放队列处理）
+        await ws.send_json({"type": "music_control", "action": action})
+        return
+
     if action == "play" and query:
-        # 清理搜索关键词
         clean_query = _clean_song_query(query)
         logger.info(f"搜索歌曲: '{query}' (清理后: '{clean_query}')")
 
-        # 1. 优先本地歌单搜索（含 difflib 模糊匹配）
-        local_hit = search_local(clean_query) if clean_query else None
-        if local_hit:
-            song = {
-                "song_id": f"local_{local_hit['filename']}",
-                "song_name": local_hit["song_name"], "singers": local_hit["artist"],
-                "album": "", "source": "local", "duration": "", "duration_s": 0,
-                "cover_url": "", "download_url": local_hit["url"], "ext": "mp3",
-                "file_size": "", "file_size_bytes": 0, "quality": "", "lyric": "",
-            }
+        # 发送搜索状态给前端
+        await ws.send_json({
+            "type": "music_search_status",
+            "status": "searching",
+            "query": clean_query or query,
+        })
+
+        # ── 记忆偏好联动：短 query（可能只是歌手名）查记忆扩展 ──
+        if clean_query and len(clean_query) < 6:
+            try:
+                memory = get_memory()
+                memories = memory.get_all()
+                for mem in memories:
+                    if mem.get("category") == "preference" and clean_query in str(mem.get("value", "")):
+                        expanded = f"{clean_query} 热门歌曲"
+                        logger.info(f"记忆偏好联动: '{clean_query}' → '{expanded}'")
+                        clean_query = expanded
+                        break
+            except Exception:
+                pass  # 记忆引擎失败不影响播放
+
+        # 泛化请求（无具体歌名）→ 随机播放本地歌单
+        if not clean_query:
+            all_local = get_all_songs()
+            if all_local:
+                import random as _random
+                picked = _random.choice(all_local)
+                await _announce_and_play(ws, _build_local_song(picked))
+                logger.info(f"泛化播放，随机选择: {picked['song_name']} - {picked['artist']}")
+                return
+            logger.info("泛化播放请求但本地歌单为空")
             await ws.send_json({
-                "type": "music_control", "action": "play",
-                "song_id": song["song_id"], "song_name": song["song_name"],
-                "singers": song["singers"], "download_url": song["download_url"],
-                "source": "local", "songs": [song],
+                "type": "music_search_status",
+                "status": "not_found",
+                "message": "本地歌单为空，请先添加音乐文件",
             })
-            logger.info(f"本地命中: {song['song_name']} - {song['singers']}")
             return
 
-        # 2. 外部 API 搜索
+        # ── 四级搜索流水线 ──
+        # 1. 本地歌单搜索（含 difflib 模糊匹配）
+        local_hit = search_local(clean_query) if clean_query else None
+        if local_hit:
+            await _announce_and_play(ws, _build_local_song(local_hit))
+            logger.info(f"本地命中: {local_hit['song_name']} - {local_hit['artist']}")
+            return
+
+        # 2. Jamendo API（CC 授权独立音乐，有真实可播放 MP3 URL）
+        jamendo_songs = await _search_jamendo(clean_query)
+        if jamendo_songs:
+            first = jamendo_songs[0]
+            if first.get("download_url"):
+                _search_cache[clean_query] = jamendo_songs[:3]
+                await _announce_and_play(ws, first)
+                logger.info(f"Jamendo 命中: {first.get('song_name', '')} - {first.get('singers', '')}")
+                return
+
+        # 3. Pixabay Music（免费可商用，有真实 MP3 URL）
+        from services.pixabay_music import search_pixabay_music
+        pixabay_songs = await search_pixabay_music(clean_query)
+        if pixabay_songs:
+            first = pixabay_songs[0]
+            if first.get("download_url"):
+                _search_cache[clean_query] = pixabay_songs[:3]
+                await _announce_and_play(ws, first)
+                logger.info(f"Pixabay 命中: {first.get('song_name', '')}")
+                return
+
+        # 4. 163 在线搜索（仅元数据，预览 URL 不可靠，仅作参考）
         ms = MusicService()
         songs = await ms.search_songs(clean_query)
         if songs:
-            first = songs[0]
-            # 缓存前3条结果用于"换一首"
             _search_cache[clean_query] = songs[:3]
+
+            first = songs[0]
+            if first.get("download_url"):
+                await _announce_and_play(ws, first)
+                logger.info(f"163 播放: {first.get('song_name', '')} by {first.get('singers', '')}")
+                return
+            logger.info(f"163 结果无播放链接: {first.get('song_name', '')}")
+
+        # ── 5. 版权拦截：中文 query + 所有源都未命中 → 告知用户 ──
+        if _is_chinese_query(clean_query):
+            msg = "抱歉，我不能为你播放有版权的歌曲。你可以把 mp3 文件放到 music 目录，我就能播放了"
             await ws.send_json({
-                "type": "music_control", "action": "play",
-                "song_id": first.get("song_id", ""), "song_name": first.get("song_name", ""),
-                "singers": first.get("singers", ""), "album": first.get("album", ""),
-                "source": first.get("source", ""), "duration": first.get("duration", ""),
-                "duration_s": first.get("duration_s", 0),
-                "cover_url": first.get("cover_url", ""), "download_url": first.get("download_url", ""),
-                "ext": first.get("ext", "mp3"), "songs": songs,
+                "type": "music_search_status",
+                "status": "copyright_blocked",
+                "message": msg,
+                "query": clean_query,
             })
-            logger.info(f"音乐结果: {first.get('song_name', '')} by {first.get('singers', '')} ({len(songs)}条, 缓存前{len(songs[:3])}条)")
-        else:
-            logger.info(f"音乐搜索无结果: {query}，不触发播放")
-            await ws.send_json({
-                "type": "chat_error",
-                "message": f"未找到歌曲「{query}」，请换个关键词试试",
-            })
-    elif action == "play" and not query:
+            asyncio.create_task(_maybe_tts(ws, msg, "music"))
+            logger.info(f"版权拦截: '{clean_query}'（中文商业版权歌曲，所有源均未命中）")
+            return
+
+        # ── 6. 回退：非中文 → 随机本地 + 告知用户 ──
         all_local = get_all_songs()
         if all_local:
-            songs = []
-            for s in all_local:
-                songs.append({
-                    "song_id": f"local_{s['filename']}", "song_name": s["song_name"],
-                    "singers": s["artist"], "album": "", "source": "local",
-                    "duration": "", "duration_s": 0, "cover_url": "",
-                    "download_url": s["url"], "ext": "mp3",
-                    "file_size": "", "file_size_bytes": 0, "quality": "", "lyric": "", "bitrate": "", "local": True,
-                })
-            first = songs[0]
-            await ws.send_json({
-                "type": "music_control", "action": "play",
-                "song_name": first["song_name"], "singers": first["singers"],
-                "download_url": first["download_url"], "songs": songs,
-            })
-            logger.info(f"播放全部本地歌单: {len(songs)} 首")
+            import random as _random
+            picked = _random.choice(all_local)
+            fallback_msg = f"抱歉，我没找到「{query}」的可播放版本，为你随机播放一首本地歌曲吧"
+            await ws.send_json({"type": "chat_error", "message": fallback_msg})
+            await _announce_and_play(ws, _build_local_song(picked))
+            logger.info(f"回退本地随机: {picked['song_name']} - {picked['artist']}")
         else:
-            logger.info("本地歌单为空，不触发播放")
+            await ws.send_json({
+                "type": "music_search_status",
+                "status": "not_found",
+                "message": f"未找到歌曲「{query}」，本地歌单也为空，请先添加音乐文件",
+                "query": clean_query,
+            })
+
+    elif action == "play" and not query:
+        # 随机播放：优先本地歌单随机选一首 → Pixabay 随机 → 报错
+        all_local = get_all_songs()
+        if all_local:
+            import random as _random
+            picked = _random.choice(all_local)
+            await _announce_and_play(ws, _build_local_song(picked))
+            logger.info(f"随机播放本地: {picked['song_name']} - {picked['artist']}")
+        else:
+            # 本地歌单为空，尝试 Pixabay 随机抓取
+            from services.pixabay_music import search_pixabay_music
+            pixabay_songs = await search_pixabay_music("relaxing music")
+            if pixabay_songs:
+                first = pixabay_songs[0]
+                if first.get("download_url"):
+                    await _announce_and_play(ws, first)
+                    logger.info(f"随机播放 Pixabay: {first.get('song_name', '')}")
+                    return
+            logger.info("随机播放失败：本地和 Pixabay 都无歌曲")
             await ws.send_json({
                 "type": "chat_error",
-                "message": "本地歌单为空，请先添加音乐文件到 public/music/ 目录",
+                "message": "本地歌单为空，在线曲库也未找到歌曲，请先添加音乐文件",
             })
     else:
         await ws.send_json({"type": "music_control", "action": action})
@@ -264,12 +402,16 @@ async def proxy_music(url: str = Query(..., description="要代理的音乐URL")
             resp = await client.get(url, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             })
+            content_type = resp.headers.get("content-type", "audio/mpeg")
+            content_length = resp.headers.get("content-length", "")
+            headers = {"Accept-Ranges": "bytes"}
+            if content_length and content_length.strip():
+                headers["Content-Length"] = content_length
             return StreamingResponse(
                 resp.aiter_bytes(),
                 status_code=200,
-                media_type=resp.headers.get("content-type", "audio/mpeg"),
-                headers={"Content-Length": resp.headers.get("content-length", ""),
-                         "Accept-Ranges": "bytes"},
+                media_type=content_type,
+                headers=headers,
             )
     except Exception as e:
         logger.warning(f"音乐代理失败: {e}")
@@ -475,6 +617,12 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "engine_config", "config": cfg.to_dict(), "reset": True})
                 continue
 
+            if msg_type == "reset":
+                conversation_history.clear()
+                logger.info("对话历史已重置")
+                await ws.send_json({"type": "chat_reset", "message": "对话已重置"})
+                continue
+
             # ===== 流式 STT：分段发到后端，实时返回转写结果 =====
             # ===== 语音转写：一次性接收完整音频，一次转写 =====
             if msg_type == "audio_stream":
@@ -484,6 +632,8 @@ async def websocket_endpoint(ws: WebSocket):
                 logger.info("STT 转写 (%d bytes)", len(audio_b64))
                 text = await stt_transcribe(audio_b64)
                 if text:
+                    # STT 后处理纠错（修正 Whisper 常见误识别）
+                    text = stt_correct(text)
                     await ws.send_json({"type": "stt_result", "text": text})
                 else:
                     await ws.send_json({"type": "error", "error": "语音转写失败"})
@@ -577,7 +727,7 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({
                             "type": "search_status",
                             "status": "searching",
-                            "message": "🔍 正在联网搜索...",
+                            "message": "正在联网搜索...",
                         })
                         search_ctx = await search_to_context(prompt)
                         if search_ctx:
@@ -585,7 +735,7 @@ async def websocket_endpoint(ws: WebSocket):
                             await ws.send_json({
                                 "type": "search_status",
                                 "status": "done",
-                                "message": "🔍 已获取搜索结果",
+                                "message": "已获取搜索结果",
                                 "result": search_ctx[:200] + ("..." if len(search_ctx) > 200 else ""),
                             })
 
@@ -610,27 +760,8 @@ async def websocket_endpoint(ws: WebSocket):
                         await _maybe_tts(ws, full_reply, route_path)
                         return
 
-                    # 处理 [SEARCH] 标签：模型主动触发的搜索请求
-                    if '[SEARCH]' in full_reply or '[/SEARCH]' in full_reply:
-                        import re as _re
-                        queries = _re.findall(r'\[SEARCH\](.*?)\[/SEARCH\]', full_reply, _re.DOTALL)
-                        for q in queries:
-                            q = q.strip()
-                            if q:
-                                logger.info(f"模型触发搜索: {q}")
-                                await ws.send_json({
-                                    "type": "search_status",
-                                    "status": "searching",
-                                    "message": f"🔍 正在搜索: {q[:30]}...",
-                                })
-                                result = await search_to_context(q)
-                                if result:
-                                    full_reply = full_reply.replace(f'[SEARCH]{q}[/SEARCH]', '', 1)
-                                    full_reply += f"\n\n📎 搜索结果 ({q}):\n{result[:500]}"
-                                else:
-                                    full_reply = full_reply.replace(f'[SEARCH]{q}[/SEARCH]', '（搜索无结果）', 1)
-
                     # 处理 [ACTIONS] 标签：模型主动输出的设备/音乐操作
+                    # (SEARCH 标签已在流式输出层过滤，此处仅处理 ACTIONS)
                     llm_actions = None
                     if '[ACTIONS]' in full_reply:
                         full_reply, llm_actions = parse_actions(full_reply)
@@ -745,6 +876,12 @@ async def websocket_endpoint(ws: WebSocket):
                         await call_llm(text, "llm")
                         continue
 
+                # ===== 路径 noise：音乐串扰过滤，静默忽略 =====
+                if decision.path == "noise":
+                    logger.info(f"噪声过滤: 忽略疑似音乐串扰文本 '{text[:40]}'")
+                    await ws.send_json({"type": "noise_filtered", "text": text[:40]})
+                    continue
+
                 # ===== 路径 B：信息查询（info_query → DeepSeek 云端 + 自动搜索） =====
                 if decision.path == "info_query":
                     await ws.send_json({
@@ -801,7 +938,7 @@ async def websocket_endpoint(ws: WebSocket):
                     })
                     await ws.send_json({
                         "type": "done", "path": "reasonix",
-                        "reply": "📋 已记录编程任务，说「允许」让Reasonix开始工作",
+                        "reply": "已记录编程任务，说「允许」让 Reasonix 开始工作",
                         "model": "reasonix",
                     })
                     continue

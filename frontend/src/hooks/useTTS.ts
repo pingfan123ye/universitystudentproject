@@ -41,8 +41,8 @@ export function useTTS(options: TTSOptions = {}) {
     return voices.find((v) => v.lang.includes('zh')) || null;
   }, [getVoices]);
 
-  const speakBrowser = useCallback(async (text: string) => {
-    if (!isSupported || !text.trim()) return;
+  const speakBrowser = useCallback(async (text: string, onEnd?: () => void) => {
+    if (!isSupported || !text.trim()) { onEnd?.(); return; }
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = lang;
@@ -52,14 +52,14 @@ export function useTTS(options: TTSOptions = {}) {
     const voice = await pickVoice();
     if (voice) utterance.voice = voice;
     utterance.onstart = () => setSpeaking(true);
-    utterance.onend = () => setSpeaking(false);
-    utterance.onerror = () => setSpeaking(false);
+    utterance.onend = () => { setSpeaking(false); onEnd?.(); };
+    utterance.onerror = () => { setSpeaking(false); onEnd?.(); };
     utteranceRef.current = utterance;
     window.speechSynthesis.speak(utterance);
   }, [isSupported, lang, rate, pitch, volume, pickVoice]);
 
   // ===== 后端 Edge TTS 音频播放（主力） =====
-  const playAudioBase64 = useCallback((base64: string) => {
+  const playAudioBase64 = useCallback((base64: string, onEnd?: () => void) => {
     try {
       // 停止当前播放
       window.speechSynthesis.cancel();
@@ -86,14 +86,16 @@ export function useTTS(options: TTSOptions = {}) {
         setSpeaking(false);
         URL.revokeObjectURL(url);
         audioRef.current = null;
+        onEnd?.();
       };
       audio.onerror = () => {
         setSpeaking(false);
         URL.revokeObjectURL(url);
         audioRef.current = null;
+        onEnd?.();
       };
       audio.oncanplay = () => {
-        audio.play().catch(() => setSpeaking(false));
+        audio.play().catch(() => { setSpeaking(false); onEnd?.(); });
       };
       setSpeaking(true);
       audio.load();
@@ -103,12 +105,12 @@ export function useTTS(options: TTSOptions = {}) {
   }, []);
 
   // ===== 统一接口：优先后端 TTS，降级浏览器 =====
-  const speak = useCallback((text: string, backendAudio?: string) => {
-    if (!autoSpeak) return;
+  const speak = useCallback((text: string, backendAudio?: string, onEnd?: () => void) => {
+    if (!autoSpeak) { onEnd?.(); return; }
     if (backendAudio) {
-      playAudioBase64(backendAudio);
+      playAudioBase64(backendAudio, onEnd);
     } else {
-      speakBrowser(text);
+      speakBrowser(text, onEnd);
     }
   }, [autoSpeak, playAudioBase64, speakBrowser]);
 

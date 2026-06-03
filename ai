@@ -1,0 +1,245 @@
+# 音乐曲库优化 + 切歌/点歌修复 — 综合方案
+
+## 现状概述
+
+### 已有能力
+| 模块 | 状态 | 路径 |
+|------|------|------|
+| `_send_music_control()` 四级搜索流水线 | ✅ | `main.py:179-273` |
+| `_announce_and_play()` 播放+TTS播报 | ✅ | `main.py:142-166` |
+| 本地歌单 difflib 四层匹配 | ✅ | `playlist_service.py:81-126` |
+| 163 搜索（仅元数据，无播放URL） | ✅ | `music_service.py:55-109` |
+| Pixabay 爬虫（免费可商用音乐） | ✅ | `pixabay_music.py` |
+| 意图路由（简体+繁体 MUSIC_PLAY_PATTERNS） | ✅ | `intent_router.py`（需重启生效） |
+| 音乐串扰噪声过滤 | ✅ | `intent_router.py` noise 路径 |
+| 记忆系统（偏好提取+存储） | ✅ | `memory_engine.py` |
+
+### 核心瓶颈
+**中文流行歌曲无在线播放源。** 163 的 `outer/url?id=X.mp3` 已失效（302→404），Pixabay 无中文歌。Jamendo 以独立/CC 授权音乐为主，周杰伦等商业歌手作品不会出现。
+
+---
+
+## 1. Jamendo API 集成（新增可播放音源）
+
+### API 信息
+| 属性 | 值 |
+|------|-----|
+| 端点 | `https://api.jamendo.com/v3.0/tracks/` |
+| 认证 | `client_id`（免费注册获取） |
+| 音质 | `audioformat=mp32` → 320kbps MP3 |
+| 曲库 | 60万+ 独立音乐，CC 授权 |
+| 中文 | 少量中文独立音乐 |
+| 超时 | 5 秒 |
+
+### 实现
+
+**文件**：`backend/services/music_service.py`
+
+在现有 `search_songs()` 中插入 Jamendo 分支（本地搜索之后、网易云之前）：
+
+```python
+JAMENDO_CLIENT_ID = "your_client_id_here"  # 需申请
+JAMENDO_TIMEOUT = 5
+
+async def _search_jamendo(keyword: str) -> list[dict]:
+    """Jamendo API — 返回真实可播放 mp3 URL"""
+    ...
+    # 调用 https://api.jamendo.com/v3.0/tracks/
+    # params: client_id, format=json, limit=5, search=keyword,
+    #         include=musicinfo, audioformat=mp32
+    # 返回字段: item["audio"] 即为可播放 mp3 URL
+```
+
+串联到 `search_songs()` 流程：
+```
+本地歌单未命中 → _search_jamendo(keyword) → 命中返回 → 未命中 → 网易云搜索
+```
+
+**文件**：`backend/main.py` `_send_music_control()`
+
+调整搜索顺序：
+```
+1. 本地歌单 search_local()
+2. Jamendo search_songs() → 返回可播 URL
+3. Pixabay search_pixabay_music()
+4. 163 搜索（仅元数据参考）
+5. 版权拦截 / 回退随机本地
+```
+
+---
+
+## 2. 版权拦截（新增）
+
+当本地 + Jamendo + Pixabay 都搜不到，且 query 含中文时，判定为商业版权歌曲，明确告知用户。
+
+**文件**：`backend/main.py`
+
+```python
+def _is_chinese_query(query: str) -> bool:
+    return bool(re.search(r'[一-鿿]', query))
+```
+
+在 `_send_music_control()` 的回退分支中：
+```python
+# 所有源都未命中
+if _is_chinese_query(clean_query):
+    msg = "抱歉，我不能为你播放有版权的歌曲。你可以把 mp3 文件放到 music 目录，我就能播放了"
+    await ws.send_json({"type": "music_search_status", "status": "copyright_blocked", "message": msg})
+    asyncio.create_task(_maybe_tts(ws, msg, "music"))
+    return
+# 非中文 → 回退本地随机
+```
+
+---
+
+## 3. 前端搜索状态（新增 `searching`）
+
+### 类型定义
+
+**文件**：`frontend/src/hooks/useMusicPlayer.ts`
+
+```typescript
+// 当前
+type PlayerState = 'idle' | 'playing' | 'paused';
+
+// 改为
+type PlayerState = 'idle' | 'searching' | 'playing' | 'paused';
+```
+
+状态流转：
+```
+idle → searching（开始搜索）
+searching → playing（获取到播放 URL）
+searching → idle（搜索失败 / copyright_blocked）
+```
+
+### WebSocket 消息处理
+
+**文件**：`frontend/src/hooks/useWebSocket.ts`
+
+新增处理 `music_search_status` 消息类型：
+- `status: "searching"` → 触发 `playerState` 切换为 `searching`
+- `status: "copyright_blocked"` → 显示版权提示消息
+- `status: "not_found"` → 显示未找到提示
+
+### 后端协作
+
+**文件**：`backend/main.py`
+
+在 `_send_music_control()` 入口发送搜索状态：
+```python
+await ws.send_json({"type": "music_search_status", "status": "searching", "query": clean_query})
+```
+
+---
+
+## 4. STT 后处理纠错（新增）
+
+Whisper small 模型常误识别：
+- "晴天" → "星天"、"提前"
+- "切一首歌" → "親愛的首歌"
+- "小智" → "小字"、"小子"
+
+**文件**：新建 `backend/services/stt_corrector.py`
+
+```python
+CORRECTIONS = {
+    "星天": "晴天",
+    "提前": "晴天",
+    "親愛的首歌": "切一首歌",
+    "亲爱的首歌": "切一首歌",
+    "切割": "切歌",
+    "小字": "小智",
+    "小子": "小智",
+}
+
+def correct(text: str) -> str:
+    for wrong, right in CORRECTIONS.items():
+        text = text.replace(wrong, right)
+    return text
+```
+
+**挂载点**：`main.py` STT 结果返回前端之前调用 `stt_corrector.correct(text)`。
+
+---
+
+## 5. LLM Prompt 增强（修改现有）
+
+**文件**：`backend/services/llm_service.py` SYSTEM_PROMPT 追加：
+
+```
+【音乐控制指令】
+当用户想听歌时，输出：
+[ACTIONS]{"type":"music","action":"play","query":"<歌名或歌手>"}[/ACTIONS]
+当用户说"切歌""下一首""换一首"时，输出：
+[ACTIONS]{"type":"music","action":"next"}[/ACTIONS]
+当用户说"暂停""别放了"时，输出：
+[ACTIONS]{"type":"music","action":"pause"}[/ACTIONS]
+注意：如果Whisper可能识别错误（如"星天"可能是"晴天"），请自行纠正。
+```
+
+现有 `[ACTIONS]` 解析逻辑在 `main.py` 已有的 `call_llm()` 闭包中（第 692-696 行），确认支持 `music` 类型即可。
+
+---
+
+## 6. 切歌无列表反馈 + 记忆偏好联动（修改现有）
+
+### 切歌反馈
+
+**文件**：`backend/main.py` `_send_music_control()`
+
+在 `action == "next"` / `action == "prev"` 分支中：
+- 如果 `_search_cache` 为空且前端没有活动播放 → TTS 提示"当前没有正在播放的歌曲，你想听什么？"
+- 如果有播放队列 → 正常切歌（行为不变）
+
+### 记忆偏好联动
+
+在 `_send_music_control()` 中，query 清洗后如果只剩歌手名（长度 < 6 字，无歌名特征），查记忆引擎获取偏好：
+```python
+memories = memory_engine.get_all()
+for mem in memories:
+    if mem["category"] == "preference" and query in mem["value_text"]:
+        # 有该歌手的偏好记忆 → 扩展搜索词
+        query = f"{query} 热门歌曲"
+```
+
+---
+
+## 7. 实施步骤
+
+| 步骤 | 内容 | 文件 | 依赖 |
+|------|------|------|------|
+| 1 | 申请 Jamendo Client ID | jamendo.com | 无 |
+| 2 | 新增 `_search_jamendo()` | `backend/services/music_service.py` | 步骤1 |
+| 3 | 调整 `_send_music_control` 搜索顺序 | `backend/main.py` | 步骤2 |
+| 4 | 新增 `_is_chinese_query()` + 版权拦截 | `backend/main.py` | — |
+| 5 | 新增 `stt_corrector.py` | `backend/services/stt_corrector.py` | — |
+| 6 | 挂载纠错到 main.py STT 处理段 | `backend/main.py` | 步骤5 |
+| 7 | 更新 LLM SYSTEM_PROMPT | `backend/services/llm_service.py` | — |
+| 8 | 切歌无列表反馈 | `backend/main.py` `_send_music_control` | — |
+| 9 | 记忆偏好联动音乐搜索 | `backend/main.py` `_send_music_control` | — |
+| 10 | PlayerState 新增 `searching` 状态 | `frontend/src/hooks/useMusicPlayer.ts` | — |
+| 11 | useWebSocket 处理 `music_search_status` | `frontend/src/hooks/useWebSocket.ts` | 步骤10 |
+| 12 | MusicPlayer 搜索加载 UI | `frontend/src/components/MusicPlayer.tsx` | 步骤10 |
+| 13 | 后端发送 `music_search_status` 消息 | `backend/main.py` | 步骤3-4 |
+
+---
+
+## 8. 不改的部分
+
+- Whisper 模型（small → 换 medium/large 需 ~5GB 显存）
+- VAD 阈值（已调优至 threshold=0.25）
+- TTS 流程（Edge TTS）
+- 前端录音/播放核心逻辑
+- 意图路由主结构（只扩充不重构）
+
+---
+
+## 9. 风险与限制
+
+| 风险 | 缓解 |
+|------|------|
+| Jamendo 中文歌极少，周杰伦等商业歌曲搜不到 | 版权拦截分支+提示用户加本地 mp3 |
+| LLM `[ACTIONS]` 格式不稳定（qwen2.5:7b） | 路由层关键词匹配兜底 |
+| STT 纠错表覆盖不全 | 可持续扩充，LLM prompt 也可二次纠正 |
+| 版权拦截误杀（中文独立音乐被误判） | 仅在所有源都搜不到后才拦截 |

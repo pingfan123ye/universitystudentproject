@@ -21,15 +21,26 @@ export default function App() {
     sendMessage, clearMessages, fetchCacheList, deleteCache,
     fetchMemoryList, deleteMemory, clearMemories,
     sendAudioChunk, transcriptionText, ttsFallbackText,
+    musicSearchStatus,
+    resetConversation,
   } = useWebSocket();
 
   const {
-    playerState, currentSong, queue, currentIndex, volume, progress, error, searchResults, setSearchResults,
+    playerState, setPlayerState, currentSong, queue, currentIndex, volume, progress, error, searchResults, setSearchResults,
     play, pause, duckForRecording, restoreVolumeAfterRecording, next, prev, seek, setVolume, setQueueAndPlay,
     handleMusicControl,
   } = useMusicPlayer();
 
   useEffect(() => { if (musicAction) handleMusicControl(musicAction); }, [musicAction, handleMusicControl]);
+
+  // 音乐搜索状态 → 播放器状态同步
+  useEffect(() => {
+    if (musicSearchStatus.status === 'searching') {
+      setPlayerState('searching');
+    } else if (musicSearchStatus.status === 'copyright_blocked' || musicSearchStatus.status === 'not_found') {
+      setPlayerState('idle');
+    }
+  }, [musicSearchStatus, setPlayerState]);
 
   // Edge TTS 音频播放（ttsAudio 变化时触发）
   const [pendingTts, setPendingTts] = useState<{ text: string; audio: string } | null>(null);
@@ -91,7 +102,8 @@ export default function App() {
             onSendAudioFinal={(b64: string) => sendAudioChunk(b64)} streamText={transcriptionText}
             onDuckMusic={duckForRecording} onRestoreMusic={restoreVolumeAfterRecording}
             isMobile={isMobile} onToggleSidebar={() => setSidebarOpen(true)}
-            musicPlayerVisible={playerState !== 'idle' || currentSong !== null || queue.length > 0 || searchResults.length > 0} />
+            musicPlayerVisible={playerState !== 'idle' || currentSong !== null || queue.length > 0 || searchResults.length > 0}
+            onResetConversation={resetConversation} />
         </div>
 
         {/* 侧栏：桌面固定显示，手机为抽屉覆盖层 */}

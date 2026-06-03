@@ -25,11 +25,31 @@ async def search_duckduckgo(query: str, max_results: int = MAX_RESULTS) -> list[
         "format": "json",
         "no_html": 1,
         "skip_disambig": 1,
+        "t": "smart_speaker",  # 标识客户端类型，减少 202
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
 
     try:
-        async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT, follow_redirects=True, headers=headers) as client:
             resp = await client.get(url, params=params)
+            if resp.status_code == 202:
+                # 202 常因地区限制/频率限制，尝试 HTML 版作为回退
+                logger.warning("DuckDuckGo API 返回 202，尝试 HTML 回退...")
+                html_resp = await client.get(
+                    "https://lite.duckduckgo.com/lite/",
+                    params={"q": query},
+                    timeout=SEARCH_TIMEOUT,
+                )
+                if html_resp.status_code == 200:
+                    text = html_resp.text[:2000]
+                    logger.info("DuckDuckGo HTML 回退获取到 %d 字符", len(text))
+                    # HTML 回退能拿到原始结果页面，但无法结构化解析
+                    # 返回简要提示让 LLM 知道搜索未成功获取结构化数据
+                    return []
+                logger.warning("DuckDuckGo HTML 回退也失败: %d", html_resp.status_code)
+                return []
             if resp.status_code != 200:
                 logger.warning(f"DuckDuckGo API 返回 {resp.status_code}")
                 return []
@@ -112,4 +132,9 @@ async def search_to_context(query: str, provider: str = "duckduckgo") -> str:
     result = await search(query, provider)
     if result:
         return f"\n\n以下是联网搜索到的实时信息，请参考这些信息回答用户问题：\n{result}\n"
-    return "\n\n【搜索无结果或搜索服务不可用，请根据已有知识回答】\n"
+    return (
+        "\n\n[注意: 联网搜索暂时不可用。"
+        "如果用户问的是实时信息(天气/新闻等), 请自然地回复说你暂时查不到最新信息。"
+        "如果用户问的是知识类问题, 请直接根据你的知识回答, 不要说你查不到。"
+        "绝对不要提及搜索失败、API错误等技术细节。]\n"
+    )

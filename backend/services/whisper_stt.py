@@ -19,6 +19,7 @@ if not os.environ.get("HF_ENDPOINT"):
 _model = None
 _model_lock = threading.Lock()
 _loading_started = False
+_model_ready = threading.Event()  # 模型加载完成时触发（成功或失败都触发）
 
 
 def _load_model_sync():
@@ -32,6 +33,8 @@ def _load_model_sync():
     except Exception as e:
         logger.warning("faster-whisper 加载失败: %s", e)
         _model = None
+    finally:
+        _model_ready.set()
     return _model
 
 
@@ -56,9 +59,17 @@ async def transcribe_audio_base64(audio_b64: str) -> str:
     if not audio_b64:
         return ""
 
+    # 等待模型就绪（首次启动需 ~30s 下载/加载，之后秒级响应）
+    if not _model_ready.is_set():
+        logger.info("STT 等待 Whisper 模型就绪（最多 60s）...")
+        if not _model_ready.wait(timeout=60):
+            logger.warning("STT 等待模型超时（60s），跳过转写")
+            return ""
+        logger.info("STT 模型就绪，继续转写")
+
     model = _get_model()
     if model is None:
-        logger.warning("Whisper 模型未就绪（正在下载或加载失败），跳过转写")
+        logger.warning("Whisper 模型加载失败，跳过转写")
         return ""
 
     try:
@@ -68,6 +79,14 @@ async def transcribe_audio_base64(audio_b64: str) -> str:
 
     if len(audio_bytes) > 44 and audio_bytes[:4] == b'RIFF':
         audio_bytes = audio_bytes[44:]
+
+    if len(audio_bytes) < 1600:
+        return ""
+
+    # 对齐 int16（2 字节）：奇数长度会导致 "buffer size must be a multiple of element size"
+    if len(audio_bytes) % 2 != 0:
+        logger.warning("STT 音频字节未对齐 int16，截断 1 字节: %d -> %d", len(audio_bytes), len(audio_bytes) - 1)
+        audio_bytes = audio_bytes[:-1]
 
     if len(audio_bytes) < 1600:
         return ""
@@ -83,8 +102,16 @@ async def transcribe_audio_base64(audio_b64: str) -> str:
         if max_amp < 0.001:
             logger.warning("STT 音频诊断: 振幅极低，可能是静音或麦克风被占用")
 
+        # 自动增益：弱信号放大后再送 VAD，避免被误判为静音
+        # 用平均振幅判断整体响度（峰值可能是瞬间尖峰，不代表有效语音能量）
+        if max_amp >= 0.001 and avg_amp < 0.005:
+            gain = min(0.8 / max(max_amp, 0.01), 50.0)
+            pcm = pcm * gain
+            logger.info("STT 自动增益: ×%.1f (峰值 %.4f→%.4f 均值 %.6f)",
+                       gain, max_amp, float(np.max(np.abs(pcm))), avg_amp)
+
         # 降低 VAD 阈值（默认 0.5 → 0.3），避免轻度音频被完全过滤
-        vad_params = {"threshold": 0.3, "min_speech_duration_ms": 250}
+        vad_params = {"threshold": 0.25, "min_speech_duration_ms": 200}
         segments, _info = model.transcribe(
             pcm, language="zh", beam_size=5,
             vad_filter=True, vad_parameters=vad_params,
@@ -92,6 +119,11 @@ async def transcribe_audio_base64(audio_b64: str) -> str:
         seg_list = list(segments)
         text = "".join(seg.text for seg in seg_list).strip()
 
+        # 后处理：修正 Whisper 常见误识别（音近字）
+        if text:
+            text = text.replace("小字", "小智")
+            text = text.replace("小子", "小智")
+            text = text.replace("切割", "切歌")
         if text:
             logger.info("Whisper 转写结果 (%d chars, %d segments): %s",
                        len(text), len(seg_list), text[:60])

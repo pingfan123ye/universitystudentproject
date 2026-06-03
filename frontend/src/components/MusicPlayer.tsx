@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react';
 import { SongInfo } from '../types';
 
 interface MusicPlayerProps {
-  playerState: 'idle' | 'playing' | 'paused';
+  playerState: 'idle' | 'searching' | 'playing' | 'paused';
   currentSong: SongInfo | null;
   queue: SongInfo[];
   currentIndex: number;
@@ -102,18 +102,37 @@ export default function MusicPlayer({
 
         {/* 歌曲信息 */}
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{
-            fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap',
-            overflow: 'hidden', textOverflow: 'ellipsis',
-          }}>
-            {songName || '未选择歌曲'}
-          </div>
-          <div style={{
-            fontSize: '10px', color: 'var(--text-muted)', whiteSpace: 'nowrap',
-            overflow: 'hidden', textOverflow: 'ellipsis',
-          }}>
-            {singerName || (queue.length > 0 ? `${queue.length} 首歌曲` : '')}
-          </div>
+          {playerState === 'searching' ? (
+            <>
+              <div style={{
+                fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap',
+                overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--accent)',
+              }}>
+                🔍 正在搜索歌曲...
+              </div>
+              <div style={{
+                fontSize: '10px', color: 'var(--text-muted)', whiteSpace: 'nowrap',
+                overflow: 'hidden', textOverflow: 'ellipsis',
+              }}>
+                请稍候
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{
+                fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap',
+                overflow: 'hidden', textOverflow: 'ellipsis',
+              }}>
+                {songName || '未选择歌曲'}
+              </div>
+              <div style={{
+                fontSize: '10px', color: 'var(--text-muted)', whiteSpace: 'nowrap',
+                overflow: 'hidden', textOverflow: 'ellipsis',
+              }}>
+                {singerName || (queue.length > 0 ? `${queue.length} 首歌曲` : '')}
+              </div>
+            </>
+          )}
         </div>
 
         {/* 错误提示 */}
@@ -129,11 +148,12 @@ export default function MusicPlayer({
           <button onClick={togglePlay} style={{
             ...btnStyle,
             width: '32px', height: '32px', borderRadius: '50%',
-            background: 'var(--accent)',
+            background: playerState === 'searching' ? 'var(--text-muted)' : 'var(--accent)',
             color: '#fff',
             fontSize: '14px',
+            cursor: playerState === 'searching' ? 'default' : 'pointer',
           }}>
-            {playerState === 'playing' ? '⏸' : '▶'}
+            {playerState === 'searching' ? '⏳' : playerState === 'playing' ? '⏸' : '▶'}
           </button>
           <button onClick={onNext} style={btnStyle} title="下一首">⏭</button>
         </div>

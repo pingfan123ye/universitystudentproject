@@ -26,7 +26,7 @@ const DEFAULT_SONG: SongInfo = {
   lyric: '',
 };
 
-type PlayerState = 'idle' | 'playing' | 'paused';
+type PlayerState = 'idle' | 'searching' | 'playing' | 'paused';
 type PlaylistSource = 'builtin' | 'search';
 
 export function useMusicPlayer() {
@@ -257,7 +257,7 @@ export function useMusicPlayer() {
     setPlayerState('paused');
   }, []);
 
-  // ── 录音时自动降低音乐音量（ducking），避免音频设备冲突 ──
+  // ── 录音时降低音乐音量（ducking），避免扬声器内容被麦克风拾取 ──
   const _volumeBeforeRec = useRef(0.7);
   const _wasPlayingBeforeRec = useRef(false);
 
@@ -266,8 +266,7 @@ export function useMusicPlayer() {
     if (audio) {
       _volumeBeforeRec.current = audio.volume;
       _wasPlayingBeforeRec.current = !audio.paused;
-      // 将音量降到原来的 15%，让麦克风能清晰收音
-      const duckedVolume = Math.max(0.05, audio.volume * 0.15);
+      const duckedVolume = Math.max(0.03, audio.volume * 0.08);
       audio.volume = duckedVolume;
       console.log(`[音频Ducking] 录音开始，音量 ${_volumeBeforeRec.current.toFixed(2)} → ${duckedVolume.toFixed(2)}`);
     }
@@ -390,6 +389,7 @@ export function useMusicPlayer() {
 
   return {
     playerState,
+    setPlayerState,
     currentSong,
     queue,
     currentIndex,

@@ -14,8 +14,6 @@ import edge_tts
 
 logger = logging.getLogger(__name__)
 
-TTS_TIMEOUT = 2  # Edge TTS 后备超时（秒）
-
 # ── pyttsx3 本地引擎 ──
 _pyttsx3_engine = None
 _pyttsx3_lock = threading.Lock()

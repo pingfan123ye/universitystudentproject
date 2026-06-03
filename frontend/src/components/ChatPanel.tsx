@@ -3,7 +3,7 @@ import { Message } from '../types';
 import MessageBubble from './MessageBubble';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import { useTTS } from '../hooks/useTTS';
-import { FiSend, FiTrash2, FiMic, FiMicOff, FiVolume2, FiVolumeX } from 'react-icons/fi';
+import { FiSend, FiTrash2, FiRefreshCw, FiMic, FiMicOff, FiVolume2, FiVolumeX } from 'react-icons/fi';
 
 interface ChatPanelProps {
   messages: Message[];
@@ -21,9 +21,10 @@ interface ChatPanelProps {
   isMobile?: boolean;
   onToggleSidebar?: () => void;
   musicPlayerVisible?: boolean;
+  onResetConversation?: () => void;
 }
 
-export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlayed, pendingTtsFallback, onTtsFallbackConsumed, onSend, onClear, onSendAudioFinal, streamText: propStreamText, onDuckMusic, onRestoreMusic, isMobile, onToggleSidebar, musicPlayerVisible }: ChatPanelProps) {
+export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlayed, pendingTtsFallback, onTtsFallbackConsumed, onSend, onClear, onSendAudioFinal, streamText: propStreamText, onDuckMusic, onRestoreMusic, isMobile, onToggleSidebar, musicPlayerVisible, onResetConversation }: ChatPanelProps) {
   const [input, setInput] = useState('');
   const [micActive, setMicActive] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -51,13 +52,36 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
   const _recChunksRef = useRef<Blob[]>([]);
   const _ampCheckTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // 保持 onSendAudioFinal 为最新引用，避免 _stopRec 闭包过期
+  const onSendAudioFinalRef = useRef(onSendAudioFinal);
+  useEffect(() => { onSendAudioFinalRef.current = onSendAudioFinal; }, [onSendAudioFinal]);
+
+  // 连续对话模式
+  const [continuousMode, setContinuousMode] = useState(false);
+  const continuousModeRef = useRef(false);
+  useEffect(() => { continuousModeRef.current = continuousMode; }, [continuousMode]);
+  const _silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // 开启连续对话时自动开始录音
+  useEffect(() => {
+    if (continuousMode && !micActive) {
+      _startRec().then(ok => { if (ok) setMicActive(true); });
+    }
+    if (!continuousMode && micActive) {
+      // 关闭连续对话时停止录音
+      setMicActive(false);
+      _stopRec().then(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [continuousMode]);
+
   const _startRec = useCallback(async (): Promise<boolean> => {
     try {
       // 方案一：禁用所有音频处理，防止浏览器在音乐播放时压低麦克风增益
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
+          echoCancellation: true,
+          noiseSuppression: true,
           autoGainControl: true,
         },
       });
@@ -80,7 +104,7 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
       };
       pulseUpdate();
 
-      // 诊断：每 1 秒检查一次麦克风输入振幅
+      // 诊断 + 静音检测：每 1 秒检查一次麦克风输入振幅
       // 使用一个临时的、极短命的 AudioContext 仅用于诊断（不与音乐路径共享）
       const ampCheck = () => {
         if (!recStreamRef.current) return;
@@ -97,6 +121,29 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
           if (avg < 5) {
             console.warn('[麦克风诊断] ⚠️ 实时振幅极低，麦克风可能被占用或静音');
           }
+
+          // 连续对话模式：静音检测 → 自动停止录音
+          if (continuousModeRef.current && _recRef.current?.state === 'recording') {
+            const SILENCE_THRESHOLD = 12;  // 振幅低于此值视为静音（放宽阈值，避免误触发）
+            const elapsed = Date.now() - startTime;
+            if (avg < SILENCE_THRESHOLD && elapsed > 1500) {  // 至少录 1.5 秒
+              if (!_silenceTimerRef.current) {
+                console.log('[连续对话] 检测到静音，2秒后自动停止...');
+                _silenceTimerRef.current = setTimeout(() => {
+                  console.log('[连续对话] 静音超时，自动停止录音');
+                  setMicActive(false);
+                  _stopRec().then(b64 => {
+                    if (b64 && onSendAudioFinalRef.current) onSendAudioFinalRef.current(b64);
+                  });
+                }, 2000);
+              }
+            } else {
+              if (_silenceTimerRef.current) {
+                clearTimeout(_silenceTimerRef.current);
+                _silenceTimerRef.current = null;
+              }
+            }
+          }
           tmpCtx.close().catch(() => {});
         } catch { /* 诊断失败不影响录音 */ }
       };
@@ -112,7 +159,8 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
     } catch { return false; }
   }, [onDuckMusic]);
   const _stopRec = useCallback(async (): Promise<string | null> => {
-    // 清理诊断定时器、动画、计时器
+    // 清理静音定时器、诊断定时器、动画、计时器
+    if (_silenceTimerRef.current) { clearTimeout(_silenceTimerRef.current); _silenceTimerRef.current = null; }
     if (_ampCheckTimerRef.current) { clearInterval(_ampCheckTimerRef.current); _ampCheckTimerRef.current = null; }
     if (animFrameRef.current) { cancelAnimationFrame(animFrameRef.current); animFrameRef.current = 0; }
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
@@ -195,13 +243,10 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
 
           resolve(btoa(binary));
         } catch (decodeErr) {
-          console.warn('[录音诊断] 音频解码失败，发送原始数据:', decodeErr);
-          const buf = await blob.arrayBuffer();
-          const bytes = new Uint8Array(buf);
-          let binary = '';
-          for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+          console.warn('[录音诊断] 音频解码失败（浏览器可能不支持 WebM 解码），跳过转写:', decodeErr);
+          decodeCtx?.close?.()?.catch(() => {});
           onRestoreMusic?.();
-          resolve(btoa(binary));
+          resolve(null);  // 返回 null 而非原始 WebM 字节（后端只认 WAV/PCM）
         }
       };
       rec.stop();
@@ -227,21 +272,31 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
     }
   }, [messages]);
 
-  // Edge TTS 音频到达 → 播放
+  // Edge TTS 音频到达 → 播放，播完后连续对话模式下自动开始录音
   useEffect(() => {
     if (pendingTts && pendingTts.audio) {
-      speak(pendingTts.text, pendingTts.audio);
+      speak(pendingTts.text, pendingTts.audio, () => {
+        if (continuousModeRef.current) {
+          _startRec().then(ok => { if (ok) setMicActive(true); });
+        }
+      });
       onTtsPlayed?.();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingTts, speak, onTtsPlayed]);
 
-  // 后端 TTS 失败 → 降级浏览器 speechSynthesis
+  // 后端 TTS 失败 → 降级浏览器 speechSynthesis，播完后连续对话模式下自动开始录音
   useEffect(() => {
     if (pendingTtsFallback) {
-      speak(pendingTtsFallback);
+      speak(pendingTtsFallback, undefined, () => {
+        if (continuousModeRef.current) {
+          _startRec().then(ok => { if (ok) setMicActive(true); });
+        }
+      });
       onTtsFallbackConsumed?.();
     }
-  }, [pendingTtsFallback]); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingTtsFallback]);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
@@ -292,12 +347,28 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
 
       <div className="p-4 border-t" style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}>
         <div className="flex items-end gap-2 max-w-3xl mx-auto">
-          <button onClick={onClear} className="p-2.5 rounded hover:opacity-70 transition-opacity" style={{ color: 'var(--text-muted)' }} title="清空"><FiTrash2 size={16} /></button>
+          {onResetConversation && (
+            <button onClick={onResetConversation} className="p-2.5 rounded hover:opacity-70 transition-opacity" style={{ color: 'var(--text-muted)' }} title="重置对话（清空上下文）">
+              <FiRefreshCw size={16} />
+            </button>
+          )}
+          <button onClick={onClear} className="p-2.5 rounded hover:opacity-70 transition-opacity" style={{ color: 'var(--text-muted)' }} title="清空消息"><FiTrash2 size={16} /></button>
           {ttsSupported && (
             <button onClick={toggleAutoSpeak} className="p-2.5 rounded transition-opacity" style={{ color: autoSpeak ? 'var(--accent)' : 'var(--text-muted)' }} title={autoSpeak ? '播报中' : '静音'}>
               {autoSpeak ? <FiVolume2 size={16} /> : <FiVolumeX size={16} />}
             </button>
           )}
+          <button
+            onClick={() => setContinuousMode(prev => !prev)}
+            className={`p-2.5 rounded transition-all text-[11px] font-bold whitespace-nowrap ${continuousMode ? 'animate-pulse' : ''}`}
+            style={{
+              color: continuousMode ? '#fff' : 'var(--text-muted)',
+              background: continuousMode ? 'var(--accent)' : 'var(--bg-input)',
+            }}
+            title={continuousMode ? '连续对话中，点击关闭' : '开启连续对话，免点击录音'}
+          >
+            {continuousMode ? '🔊 连续中' : '🎤 连续'}
+          </button>
           <div className="flex-1">
             <textarea value={input} onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(); } }}

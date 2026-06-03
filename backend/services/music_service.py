@@ -1,16 +1,97 @@
 """
-音乐服务 —— 专注本地歌单 + 极简在线搜索
-在线源（Netease）搜索只返回元数据，无 playable URL。
+音乐服务 —— 本地歌单 + Jamendo + Pixabay + 网易云（元数据参考）
+Jamendo 提供 60万+ CC 授权独立音乐，有真实可播放 MP3 URL。
 """
 import asyncio
 import logging
 import os
 import time
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 # ── 在线搜索超时（快速失败，不阻塞播放） ──
 SEARCH_TIMEOUT = 5  # 秒
+
+# ── Jamendo API ──
+JAMENDO_CLIENT_ID = "BEF1512782E87A4550ED94da5eBC44F6"
+JAMENDO_TIMEOUT = 5
+
+
+async def _search_jamendo(keyword: str, limit: int = 5) -> list[dict]:
+    """
+    Jamendo API — 返回真实可播放 mp3 URL。
+    曲库：60万+ CC 授权独立音乐，含少量中文独立音乐。
+    """
+    if not keyword or not keyword.strip():
+        return []
+
+    try:
+        params = {
+            "client_id": JAMENDO_CLIENT_ID,
+            "format": "json",
+            "limit": limit,
+            "search": keyword.strip(),
+            "include": "musicinfo",
+            "audioformat": "mp32",
+        }
+        async with httpx.AsyncClient(timeout=JAMENDO_TIMEOUT) as client:
+            resp = await client.get(
+                "https://api.jamendo.com/v3.0/tracks/",
+                params=params,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Jamendo HTTP {resp.status_code}: {keyword}")
+                return []
+
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                logger.info(f"Jamendo 无结果: {keyword}")
+                return []
+
+            songs = []
+            seen = set()
+            for item in results:
+                song_id = str(item.get("id", ""))
+                if song_id in seen:
+                    continue
+                seen.add(song_id)
+
+                audio_url = item.get("audio", "")
+                if not audio_url:
+                    continue
+
+                songs.append({
+                    "song_id": f"jamendo_{song_id}",
+                    "song_name": item.get("name", "未知曲目"),
+                    "singers": item.get("artist_name", "独立音乐人"),
+                    "album": item.get("album_name", ""),
+                    "source": "jamendo",
+                    "duration": "",
+                    "duration_s": item.get("duration", 0),
+                    "cover_url": item.get("image", ""),
+                    "download_url": audio_url,
+                    "ext": "mp3",
+                    "file_size": "",
+                    "file_size_bytes": 0,
+                    "quality": "320kbps",
+                    "lyric": "",
+                    "bitrate": "",
+                    "local": False,
+                })
+
+            if songs:
+                logger.info(f"Jamendo '{keyword}': {len(songs)} 条（可播放）")
+            return songs
+
+    except asyncio.TimeoutError:
+        logger.warning(f"Jamendo 超时: {keyword}")
+        return []
+    except Exception as e:
+        logger.warning(f"Jamendo 异常: {keyword} - {e}")
+        return []
 
 
 async def search_songs(keyword: str, sources: list[str] | None = None) -> list[dict]:
@@ -52,9 +133,13 @@ async def search_songs(keyword: str, sources: list[str] | None = None) -> list[d
             "local": True,
         }]
 
-    # 2. 在线搜索（仅搜索元数据，无 playable URL）
+    # 2. Jamendo（CC 授权，有真实可播放 MP3 URL）
+    jamendo_songs = await _search_jamendo(keyword)
+    if jamendo_songs:
+        return jamendo_songs
+
+    # 3. 在线搜索（仅搜索元数据，无 playable URL）
     try:
-        import httpx
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Referer': 'https://music.163.com/'
@@ -65,6 +150,9 @@ async def search_songs(keyword: str, sources: list[str] | None = None) -> list[d
             loop.run_in_executor(None, lambda: httpx.get(api_url, headers=headers, timeout=8)),
             timeout=SEARCH_TIMEOUT
         )
+        if resp.status_code != 200:
+            logger.warning(f"在线搜索 HTTP {resp.status_code}: {keyword}")
+            return []
         data = resp.json()
         if data.get('code') == 200 and data.get('result', {}).get('songs'):
             songs = []
@@ -76,8 +164,9 @@ async def search_songs(keyword: str, sources: list[str] | None = None) -> list[d
                 seen.add(song_id)
                 name = s['name']
                 artists = ','.join([a['name'] for a in s.get('artists', [])])
-                # Netease 不再提供免费播放链接，download_url 为空
-                # 前端会 fallback 到默认歌曲
+                # 163 预览 URL 不可靠（302→404），不尝试解析
+                play_url = ""
+
                 songs.append({
                     "song_id": song_id,
                     "song_name": name,
@@ -87,7 +176,7 @@ async def search_songs(keyword: str, sources: list[str] | None = None) -> list[d
                     "duration": "",
                     "duration_s": s.get('duration', 0) // 1000 if s.get('duration') else 0,
                     "cover_url": "",
-                    "download_url": "",  # 无可用播放链接
+                    "download_url": play_url,
                     "ext": "mp3",
                     "file_size": "",
                     "file_size_bytes": 0,

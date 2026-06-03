@@ -24,6 +24,11 @@ export function useWebSocket() {
   const [transcriptionText, setTranscriptionText] = useState<string>('');
   const [ttsAudio, setTtsAudio] = useState<TTSAudio | null>(null);
   const [ttsFallbackText, setTtsFallbackText] = useState<string>('');
+  const [musicSearchStatus, setMusicSearchStatus] = useState<{
+    status: 'searching' | 'copyright_blocked' | 'not_found' | '';
+    message?: string;
+    query?: string;
+  }>({ status: '' });
   const [timeState, setTimeState] = useState<TimeState>({
     simulated: false, current_time: '', speed: 1, paused: false,
   });
@@ -221,6 +226,15 @@ export function useWebSocket() {
 
         if (data.type === 'tts_failed') {
           setTtsFallbackText(data.text || '');
+          return;
+        }
+
+        if (data.type === 'music_search_status') {
+          setMusicSearchStatus({
+            status: (data.status as 'searching' | 'copyright_blocked' | 'not_found') || '',
+            message: data.message || '',
+            query: data.query || '',
+          });
           return;
         }
 
@@ -448,6 +462,12 @@ export function useWebSocket() {
     safeSend({ type: 'reset_config' });
   }, [safeSend]);
 
+  const resetConversation = useCallback(() => {
+    currentAiMsgRef.current = '';
+    setMessages([]);
+    safeSend({ type: 'reset' });
+  }, [safeSend]);
+
   // 同步 refs，确保 connect 闭包中始终拿到最新的函数引用
   fetchMemoryListRef.current = fetchMemoryList;
   fetchCacheListRef.current = fetchCacheList;
@@ -460,6 +480,7 @@ export function useWebSocket() {
     timeState, setTime, setTimeSpeed, toggleTimePause, toggleTimeSim, toggleSuppressAlerts,
     sendMessage, clearMessages, fetchCacheList, deleteCache,
     fetchMemoryList, deleteMemory, clearMemories,
-    sendAudioChunk, sendAudioFinal,
+    musicSearchStatus,
+    sendAudioChunk, sendAudioFinal, resetConversation,
   };
 }
