@@ -2,8 +2,20 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { SongInfo, MusicControlData } from '../types';
 
 // 将第三方音乐 URL 转为后端代理（解决跨域播放）
+// 对本地路径中的中文字符做 URL 编码，避免浏览器 Audio 加载失败
 function proxyUrl(url: string): string {
-  if (!url || url.startsWith('/') || url.startsWith('blob:') || url.startsWith('data:')) return url;
+  if (!url || url.startsWith('blob:') || url.startsWith('data:')) return url;
+  if (url.startsWith('/')) {
+    // 对路径中的非 ASCII 字符进行编码（如 /music/playlists/轻音乐/song.mp3）
+    return url.split('/').map(segment => {
+      try {
+        // 如果 segment 还没被编码过，就编码；已编码的跳过
+        return decodeURIComponent(segment) === segment ? encodeURIComponent(segment) : segment;
+      } catch {
+        return encodeURIComponent(segment);
+      }
+    }).join('/');
+  }
   return `/api/proxy/music?url=${encodeURIComponent(url)}`;
 }
 
@@ -205,11 +217,15 @@ export function useMusicPlayer() {
     setCurrentSong(song);
 
     const url = song.download_url || DEFAULT_TRACK;
-    audio.src = proxyUrl(url);
+    const proxied = proxyUrl(url);
+    console.log(`[音乐播放] 索引=${index} 歌名="${song.song_name}" 原始URL="${url}" 代理URL="${proxied}"`);
+    audio.src = proxied;
     audio.play().then(() => {
       setPlayerState('playing');
       setError('');
+      console.log(`[音乐播放] 播放成功: "${song.song_name}"`);
     }).catch((e) => {
+      console.error(`[音乐播放] 播放失败: "${song.song_name}"`, e.name, e.message);
       if (e.name === 'NotAllowedError') {
         setError('请点击页面任意位置后开始播放');
       } else if (q.length > 0 && index < q.length - 1) {

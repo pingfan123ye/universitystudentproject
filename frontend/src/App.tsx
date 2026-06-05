@@ -102,8 +102,27 @@ export default function App() {
             onSendAudioFinal={(b64: string) => sendAudioChunk(b64)} onAudioStreamFinal={() => sendAudioFinal()} streamText={transcriptionText}
             onDuckMusic={duckForRecording} onRestoreMusic={restoreVolumeAfterRecording}
             isMobile={isMobile} onToggleSidebar={() => setSidebarOpen(true)}
-            musicPlayerVisible={playerState !== 'idle' || currentSong !== null || queue.length > 0 || searchResults.length > 0}
             onResetConversation={resetConversation} />
+          {/* 音乐导航栏：仅占左栏宽度，不遮挡侧栏 */}
+          <MusicPlayer
+            playerState={playerState}
+            currentSong={currentSong}
+            currentPlaylist={currentPlaylist}
+            queue={queue}
+            currentIndex={currentIndex}
+            volume={volume}
+            progress={progress}
+            error={error}
+            searchResults={searchResults}
+            onPlay={play}
+            onPause={pause}
+            onNext={next}
+            onPrev={prev}
+            onSeek={seek}
+            onSetVolume={setVolume}
+            onSetQueueAndPlay={setQueueAndPlay}
+            onSearchResults={setSearchResults}
+          />
         </div>
 
         {/* 侧栏：桌面固定显示，手机为抽屉覆盖层 */}
@@ -150,25 +169,6 @@ export default function App() {
         />
       )}
 
-      <MusicPlayer
-        playerState={playerState}
-        currentSong={currentSong}
-        currentPlaylist={currentPlaylist}
-        queue={queue}
-        currentIndex={currentIndex}
-        volume={volume}
-        progress={progress}
-        error={error}
-        searchResults={searchResults}
-        onPlay={play}
-        onPause={pause}
-        onNext={next}
-        onPrev={prev}
-        onSeek={seek}
-        onSetVolume={setVolume}
-        onSetQueueAndPlay={setQueueAndPlay}
-        onSearchResults={setSearchResults}
-      />
     </div>
   );
 }

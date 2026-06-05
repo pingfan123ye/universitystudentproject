@@ -21,11 +21,10 @@ interface ChatPanelProps {
   onRestoreMusic?: () => void;
   isMobile?: boolean;
   onToggleSidebar?: () => void;
-  musicPlayerVisible?: boolean;
   onResetConversation?: () => void;
 }
 
-export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlayed, pendingTtsFallback, onTtsFallbackConsumed, onSend, onClear, onSendAudioFinal, onAudioStreamFinal, streamText: propStreamText, onDuckMusic, onRestoreMusic, isMobile, onToggleSidebar, musicPlayerVisible, onResetConversation }: ChatPanelProps) {
+export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlayed, pendingTtsFallback, onTtsFallbackConsumed, onSend, onClear, onSendAudioFinal, onAudioStreamFinal, streamText: propStreamText, onDuckMusic, onRestoreMusic, isMobile, onToggleSidebar, onResetConversation }: ChatPanelProps) {
   const [input, setInput] = useState('');
   const [micActive, setMicActive] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -184,9 +183,9 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
           if (continuousModeRef.current && _recRef.current?.state === 'recording') {
             const SILENCE_THRESHOLD = 12;  // 振幅低于此值视为静音（放宽阈值，避免误触发）
             const elapsed = Date.now() - startTime;
-            if (avg < SILENCE_THRESHOLD && elapsed > 1500) {  // 至少录 1.5 秒
+            if (avg < SILENCE_THRESHOLD && elapsed > 2000) {  // 至少录 2 秒
               if (!_silenceTimerRef.current) {
-                console.log('[连续对话] 检测到静音，2秒后自动停止...');
+                console.log('[连续对话] 检测到静音，3秒后自动停止...');
                 _silenceTimerRef.current = setTimeout(() => {
                   console.log('[连续对话] 静音超时，自动停止录音');
                   setMicActive(false);
@@ -197,7 +196,7 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
                     }
                   });
                   return;
-                }, 2000);
+                }, 3000);
               }
             } else {
               if (_silenceTimerRef.current) {
@@ -387,7 +386,7 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
   }, [input, onSend]);
 
   return (
-    <div className="flex flex-col h-full" style={{ background: 'var(--bg-root)', paddingBottom: musicPlayerVisible ? '60px' : '0px', transition: 'padding-bottom 0.2s' }}>
+    <div className="flex flex-col flex-1 min-h-0" style={{ background: 'var(--bg-root)' }}>
       {isMobile && (
         <div className="flex items-center justify-between px-4 py-2 border-b" style={{ borderColor: 'var(--border)', background: 'var(--bg-surface)' }}>
           <span className="text-xs font-bold tracking-wider" style={{ color: 'var(--text-secondary)' }}>AI 语音助手</span>

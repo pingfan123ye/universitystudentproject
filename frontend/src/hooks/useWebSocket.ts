@@ -97,8 +97,8 @@ export function useWebSocket() {
 
         if (data.type === 'stt_result') {
           setTranscriptionText(data.text || '');
-          // 自动发送转写结果（类似浏览器 ASR 的 isFinal 行为）
-          if (data.text?.trim() && wsRef.current?.readyState === WebSocket.OPEN) {
+          // 只在最终结果时自动发送（final=true），中间结果仅更新输入框预览
+          if (data.final && data.text?.trim() && wsRef.current?.readyState === WebSocket.OPEN) {
             const text = data.text.trim();
             // 添加用户消息到列表
             setMessages((prev) => [...prev, {

@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { SongInfo } from '../types';
 
 interface MusicPlayerProps {
@@ -31,6 +31,34 @@ export default function MusicPlayer({
   const [searchQuery, setSearchQuery] = useState('');
   const [searching, setSearching] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
+  const volumeTrackRef = useRef<HTMLDivElement>(null);
+
+  // 音量滑块交互：点击轨道跳转
+  const handleVolumeTrackClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const track = volumeTrackRef.current;
+    if (!track) return;
+    const rect = track.getBoundingClientRect();
+    const fraction = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    onSetVolume(fraction);
+  }, [onSetVolume]);
+
+  // 音量滑块拖拽
+  const handleVolumeDrag = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const track = volumeTrackRef.current;
+    if (!track) return;
+    const onMove = (ev: MouseEvent) => {
+      const rect = track.getBoundingClientRect();
+      const fraction = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      onSetVolume(fraction);
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }, [onSetVolume]);
 
   // 搜索歌曲
   const handleSearch = useCallback(async () => {
@@ -79,18 +107,15 @@ export default function MusicPlayer({
 
   return (
     <div style={{
-      position: 'fixed',
-      bottom: 0,
-      left: 0,
-      right: 0,
-      zIndex: 100,
       background: 'var(--bg-elevated)',
       borderTop: '1px solid var(--border)',
-      padding: expanded ? '16px' : '8px 16px',
+      padding: expanded ? '12px 14px' : '6px 10px',
       transition: 'all 0.2s',
+      flexShrink: 0,
+      position: 'relative',
     }}>
       {/* 主控制条 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', maxWidth: '900px', margin: '0 auto' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '4px', maxWidth: '900px', margin: '0 auto' }}>
         {/* 封面 */}
         <div style={{
           width: '36px', height: '36px', borderRadius: '6px',
@@ -168,7 +193,7 @@ export default function MusicPlayer({
         )}
 
         {/* 控制按钮 */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
           <button onClick={onPrev} style={btnStyle} title="上一首">⏮</button>
           <button onClick={togglePlay} style={{
             ...btnStyle,
@@ -184,16 +209,54 @@ export default function MusicPlayer({
         </div>
 
         {/* 音量 */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', width: '80px' }}>
-          <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', width: '80px', flexShrink: 0 }}>
+          <span style={{ fontSize: '12px', color: 'var(--text-muted)', flexShrink: 0, cursor: 'pointer', userSelect: 'none' }}
+            onClick={() => onSetVolume(volume === 0 ? 0.7 : 0)}
+            title={volume === 0 ? '取消静音' : '静音'}
+          >
             {volume === 0 ? '🔇' : volume < 0.5 ? '🔉' : '🔊'}
           </span>
-          <input
-            type="range" min="0" max="1" step="0.05"
-            value={volume}
-            onChange={(e) => onSetVolume(parseFloat(e.target.value))}
-            style={{ flex: 1, height: '3px', accentColor: 'var(--accent)' }}
-          />
+          {/* 自定义音量滑块 — 规整统一的跨浏览器外观 */}
+          <div
+            ref={volumeTrackRef}
+            onClick={handleVolumeTrackClick}
+            style={{
+              flex: 1, minWidth: 0, height: '22px',
+              display: 'flex', alignItems: 'center',
+              cursor: 'pointer',
+            }}
+          >
+            <div style={{
+              position: 'relative', width: '100%', height: '4px',
+              borderRadius: '2px', background: 'var(--border)',
+              overflow: 'visible',
+            }}>
+              {/* 已填充部分 */}
+              <div style={{
+                position: 'absolute', top: 0, left: 0, height: '100%',
+                width: `${volume * 100}%`,
+                borderRadius: '2px',
+                background: 'var(--accent)',
+                transition: 'width 0.05s linear',
+              }} />
+              {/* 拖拽圆点 */}
+              <div
+                onMouseDown={handleVolumeDrag}
+                style={{
+                  position: 'absolute', top: '50%',
+                  left: `${volume * 100}%`,
+                  transform: 'translate(-50%, -50%)',
+                  width: '12px', height: '12px',
+                  borderRadius: '50%',
+                  background: 'var(--accent)',
+                  border: '2px solid var(--bg-elevated)',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.25)',
+                  cursor: 'grab',
+                  transition: 'left 0.05s linear',
+                }}
+              />
+            </div>
+          </div>
         </div>
 
         {/* 展开按钮 */}

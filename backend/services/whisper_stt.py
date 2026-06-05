@@ -140,6 +140,14 @@ async def transcribe_audio_base64(audio_b64: str) -> str:
             text = text.replace("切割", "切歌")
             # 繁转简（Whisper 经常输出繁体中文）
             text = _to_simplified(text)
+        # 噪声词黑名单：过滤 Whisper 在低信噪比下的幻觉输出
+        _NOISE_WORDS = {
+            "蝙蝠绿狗", "謝謝觀賞", "感谢观看", "字幕by", "谢谢观看",
+            "歡迎收聽", "欢迎收听", "字幕由",
+        }
+        if text and text.strip() in _NOISE_WORDS:
+            logger.info("Whisper 噪声词已过滤: %s", text)
+            return ""
         if text:
             logger.info("Whisper 转写结果 (%d chars, %d segments): %s",
                        len(text), len(seg_list), text[:60])

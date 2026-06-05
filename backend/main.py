@@ -90,6 +90,10 @@ async def _maybe_tts(ws: WebSocket, reply: str, path: str):
     """非阻塞发送 TTS 音频，失败时通知前端降级 speechSynthesis"""
     if not reply or not reply.strip():
         return
+    # 清洗 Markdown 格式字符，避免 TTS 朗读星号/井号等
+    reply = _clean_for_tts(reply)
+    if not reply:
+        return
     try:
         audio_b64 = await text_to_speech_base64(reply)
         if audio_b64:
@@ -143,6 +147,32 @@ def _clean_song_query(text: str) -> str:
 def _is_chinese_query(query: str) -> bool:
     """检测 query 是否包含中文字符（用于版权拦截判断）"""
     return bool(re.search(r'[一-鿿]', query))
+
+
+def _clean_for_tts(text: str) -> str:
+    """清洗 Markdown / 结构化格式字符，让 TTS 只朗读纯文本"""
+    import re as _re
+    # 1. 去掉代码块（```...```）
+    text = _re.sub(r'```[\s\S]*?```', '', text)
+    # 2. 去掉行内代码 (`code`)
+    text = _re.sub(r'`([^`]+)`', r'\1', text)
+    # 3. 去掉粗体标记（**text**, __text__）
+    text = _re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = _re.sub(r'__([^_]+)__', r'\1', text)
+    # 4. 去掉斜体标记（*text* / _text_），注意不误伤单独出现的 * 或 _
+    text = _re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'\1', text)
+    text = _re.sub(r'(?<!_)_([^_\n]+)_(?!_)', r'\1', text)
+    # 5. 去掉标题标记（# ## ### 等，只在行首匹配）
+    text = _re.sub(r'^#{1,6}\s+', '', text, flags=_re.MULTILINE)
+    # 6. 去掉无序列表标记（- * + 开头）
+    text = _re.sub(r'^[\-\*\+]\s+', '', text, flags=_re.MULTILINE)
+    # 7. 去掉有序列表标记（1. 2. 等）
+    text = _re.sub(r'^\d+\.\s+', '', text, flags=_re.MULTILINE)
+    # 8. 去掉删除线（~~text~~）
+    text = _re.sub(r'~~([^~]+)~~', r'\1', text)
+    # 9. 去掉多余空白行
+    text = _re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 def _mood_to_english(query: str) -> str:
@@ -680,6 +710,7 @@ async def websocket_endpoint(ws: WebSocket):
         {"type": "error", "error": "..."}                       — 错误
     """
     await ws.accept()
+    global _stt_buffer
     logger.info("WebSocket 客户端已连接")
 
     # 发送初始设备状态
@@ -1077,6 +1108,8 @@ async def websocket_endpoint(ws: WebSocket):
                             logger.info(f"LLM 输出 [ACTIONS] (兜底): {json.dumps(llm_actions, ensure_ascii=False)[:200]}")
 
                     full_reply = strip_search_tags(full_reply)
+                    # 清洗 Markdown 格式字符（双保险：前端显示 + TTS 都不含格式符号）
+                    full_reply = _clean_for_tts(full_reply)
                     actual_model = model_used[0] if model_used else "unknown"
                     logger.info(f"大模型回复完成, 模型: {actual_model}")
                     await ws.send_json({"type": "done", "path": route_path, "reply": full_reply.strip(), "model": actual_model})

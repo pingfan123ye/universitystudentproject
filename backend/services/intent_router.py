@@ -470,11 +470,14 @@ def _is_music_bleed(text: str) -> bool:
     for p in MUSIC_BLEED_PATTERNS:
         if p.search(text):
             return True
-    # 短文本 + 全是重复字符（如"謝謝謝謝"）
+    # 短文本 + 真正有重复字符（如"謝謝謝謝"、"好的好的"）
+    # 避免误杀正常短命令：晚安/开灯/关灯/切歌/暂停 等
     if len(text) <= 6:
         chars = set(text)
         if len(chars) <= 2:
-            return True
+            # 仅当有字符重复出现（非每个字符仅出现一次）才视为噪声
+            if any(text.count(c) >= 2 for c in chars):
+                return True
     return False
 
 
