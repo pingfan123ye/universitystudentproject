@@ -20,13 +20,13 @@ export default function App() {
     timeState, setTime, setTimeSpeed, toggleTimePause, toggleTimeSim, toggleSuppressAlerts,
     sendMessage, clearMessages, fetchCacheList, deleteCache,
     fetchMemoryList, deleteMemory, clearMemories,
-    sendAudioChunk, transcriptionText, ttsFallbackText,
+    sendAudioChunk, sendAudioFinal, transcriptionText, ttsFallbackText,
     musicSearchStatus,
     resetConversation,
   } = useWebSocket();
 
   const {
-    playerState, setPlayerState, currentSong, queue, currentIndex, volume, progress, error, searchResults, setSearchResults,
+    playerState, setPlayerState, currentSong, currentPlaylist, queue, currentIndex, volume, progress, error, searchResults, setSearchResults,
     play, pause, duckForRecording, restoreVolumeAfterRecording, next, prev, seek, setVolume, setQueueAndPlay,
     handleMusicControl,
   } = useMusicPlayer();
@@ -99,7 +99,7 @@ export default function App() {
           <ChatPanel messages={messages} pendingTask={pendingTask ? { task: pendingTask } : null} onSend={sendMessage} onClear={clearMessages}
             pendingTts={pendingTts} onTtsPlayed={() => setPendingTts(null)}
             pendingTtsFallback={pendingTtsFallback} onTtsFallbackConsumed={() => setPendingTtsFallback('')}
-            onSendAudioFinal={(b64: string) => sendAudioChunk(b64)} streamText={transcriptionText}
+            onSendAudioFinal={(b64: string) => sendAudioChunk(b64)} onAudioStreamFinal={() => sendAudioFinal()} streamText={transcriptionText}
             onDuckMusic={duckForRecording} onRestoreMusic={restoreVolumeAfterRecording}
             isMobile={isMobile} onToggleSidebar={() => setSidebarOpen(true)}
             musicPlayerVisible={playerState !== 'idle' || currentSong !== null || queue.length > 0 || searchResults.length > 0}
@@ -153,6 +153,7 @@ export default function App() {
       <MusicPlayer
         playerState={playerState}
         currentSong={currentSong}
+        currentPlaylist={currentPlaylist}
         queue={queue}
         currentIndex={currentIndex}
         volume={volume}

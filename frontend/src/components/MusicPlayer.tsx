@@ -4,6 +4,7 @@ import { SongInfo } from '../types';
 interface MusicPlayerProps {
   playerState: 'idle' | 'searching' | 'playing' | 'paused';
   currentSong: SongInfo | null;
+  currentPlaylist?: string | null;
   queue: SongInfo[];
   currentIndex: number;
   volume: number;
@@ -21,7 +22,7 @@ interface MusicPlayerProps {
 }
 
 export default function MusicPlayer({
-  playerState, currentSong, queue, currentIndex,
+  playerState, currentSong, currentPlaylist, queue, currentIndex,
   volume, progress, error, searchResults,
   onPlay, onPause, onNext, onPrev,
   onSeek, onSetVolume, onSetQueueAndPlay, onSearchResults,
@@ -115,6 +116,30 @@ export default function MusicPlayer({
                 overflow: 'hidden', textOverflow: 'ellipsis',
               }}>
                 请稍候
+              </div>
+            </>
+          ) : currentPlaylist ? (
+            <>
+              {/* 歌单名 — 优先显示 */}
+              <div style={{
+                fontSize: '13px', fontWeight: 700, whiteSpace: 'nowrap',
+                overflow: 'hidden', textOverflow: 'ellipsis',
+                color: 'var(--accent)',
+              }}>
+                📋 {currentPlaylist}
+              </div>
+              {/* 当前曲名 */}
+              <div style={{
+                fontSize: '11px', color: 'var(--text-muted)', whiteSpace: 'nowrap',
+                overflow: 'hidden', textOverflow: 'ellipsis',
+              }}>
+                {songName || '未选择歌曲'}
+              </div>
+              {/* 进度信息 */}
+              <div style={{
+                fontSize: '9px', color: 'var(--text-muted)', whiteSpace: 'nowrap',
+              }}>
+                {queue.length > 0 ? `${currentIndex + 1}/${queue.length} · 循环` : ''}
               </div>
             </>
           ) : (
@@ -285,7 +310,9 @@ export default function MusicPlayer({
                 fontSize: '10px', fontWeight: 600, textTransform: 'uppercase',
                 letterSpacing: '0.5px', color: 'var(--text-muted)', marginBottom: '6px',
               }}>
-                播放队列 ({queue.length})
+                {currentPlaylist
+                  ? `📋 ${currentPlaylist} (${queue.length}) · 随机循环`
+                  : `播放队列 (${queue.length})`}
               </div>
               {queue.map((song, i) => (
                 <div

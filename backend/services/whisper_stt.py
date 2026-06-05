@@ -10,6 +10,20 @@ import threading
 
 import numpy as np
 
+# 简繁转换（Whisper 经常输出繁体中文）
+try:
+    from opencc import OpenCC
+    _opencc = OpenCC('t2s')  # 繁体 → 简体
+except ImportError:
+    _opencc = None
+
+
+def _to_simplified(text: str) -> str:
+    """繁体中文 → 简体中文"""
+    if not text or _opencc is None:
+        return text
+    return _opencc.convert(text)
+
 logger = logging.getLogger(__name__)
 
 # 国内 HuggingFace 镜像加速下载
@@ -124,6 +138,8 @@ async def transcribe_audio_base64(audio_b64: str) -> str:
             text = text.replace("小字", "小智")
             text = text.replace("小子", "小智")
             text = text.replace("切割", "切歌")
+            # 繁转简（Whisper 经常输出繁体中文）
+            text = _to_simplified(text)
         if text:
             logger.info("Whisper 转写结果 (%d chars, %d segments): %s",
                        len(text), len(seg_list), text[:60])

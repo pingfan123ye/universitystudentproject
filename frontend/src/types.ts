@@ -46,7 +46,8 @@ export interface WSResponse {
     | 'tts_audio' | 'time_sync'
     | 'proactive_alert' | 'alerts_suppressed'
     | 'safety_confirm' | 'engine_config'
-    | 'search_status' | 'transcription_text' | 'stt_result' | 'tts_failed';
+    | 'search_status' | 'music_search_status' | 'chat_error'
+    | 'transcription_text' | 'stt_result' | 'tts_failed';
   text?: string;
   path?: RoutePath;
   reply?: string;
@@ -54,7 +55,9 @@ export interface WSResponse {
   error?: string;
   action?: string;
   model?: string;
+  query?: string;
   // music_control payload
+  playlist_name?: string;
   song_id?: string;
   song_name?: string;
   singers?: string;
@@ -138,6 +141,7 @@ export interface SongInfo {
 
 export interface MusicControlData {
   action: string;
+  playlist_name?: string;
   song_id?: string;
   song_name?: string;
   singers?: string;

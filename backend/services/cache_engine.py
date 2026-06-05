@@ -74,6 +74,10 @@ def _init_db():
         conn.execute("ALTER TABLE cache ADD COLUMN is_cached INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+    try:
+        conn.execute("ALTER TABLE cache ADD COLUMN actions_json TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -92,18 +96,29 @@ class CacheEngine:
     def _load_from_db(self):
         """启动时从 SQLite 加载缓存到内存热层"""
         conn = sqlite3.connect(_get_db_path())
-        rows = conn.execute(
-            "SELECT id, normalized_text, original_text, reply, hit_count, created_at, last_hit_at "
-            "FROM cache ORDER BY last_hit_at DESC LIMIT ?",
-            (self.hot_size,)
-        ).fetchall()
+        # 尝试加载 actions_json 列（兼容旧表无此列）
+        try:
+            rows = conn.execute(
+                "SELECT id, normalized_text, original_text, reply, hit_count, created_at, last_hit_at, actions_json "
+                "FROM cache ORDER BY last_hit_at DESC LIMIT ?",
+                (self.hot_size,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                "SELECT id, normalized_text, original_text, reply, hit_count, created_at, last_hit_at "
+                "FROM cache ORDER BY last_hit_at DESC LIMIT ?",
+                (self.hot_size,)
+            ).fetchall()
         conn.close()
         for row in rows:
-            self.hot[row[0]] = {
+            entry = {
                 "id": row[0], "normalized_text": row[1], "original_text": row[2],
                 "reply": row[3], "hit_count": row[4],
                 "created_at": row[5], "last_hit_at": row[6],
             }
+            if len(row) >= 8:
+                entry["actions_json"] = row[7]
+            self.hot[row[0]] = entry
 
     CACHE_THRESHOLD = 3  # 同一指令第 3 次调用后缓存
 
@@ -129,12 +144,19 @@ class CacheEngine:
 
         # 查冷层
         conn = sqlite3.connect(_get_db_path())
-        row = conn.execute(
-            "SELECT id, reply, hit_count, last_hit_at FROM cache WHERE id = ? AND is_cached = 1", (key,)
-        ).fetchone()
+        try:
+            row = conn.execute(
+                "SELECT id, reply, hit_count, last_hit_at, actions_json FROM cache WHERE id = ? AND is_cached = 1", (key,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = conn.execute(
+                "SELECT id, reply, hit_count, last_hit_at FROM cache WHERE id = ? AND is_cached = 1", (key,)
+            ).fetchone()
         conn.close()
         if row:
             entry = {"id": row[0], "reply": row[1], "hit_count": row[2], "last_hit_at": row[3], "is_cached": True}
+            if len(row) >= 5 and row[4]:
+                entry["actions_json"] = row[4]
             if now - entry["last_hit_at"] > 7 * 24 * 3600:
                 self.delete(text)
                 return None
@@ -164,16 +186,23 @@ class CacheEngine:
         conn.close()
         return current, current >= self.CACHE_THRESHOLD
 
-    def store_reply(self, text: str, reply: str):
-        """缓存大模型回复（达到阈值时调用）"""
+    def store_reply(self, text: str, reply: str, actions_json: str | None = None):
+        """缓存大模型回复（达到阈值时调用）
+
+        Args:
+            actions_json: 若提供，为 [ACTIONS] 标签中解析出的 JSON 字符串，
+                         缓存命中时将恢复执行（音乐/设备操作）。
+        """
         key = _make_key(text)
         now = time.time()
         entry = {"id": key, "reply": reply, "hit_count": 0, "last_hit_at": now, "is_cached": True}
+        if actions_json:
+            entry["actions_json"] = actions_json
         self._promote_to_hot(key, entry)
         conn = sqlite3.connect(_get_db_path())
         conn.execute(
-            "UPDATE cache SET reply = ?, is_cached = 1, hit_count = 0, last_hit_at = ? WHERE id = ?",
-            (reply, now, key)
+            "UPDATE cache SET reply = ?, actions_json = ?, is_cached = 1, hit_count = 0, last_hit_at = ? WHERE id = ?",
+            (reply, actions_json, now, key)
         )
         conn.commit()
         conn.close()
@@ -191,19 +220,28 @@ class CacheEngine:
     def get_all(self) -> list[dict]:
         """获取全部缓存条目（用于前端管理面板）"""
         conn = sqlite3.connect(_get_db_path())
-        rows = conn.execute(
-            "SELECT id, normalized_text, original_text, reply, hit_count, created_at, last_hit_at "
-            "FROM cache ORDER BY last_hit_at DESC"
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT id, normalized_text, original_text, reply, hit_count, created_at, last_hit_at, actions_json "
+                "FROM cache ORDER BY last_hit_at DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                "SELECT id, normalized_text, original_text, reply, hit_count, created_at, last_hit_at "
+                "FROM cache ORDER BY last_hit_at DESC"
+            ).fetchall()
         conn.close()
-        return [
-            {
+        results = []
+        for r in rows:
+            entry = {
                 "id": r[0], "normalized_text": r[1], "original_text": r[2],
                 "reply": r[3], "hit_count": r[4],
                 "created_at": r[5], "last_hit_at": r[6],
             }
-            for r in rows
-        ]
+            if len(r) >= 8 and r[7]:
+                entry["actions_json"] = r[7]
+            results.append(entry)
+        return results
 
     def _promote_to_hot(self, key: str, entry: dict):
         """提升条目到热层"""

@@ -82,6 +82,9 @@ def _kill_old_process():
 
 _kill_old_process()
 
+# ===== 流式 STT 累积缓冲区 =====
+_stt_buffer: str = ""  # 分段音频转写结果的累积字符串
+
 # ===== 非阻塞 TTS 辅助 =====
 async def _maybe_tts(ws: WebSocket, reply: str, path: str):
     """非阻塞发送 TTS 音频，失败时通知前端降级 speechSynthesis"""
@@ -109,9 +112,6 @@ async def _maybe_tts(ws: WebSocket, reply: str, path: str):
             "reason": "TTS 异常",
         })
 
-
-# ===== 音乐搜索缓存（供"换一首"使用） =====
-_search_cache: dict[str, list[dict]] = {}  # query → 前3条外部搜索结果
 
 
 def _clean_song_query(text: str) -> str:
@@ -145,10 +145,50 @@ def _is_chinese_query(query: str) -> bool:
     return bool(re.search(r'[一-鿿]', query))
 
 
-async def _announce_and_play(ws, song: dict):
-    """发送播放指令 + TTS 语音播报歌名"""
+def _mood_to_english(query: str) -> str:
+    """中文情绪/场景词 → Jamendo 英文标签（轻音乐/纯音乐等 Jamendo 中文无结果）"""
+    if not query:
+        return ""
+    q = query.lower()
+    # 先精确匹配整段
+    if any(kw in q for kw in ["轻音乐", "纯音乐", "纯音", "轻音"]):
+        return "instrumental piano"
+    if any(kw in q for kw in ["安静", "不吵", "环境", "背景", "看书", "读书", "专注", "专心"]):
+        return "ambient study"
+    if any(kw in q for kw in ["学习", "看书", "读书", "做作业", "写作业"]):
+        return "study focus"
+    if any(kw in q for kw in ["放松", "舒缓", "安静", "平静", "轻松"]):
+        return "relaxing calm"
+    if any(kw in q for kw in ["钢琴", "吉他", "古筝", "琵琶", "二胡", "小提琴"]):
+        return "piano instrumental"
+    if any(kw in q for kw in ["冥想", "瑜伽", "睡眠"]):
+        return "meditation sleep"
+    if any(kw in q for kw in ["自然", "下雨", "雨声", "海浪", "鸟"]):
+        return "nature sounds"
+    if any(kw in q for kw in ["咖啡", "咖啡馆", "咖啡厅"]):
+        return "coffee shop jazz"
+    return ""
+
+
+async def _announce_and_play(ws, song: dict, all_local_songs: list[dict] | None = None):
+    """发送播放指令 + TTS 语音播报歌名。
+    当 all_local_songs 提供时，将其打包为完整队列发给前端（当前歌曲排第一，其余随机），
+    这样前端有完整队列，切歌/上一首可以直接在队列中推进。"""
     name = song.get("song_name", "")
     singer = song.get("singers", "")
+
+    # 构建歌曲队列（当前歌曲 + 其余本地歌曲随机排列）
+    if all_local_songs:
+        import random as _random
+        # 将当前命中的歌曲排第一，其余随机打乱（用 song_id 去重）
+        current_filename = song.get("song_id", "").replace("local_", "")
+        others = [_build_local_song(s) for s in all_local_songs
+                  if s.get("filename") != current_filename]
+        _random.shuffle(others)
+        songs_payload = [song] + others
+    else:
+        songs_payload = [song]
+
     await ws.send_json({
         "type": "music_control", "action": "play",
         "song_id": song.get("song_id", ""),
@@ -161,7 +201,7 @@ async def _announce_and_play(ws, song: dict):
         "cover_url": song.get("cover_url", ""),
         "download_url": song.get("download_url", ""),
         "ext": song.get("ext", "mp3"),
-        "songs": [song],
+        "songs": songs_payload,
     })
     # TTS 播报：告诉用户正在播放什么
     if singer:
@@ -169,7 +209,7 @@ async def _announce_and_play(ws, song: dict):
     else:
         announce_text = f"好的，为你播放{name}"
     asyncio.create_task(_maybe_tts(ws, announce_text, "music"))
-    logger.info(f"播放: {name} - {singer}")
+    logger.info(f"播放: {name} - {singer}" + (f" (队列 {len(songs_payload)} 首)" if all_local_songs else ""))
 
 
 def _build_local_song(picked: dict) -> dict:
@@ -185,23 +225,178 @@ def _build_local_song(picked: dict) -> dict:
 async def _send_music_control(ws, music_action: dict):
     """发送音乐控制消息，如果 play 时携带 query 则先搜索歌曲"""
     from services.music_service import MusicService, _search_jamendo
-    from playlist_service import get_all_songs, search_local
+    from playlist_service import get_all_songs, search_local, get_playlist, list_playlists
 
     action = music_action.get("action", "play")
     query = music_action.get("query", "")
 
-    # ── 切歌/上一首：无播放列表时给出反馈 ──
+    # ── 切歌/上一首：直接由前端队列处理 ──
     if action in ("next", "prev"):
-        if not _search_cache:
-            # 没有搜索缓存，无法切歌
-            msg = "当前没有正在播放的歌曲，你想听什么？"
-            await ws.send_json({"type": "chat_error", "message": msg})
-            asyncio.create_task(_maybe_tts(ws, msg, "music"))
-            logger.info("切歌请求但无播放缓存，提示用户")
-            return
-        # 有缓存 → 正常切歌（前端当前播放队列处理）
+        # 前端已有歌曲队列（播放器/歌单），直接发指令让前端推进。
+        # 如果前端没歌曲，next() 无害（队列空则不操作/播默认曲目）
         await ws.send_json({"type": "music_control", "action": action})
+        asyncio.create_task(_maybe_tts(ws, "好的", "music"))
         return
+
+    # ── 歌单播放 ──
+    playlist_name = music_action.get("playlist", "")
+    # 无歌单 + 无搜索词 → 默认第一个可用歌单（避免随机单曲体验差）
+    if not playlist_name and not query:
+        try:
+            all_playlists = list_playlists()
+            if all_playlists:
+                playlist_name = list(all_playlists.keys())[0]
+                logger.info(f"无歌单/无搜索 → 默认歌单: '{playlist_name}'")
+        except Exception:
+            pass
+    # 如果没显式指定 playlist 但 query 匹配某个歌单名，自动回退
+    if not playlist_name and query:
+        try:
+            all_playlists = list_playlists()
+            q_lower = query.strip().lower()
+            for pname in all_playlists:
+                if q_lower == pname.lower() or pname.lower() in q_lower:
+                    playlist_name = pname
+                    logger.info(f"歌单自动匹配: query='{query}' → playlist='{playlist_name}'")
+                    break
+        except Exception:
+            pass
+
+    if playlist_name:
+        songs = get_playlist(playlist_name)
+        if songs:
+            import random as _random
+            shuffled = list(songs)  # 复制
+            _random.shuffle(shuffled)
+
+            # 构建完整 SongInfo 对象
+            song_info_list = []
+            for s in shuffled:
+                song_info_list.append({
+                    "song_id": f"playlist_{playlist_name}_{s['filename']}",
+                    "song_name": s.get("song_name", s.get("filename", "")),
+                    "singers": s.get("artist", ""),
+                    "album": "",
+                    "source": "playlist",
+                    "duration": "",
+                    "duration_s": 0,
+                    "cover_url": "",
+                    "download_url": s["url"],
+                    "ext": "mp3",
+                    "file_size": "",
+                    "file_size_bytes": 0,
+                    "quality": "",
+                    "lyric": "",
+                })
+
+            first = song_info_list[0]
+            await ws.send_json({
+                "type": "music_control",
+                "action": "play",
+                "playlist_name": playlist_name,
+                "song_id": first["song_id"],
+                "song_name": first["song_name"],
+                "singers": first["singers"],
+                "album": first["album"],
+                "source": first["source"],
+                "duration": first["duration"],
+                "duration_s": first["duration_s"],
+                "cover_url": first["cover_url"],
+                "download_url": first["download_url"],
+                "ext": first["ext"],
+                "songs": song_info_list,
+            })
+
+            # TTS 播报
+            announce_text = f"好的，为你播放歌单「{playlist_name}」"
+            asyncio.create_task(_maybe_tts(ws, announce_text, "music"))
+            logger.info(f"歌单播放: '{playlist_name}' ({len(song_info_list)} 首, 已随机打乱)")
+            return
+        else:
+            logger.warning(f"歌单 '{playlist_name}' 未找到，尝试关键词意图回退")
+
+            # ── 歌单名匹配失败 → 关键词意图映射回退 ──
+            # LLM 可能编造歌单名（如"轻松学习曲目"），从其中提取关键词来匹配真实歌单
+            all_playlists = list_playlists()
+            if all_playlists:
+                playlist_names = list(all_playlists.keys())
+                # 关键词 → 偏好歌单名 映射（优先级从高到低）
+                KEYWORD_MAP: list[tuple[list[str], str]] = [
+                    (["学习", "专注", "看书", "读书", "写作业", "备考", "焦虑", "紧张",
+                      "助眠", "睡觉", "失眠", "休息", "冥想", "放松",
+                      "轻音乐", "轻音", "纯音乐", "纯音", "背景", "安静", "环境",
+                      "钢琴", "古筝", "吉他", "琵琶", "二胡", "小提琴", "器乐"], "轻音乐"),
+                    (["兴奋", "运动", "跑步", "健身", "锻炼", "燃", "嗨", "劲爆", "摇滚", "节奏"], "运动"),
+                    (["日常", "随便", "来点", "放歌", "想听", "播放", "收藏", "流行"], "收藏"),
+                ]
+
+                # 从 LLM 输出的 playlist_name + query 中提取关键词
+                search_text = f"{playlist_name} {query}".strip().lower()
+
+                matched_playlist = None
+                for keywords, target_playlist in KEYWORD_MAP:
+                    if target_playlist not in playlist_names:
+                        continue  # 目标歌单不存在则跳过
+                    if any(kw in search_text for kw in keywords):
+                        matched_playlist = target_playlist
+                        logger.info(f"歌单关键词回退命中: '{search_text}' → '{matched_playlist}'")
+                        break
+
+                # 无关键词匹配 → 默认第一个歌单
+                if not matched_playlist:
+                    matched_playlist = playlist_names[0]
+                    logger.info(f"歌单无关键词匹配，默认选第一个: '{matched_playlist}'")
+
+                # 用匹配到的歌单再试一次
+                songs = get_playlist(matched_playlist)
+                if songs:
+                    import random as _random2
+                    shuffled = list(songs)
+                    _random2.shuffle(shuffled)
+
+                    song_info_list = []
+                    for s in shuffled:
+                        song_info_list.append({
+                            "song_id": f"playlist_{matched_playlist}_{s['filename']}",
+                            "song_name": s.get("song_name", s.get("filename", "")),
+                            "singers": s.get("artist", ""),
+                            "album": "",
+                            "source": "playlist",
+                            "duration": "",
+                            "duration_s": 0,
+                            "cover_url": "",
+                            "download_url": s["url"],
+                            "ext": "mp3",
+                            "file_size": "",
+                            "file_size_bytes": 0,
+                            "quality": "",
+                            "lyric": "",
+                        })
+
+                    first = song_info_list[0]
+                    await ws.send_json({
+                        "type": "music_control",
+                        "action": "play",
+                        "playlist_name": matched_playlist,
+                        "song_id": first["song_id"],
+                        "song_name": first["song_name"],
+                        "singers": first["singers"],
+                        "album": first["album"],
+                        "source": first["source"],
+                        "duration": first["duration"],
+                        "duration_s": first["duration_s"],
+                        "cover_url": first["cover_url"],
+                        "download_url": first["download_url"],
+                        "ext": first["ext"],
+                        "songs": song_info_list,
+                    })
+
+                    announce_text = f"好的，为你播放歌单「{matched_playlist}」"
+                    asyncio.create_task(_maybe_tts(ws, announce_text, "music"))
+                    logger.info(f"歌单回退播放: '{matched_playlist}' ({len(song_info_list)} 首, 关键词映射)")
+                    return
+                else:
+                    logger.warning(f"回退歌单 '{matched_playlist}' 也无歌曲，继续搜索流水线")
 
     if action == "play" and query:
         clean_query = _clean_song_query(query)
@@ -234,14 +429,16 @@ async def _send_music_control(ws, music_action: dict):
             if all_local:
                 import random as _random
                 picked = _random.choice(all_local)
-                await _announce_and_play(ws, _build_local_song(picked))
+                await _announce_and_play(ws, _build_local_song(picked), all_local)
                 logger.info(f"泛化播放，随机选择: {picked['song_name']} - {picked['artist']}")
                 return
-            logger.info("泛化播放请求但本地歌单为空")
+            logger.info("泛化播放请求但本地歌单为空，使用默认纯音乐")
             await ws.send_json({
-                "type": "music_search_status",
-                "status": "not_found",
-                "message": "本地歌单为空，请先添加音乐文件",
+                "type": "music_control",
+                "action": "play",
+                "song_name": "专注纯音乐",
+                "download_url": "/music/running-up-that-hill.mp3",
+                "source": "local",
             })
             return
 
@@ -249,8 +446,9 @@ async def _send_music_control(ws, music_action: dict):
         # 1. 本地歌单搜索（含 difflib 模糊匹配）
         local_hit = search_local(clean_query) if clean_query else None
         if local_hit:
-            await _announce_and_play(ws, _build_local_song(local_hit))
-            logger.info(f"本地命中: {local_hit['song_name']} - {local_hit['artist']}")
+            all_local = get_all_songs()
+            await _announce_and_play(ws, _build_local_song(local_hit), all_local)
+            logger.info(f"本地命中: {local_hit['song_name']} - {local_hit['artist']} (队列 {len(all_local)} 首)")
             return
 
         # 2. Jamendo API（CC 授权独立音乐，有真实可播放 MP3 URL）
@@ -258,10 +456,21 @@ async def _send_music_control(ws, music_action: dict):
         if jamendo_songs:
             first = jamendo_songs[0]
             if first.get("download_url"):
-                _search_cache[clean_query] = jamendo_songs[:3]
                 await _announce_and_play(ws, first)
                 logger.info(f"Jamendo 命中: {first.get('song_name', '')} - {first.get('singers', '')}")
                 return
+
+        # 2a. 轻音乐/纯音乐/学习 mood 搜索 → Jamendo 用英文标签（中文曲库少）
+        eng_tags = _mood_to_english(clean_query)
+        if eng_tags:
+            logger.info(f"Mood 搜索: '{clean_query}' → Jamendo English tags: '{eng_tags}'")
+            jamendo_mood = await _search_jamendo(eng_tags)
+            if jamendo_mood:
+                first = jamendo_mood[0]
+                if first.get("download_url"):
+                    await _announce_and_play(ws, first)
+                    logger.info(f"Jamendo mood 命中: {first.get('song_name', '')} - {first.get('singers', '')}")
+                    return
 
         # 3. Pixabay Music（免费可商用，有真实 MP3 URL）
         from services.pixabay_music import search_pixabay_music
@@ -269,7 +478,6 @@ async def _send_music_control(ws, music_action: dict):
         if pixabay_songs:
             first = pixabay_songs[0]
             if first.get("download_url"):
-                _search_cache[clean_query] = pixabay_songs[:3]
                 await _announce_and_play(ws, first)
                 logger.info(f"Pixabay 命中: {first.get('song_name', '')}")
                 return
@@ -278,7 +486,6 @@ async def _send_music_control(ws, music_action: dict):
         ms = MusicService()
         songs = await ms.search_songs(clean_query)
         if songs:
-            _search_cache[clean_query] = songs[:3]
 
             first = songs[0]
             if first.get("download_url"):
@@ -289,6 +496,17 @@ async def _send_music_control(ws, music_action: dict):
 
         # ── 5. 版权拦截：中文 query + 所有源都未命中 → 告知用户 ──
         if _is_chinese_query(clean_query):
+            # 如果是轻音乐/纯音乐/学习 mood 请求，放默认纯音乐代替报错
+            if _mood_to_english(clean_query):
+                logger.info(f"Mood 搜索所有源未命中，播放默认纯音乐: '{clean_query}'")
+                await ws.send_json({
+                    "type": "music_control",
+                    "action": "play",
+                    "song_name": f"纯音乐 · {clean_query[:20]}",
+                    "download_url": "/music/running-up-that-hill.mp3",
+                    "source": "local",
+                })
+                return
             msg = "抱歉，我不能为你播放有版权的歌曲。你可以把 mp3 文件放到 music 目录，我就能播放了"
             await ws.send_json({
                 "type": "music_search_status",
@@ -307,7 +525,7 @@ async def _send_music_control(ws, music_action: dict):
             picked = _random.choice(all_local)
             fallback_msg = f"抱歉，我没找到「{query}」的可播放版本，为你随机播放一首本地歌曲吧"
             await ws.send_json({"type": "chat_error", "message": fallback_msg})
-            await _announce_and_play(ws, _build_local_song(picked))
+            await _announce_and_play(ws, _build_local_song(picked), all_local)
             logger.info(f"回退本地随机: {picked['song_name']} - {picked['artist']}")
         else:
             await ws.send_json({
@@ -323,7 +541,7 @@ async def _send_music_control(ws, music_action: dict):
         if all_local:
             import random as _random
             picked = _random.choice(all_local)
-            await _announce_and_play(ws, _build_local_song(picked))
+            await _announce_and_play(ws, _build_local_song(picked), all_local)
             logger.info(f"随机播放本地: {picked['song_name']} - {picked['artist']}")
         else:
             # 本地歌单为空，尝试 Pixabay 随机抓取
@@ -341,7 +559,13 @@ async def _send_music_control(ws, music_action: dict):
                 "message": "本地歌单为空，在线曲库也未找到歌曲，请先添加音乐文件",
             })
     else:
+        # pause / resume / stop — 直接转发给前端
         await ws.send_json({"type": "music_control", "action": action})
+        if action == "pause":
+            asyncio.create_task(_maybe_tts(ws, "已暂停", "music"))
+        elif action == "stop":
+            asyncio.create_task(_maybe_tts(ws, "已停止", "music"))
+        # resume 不 TTS：音乐恢复播放本身就是最直接的反馈
 
 
 # ===== 全局虚拟家庭实例 =====
@@ -416,6 +640,30 @@ async def proxy_music(url: str = Query(..., description="要代理的音乐URL")
     except Exception as e:
         logger.warning(f"音乐代理失败: {e}")
         return JSONResponse({"error": "代理失败"}, status_code=502)
+
+
+# ── 歌单 API ──
+@app.get("/api/playlists")
+async def api_list_playlists():
+    """列出所有歌单及其歌曲数"""
+    from playlist_service import list_playlists
+    return {"playlists": list_playlists()}
+
+
+@app.get("/api/playlists/{name}")
+async def api_get_playlist(name: str):
+    """获取指定歌单的歌曲列表"""
+    from playlist_service import get_playlist
+    songs = get_playlist(name)
+    return {"name": name, "songs": songs or []}
+
+
+@app.post("/api/playlists/{name}/refresh")
+async def api_refresh_playlist(name: str):
+    """强制刷新歌单索引"""
+    from playlist_service import refresh_playlists
+    refresh_playlists()
+    return {"ok": True}
 
 
 @app.websocket("/api/ws")
@@ -623,20 +871,30 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "chat_reset", "message": "对话已重置"})
                 continue
 
-            # ===== 流式 STT：分段发到后端，实时返回转写结果 =====
-            # ===== 语音转写：一次性接收完整音频，一次转写 =====
+            # ===== 流式 STT：分段音频 → 实时增量返回 =====
             if msg_type == "audio_stream":
                 audio_b64 = data.get("audio", "")
+                is_final = data.get("final", False)
+
+                if is_final and not audio_b64:
+                    # final=true 且无音频：结束标记
+                    final_text = _stt_buffer.strip()
+                    _stt_buffer = ""
+                    if final_text:
+                        await ws.send_json({"type": "stt_result", "text": final_text, "final": True})
+                    continue
+
                 if not audio_b64:
                     continue
-                logger.info("STT 转写 (%d bytes)", len(audio_b64))
+
+                logger.info("STT 转写 (%d bytes, final=%s)", len(audio_b64), is_final)
                 text = await stt_transcribe(audio_b64)
                 if text:
-                    # STT 后处理纠错（修正 Whisper 常见误识别）
                     text = stt_correct(text)
-                    await ws.send_json({"type": "stt_result", "text": text})
-                else:
-                    await ws.send_json({"type": "error", "error": "语音转写失败"})
+                    _stt_buffer += " " if _stt_buffer and not _stt_buffer.endswith(("。","！","？","，")) else ""
+                    _stt_buffer += text
+                    # 每次返回完整累积文本，前端直接替换输入框即可
+                    await ws.send_json({"type": "stt_result", "text": _stt_buffer, "final": False})
                 continue
 
 
@@ -715,13 +973,55 @@ async def websocket_endpoint(ws: WebSocket):
                     cached = cache.check_and_get(prompt)
                     if cached:
                         logger.info(f"缓存命中: {prompt[:30]}...")
-                        await ws.send_json({"type": "token", "text": cached["reply"]})
-                        await ws.send_json({"type": "done", "path": "cache", "reply": cached["reply"], "model": "cache"})
-                        asyncio.create_task(_maybe_tts(ws, cached["reply"], "cache"))
+                        reply_text = cached["reply"]
+                        # 防御：兼容旧缓存（reply 中可能残留 [ACTIONS] 标签）
+                        clean_reply, cached_actions = parse_actions(reply_text)
+                        if cached_actions:
+                            reply_text = clean_reply
+                            logger.info(f"缓存 [ACTIONS] 兜底解析: {json.dumps(cached_actions, ensure_ascii=False)[:200]}")
+                        else:
+                            # 新缓存：ACTIONS 存储在独立字段
+                            actions_json = cached.get("actions_json")
+                            if actions_json:
+                                try:
+                                    cached_actions = json.loads(actions_json)
+                                    logger.info(f"缓存 [ACTIONS] 恢复: {actions_json[:200]}")
+                                except json.JSONDecodeError:
+                                    logger.warning(f"缓存 actions_json 解析失败: {actions_json[:100]}")
+                        # 发送回复
+                        await ws.send_json({"type": "token", "text": reply_text})
+                        await ws.send_json({"type": "done", "path": "cache", "reply": reply_text, "model": "cache"})
+                        asyncio.create_task(_maybe_tts(ws, reply_text, "cache"))
+                        # 执行缓存中的音乐/设备操作
+                        if cached_actions:
+                            music_act = cached_actions.get("music")
+                            device_acts = cached_actions.get("devices", [])
+                            if music_act and isinstance(music_act, dict):
+                                await _send_music_control(ws, music_act)
+                                logger.info(f"[缓存] 执行音乐: {music_act}")
+                            if device_acts:
+                                for da in device_acts:
+                                    virtual_home.execute(da.get("device", ""), da.get("action", "toggle"))
+                                await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
                         return
 
                     # 0.5 自动搜索（信息查询类）
                     mem_ctx = memory.get_context()
+
+                    # 注入当前可用歌单列表（供 LLM 做歌单匹配）
+                    try:
+                        playlists_available = list_playlists()
+                        if playlists_available:
+                            names = "、".join(playlists_available.keys())
+                            mem_ctx += (
+                                f"\n\n【当前可用歌单 — 必须原样使用】{names}\n"
+                                "规则：当用户请求播放音乐且未指定具体歌名时，你必须从上面列表中**原样复制**一个歌单名。\n"
+                                "不确定选哪个时：学习/专注/焦虑/助眠→优先选含'轻音乐'的；日常/随便→优先选'收藏'。\n"
+                                "**绝对不要**自己编造歌单名，不确定就留空 playlist 让后端自己选。"
+                            )
+                    except Exception:
+                        pass  # 歌单目录可能尚未创建
+
                     if auto_search:
                         logger.info(f"自动搜索: {prompt[:40]}...")
                         await ws.send_json({
@@ -741,6 +1041,7 @@ async def websocket_endpoint(ws: WebSocket):
 
                     # 1. 调大模型（记录实际使用的模型）
                     model_used: list[str] = []
+                    actions_out: list[str] = []  # 侧通道：收集流式中的 [ACTIONS] 标签
                     full_reply = ""
                     try:
                         async for token in generate_stream(
@@ -749,6 +1050,7 @@ async def websocket_endpoint(ws: WebSocket):
                             conversation_history=conversation_history,
                             prefer_cloud=prefer_cloud,
                             model_used=model_used,
+                            actions_out=actions_out,
                         ):
                             await ws.send_json({"type": "token", "text": token})
                             full_reply += token
@@ -761,12 +1063,18 @@ async def websocket_endpoint(ws: WebSocket):
                         return
 
                     # 处理 [ACTIONS] 标签：模型主动输出的设备/音乐操作
-                    # (SEARCH 标签已在流式输出层过滤，此处仅处理 ACTIONS)
+                    # 优先从侧通道读取（流式层已收集），兜底检查 full_reply
                     llm_actions = None
-                    if '[ACTIONS]' in full_reply:
+                    for action_text in actions_out:
+                        _, actions = parse_actions(action_text)
+                        if actions:
+                            llm_actions = actions
+                            logger.info(f"LLM 输出 [ACTIONS] (侧通道): {json.dumps(actions, ensure_ascii=False)[:200]}")
+                            break
+                    if not llm_actions and '[ACTIONS]' in full_reply:
                         full_reply, llm_actions = parse_actions(full_reply)
                         if llm_actions:
-                            logger.info(f"LLM 输出 [ACTIONS]: {json.dumps(llm_actions, ensure_ascii=False)[:200]}")
+                            logger.info(f"LLM 输出 [ACTIONS] (兜底): {json.dumps(llm_actions, ensure_ascii=False)[:200]}")
 
                     full_reply = strip_search_tags(full_reply)
                     actual_model = model_used[0] if model_used else "unknown"
@@ -787,6 +1095,46 @@ async def websocket_endpoint(ws: WebSocket):
                                 virtual_home.execute(da.get("device", ""), da.get("action", "toggle"))
                             await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
 
+                    # 4.5 兜底音乐检测：LLM 未输出 ACTIONS 但回复确认了播放
+                    # 场景：小模型（qwen2.5:7b）有时忽略 ACTIONS 指令但仍会在文字中确认"轻音乐已就位"
+                    if not llm_actions and route_path == "llm" and full_reply.strip():
+                        music_reply_hints = [
+                            "已经在放", "已就位", "已开始播放", "音乐已经", "已经为你",
+                            "正在播放", "轻音乐已", "背景音乐已", "歌单已", "已为你播放",
+                            "给你放", "为你放", "放点", "来点音乐", "帮你播放",
+                        ]
+                        reply_hints = any(hint in full_reply for hint in music_reply_hints)
+                        user_music_kw = ["歌", "音乐", "音樂", "听歌", "聽歌", "放点", "放點",
+                                        "来点", "來點", "播点", "播點", "放首", "来首", "來首",
+                                        "放点", "放些", "播放", "想听", "想聽"]
+                        user_wants = any(kw in prompt for kw in user_music_kw)
+                        if reply_hints and user_wants:
+                            logger.info("兜底音乐检测：LLM 回复暗示播放 + 用户请求音乐 → 触发歌单播放")
+                            # 尝试从 LLM 回复中匹配可用歌单名
+                            playlist_name = ""
+                            try:
+                                from playlist_service import list_playlists as _list_playlists
+                                available = _list_playlists()
+                                for pname in available:
+                                    if pname in full_reply:
+                                        playlist_name = pname
+                                        logger.info(f"兜底歌单匹配: LLM 回复含 '{pname}'")
+                                        break
+                                if not playlist_name and available:
+                                    # 无匹配 → 根据用户 prompt 关键词选
+                                    prompt_lower = prompt.lower()
+                                    for pname in available:
+                                        if any(kw in prompt_lower for kw in ["学习", "专注", "轻音乐", "安静", "助眠"]):
+                                            if "轻音乐" in pname:
+                                                playlist_name = pname
+                                                break
+                                    if not playlist_name:
+                                        playlist_name = list(available.keys())[0]
+                                        logger.info(f"兜底歌单: 无匹配，默认选 '{playlist_name}'")
+                            except Exception:
+                                pass
+                            await _send_music_control(ws, {"action": "play", "playlist": playlist_name})
+
                     # 5. 更新对话历史（非缓存路径）
                     reply_text = full_reply.strip()
                     if reply_text:
@@ -806,8 +1154,8 @@ async def websocket_endpoint(ws: WebSocket):
                             if implicit.music_action:
                                 q = implicit.music_action.get("query", "")
                                 if q and (len(q) > 30 or any(p in q for p in ["。", "！", "？", "，", "希望", "如果", "推荐", "告诉", "比如", "或", "之类"])):
-                                    logger.info(f"用户原文音乐查询无效({q[:40]})，丢弃")
-                                    implicit.music_action = None
+                                    logger.info(f"用户原文音乐查询无效({q[:40]})，清空 query 走歌单回退")
+                                    implicit.music_action["query"] = ""  # 不丢弃 action，清空 query 让后端走歌单/随机回退
                             if implicit.device_actions or implicit.music_action:
                                 implicit_result = xiaoai_execute(
                                     virtual_home=virtual_home,
@@ -842,7 +1190,8 @@ async def websocket_endpoint(ws: WebSocket):
                         count, reached = cache.increment_and_check(prompt)
                         logger.info(f"LLM 计数: {prompt[:30]}... -> {count}/3")
                         if reached:
-                            cache.store_reply(prompt, full_reply.strip())
+                            actions_json = json.dumps(llm_actions, ensure_ascii=False) if llm_actions else None
+                            cache.store_reply(prompt, full_reply.strip(), actions_json=actions_json)
                             logger.info(f"缓存学习完成: {prompt[:30]}...")
                             await ws.send_json({
                                 "type": "cache_learned",
@@ -863,7 +1212,10 @@ async def websocket_endpoint(ws: WebSocket):
                     if result["handled"]:
                         await ws.send_json({"type": "token", "text": result["reply"]})
                         await ws.send_json({"type": "done", "path": "xiaoai", "reply": result["reply"], "model": "xiaoai"})
-                        asyncio.create_task(_maybe_tts(ws, result["reply"], "xiaoai"))
+                        # 纯音乐动作不播乐观 TTS，由 _send_music_control 按实际结果播报
+                        is_pure_music = result.get("music_action") and not result.get("results")
+                        if not is_pure_music:
+                            asyncio.create_task(_maybe_tts(ws, result["reply"], "xiaoai"))
                         if result.get("music_action"):
                             await _send_music_control(ws, result["music_action"])
                         if result["results"]:

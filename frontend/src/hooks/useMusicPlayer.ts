@@ -35,6 +35,7 @@ export function useMusicPlayer() {
   const [queue, setQueue] = useState<SongInfo[]>([]);
   const [currentIndex, setCurrentIndex] = useState<number>(-1);
   const [playlistSource, setPlaylistSource] = useState<PlaylistSource>('builtin');
+  const [currentPlaylist, setCurrentPlaylist] = useState<string | null>(null);
   const [volume, setVolumeState] = useState<number>(0.7);
   const [progress, setProgress] = useState<number>(0);
   const [duration, setDuration] = useState<number>(0);
@@ -48,12 +49,14 @@ export function useMusicPlayer() {
   const currentSongRef = useRef<SongInfo | null>(null);
   const playlistSourceRef = useRef<PlaylistSource>('builtin');
   const builtinQueueRef = useRef<SongInfo[]>([]);  // 始终保留内置歌单备份
+  const currentPlaylistRef = useRef<string | null>(null);
 
   // 同步 state → ref
   useEffect(() => { queueRef.current = queue; }, [queue]);
   useEffect(() => { currentIndexRef.current = currentIndex; }, [currentIndex]);
   useEffect(() => { currentSongRef.current = currentSong; }, [currentSong]);
   useEffect(() => { playlistSourceRef.current = playlistSource; }, [playlistSource]);
+  useEffect(() => { currentPlaylistRef.current = currentPlaylist; }, [currentPlaylist]);
 
   // ── Audio 初始化 + 用户手势解锁 ──
   useEffect(() => {
@@ -66,7 +69,25 @@ export function useMusicPlayer() {
         // 自动下一首（用 ref 避免闭包过期）
         const q = queueRef.current;
         const idx = currentIndexRef.current;
-        if (q.length > 0 && idx < q.length - 1) {
+        const playlist = currentPlaylistRef.current;
+
+        if (playlist && q.length > 0) {
+          // 歌单模式：播完循环（重新打乱顺序）
+          if (idx < q.length - 1) {
+            const fn = playIndexRef.current;
+            if (fn) fn(idx + 1);
+          } else {
+            // 歌单播完 → 重新打乱 → 从头播放
+            const reshuffled = [...q].sort(() => Math.random() - 0.5);
+            queueRef.current = reshuffled;
+            setQueue(reshuffled);
+            currentIndexRef.current = 0;
+            setCurrentIndex(0);
+            const fn = playIndexRef.current;
+            if (fn) fn(0);
+          }
+        } else if (q.length > 0 && idx < q.length - 1) {
+          // 普通模式：自动下一首
           const fn = playIndexRef.current;
           if (fn) fn(idx + 1);
         } else {
@@ -78,11 +99,34 @@ export function useMusicPlayer() {
         setError('音频加载失败，尝试下一首');
         const q = queueRef.current;
         const idx = currentIndexRef.current;
-        if (q.length > 0 && idx < q.length - 1) {
+        const playlist = currentPlaylistRef.current;
+
+        if (playlist && q.length > 0) {
+          // 歌单模式：跳到下一首（或重新打乱循环）
+          if (idx < q.length - 1) {
+            setTimeout(() => {
+              const fn = playIndexRef.current;
+              if (fn) fn(idx + 1);
+            }, 800);
+          } else {
+            // 最后一首失败 → 重新打乱 → 从头播放
+            const reshuffled = [...q].sort(() => Math.random() - 0.5);
+            queueRef.current = reshuffled;
+            setQueue(reshuffled);
+            currentIndexRef.current = 0;
+            setCurrentIndex(0);
+            setTimeout(() => {
+              const fn = playIndexRef.current;
+              if (fn) fn(0);
+            }, 800);
+          }
+        } else if (q.length > 0 && idx < q.length - 1) {
           setTimeout(() => {
             const fn = playIndexRef.current;
             if (fn) fn(idx + 1);
-          }, 1000);
+          }, 800);
+        } else {
+          setPlayerState('idle');
         }
       };
 
@@ -206,14 +250,23 @@ export function useMusicPlayer() {
   const next = useCallback(() => {
     const q = queueRef.current;
     const idx = currentIndexRef.current;
+    const playlist = currentPlaylistRef.current;
+
     if (q.length > 0 && idx < q.length - 1) {
       playIndex(idx + 1);
+    } else if (q.length > 0 && playlist) {
+      // 歌单最后一首切歌 → 重新打乱 → 从头播放（与 onended 行为统一）
+      const reshuffled = [...q].sort(() => Math.random() - 0.5);
+      queueRef.current = reshuffled;
+      setQueue(reshuffled);
+      currentIndexRef.current = 0;
+      setCurrentIndex(0);
+      playIndex(0);
     } else if (q.length > 0) {
-      playIndex(0);  // 循环到开头
-    } else {
-      play();
+      playIndex(0);  // 普通模式循环到开头
     }
-  }, [playIndex, play]);
+    // 队列为空时 next 无害，不播默认曲目
+  }, [playIndex]);
 
   // ── 上一首 ──
   const prev = useCallback(() => {
@@ -301,6 +354,41 @@ export function useMusicPlayer() {
 
     switch (mc.action) {
       case 'play': {
+        // ── 歌单模式 ──
+        if (mc.playlist_name && mc.songs && mc.songs.length > 0) {
+          const songs = mc.songs as SongInfo[];
+          currentPlaylistRef.current = mc.playlist_name;
+          setCurrentPlaylist(mc.playlist_name);
+          queueRef.current = songs;
+          setQueue(songs);
+          playlistSourceRef.current = 'builtin';
+          setPlaylistSource('builtin');
+          builtinQueueRef.current = songs;
+          setSearchResults([]);
+          // 找到要播放的第一首
+          if (mc.song_id) {
+            const idx = songs.findIndex((s) => s.song_id === mc.song_id);
+            if (idx >= 0) {
+              currentIndexRef.current = idx;
+              setCurrentIndex(idx);
+              playIndex(idx);
+            } else {
+              currentIndexRef.current = 0;
+              setCurrentIndex(0);
+              playIndex(0);
+            }
+          } else {
+            currentIndexRef.current = 0;
+            setCurrentIndex(0);
+            playIndex(0);
+          }
+          break;
+        }
+
+        // ── 非歌单播放：清除歌单状态 ──
+        currentPlaylistRef.current = null;
+        setCurrentPlaylist(null);
+
         const isLocal = mc.source === 'local';
         // 保存内置歌单（首次从后端收到本地歌单时）
         if (isLocal && mc.songs && mc.songs.length > 0) {
@@ -391,6 +479,7 @@ export function useMusicPlayer() {
     playerState,
     setPlayerState,
     currentSong,
+    currentPlaylist,
     queue,
     currentIndex,
     playlistSource,

@@ -15,6 +15,7 @@ interface ChatPanelProps {
   onSend: (text: string) => void;
   onClear: () => void;
   onSendAudioFinal?: (base64: string) => void;
+  onAudioStreamFinal?: () => void;
   streamText?: string;
   onDuckMusic?: () => void;
   onRestoreMusic?: () => void;
@@ -24,7 +25,7 @@ interface ChatPanelProps {
   onResetConversation?: () => void;
 }
 
-export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlayed, pendingTtsFallback, onTtsFallbackConsumed, onSend, onClear, onSendAudioFinal, streamText: propStreamText, onDuckMusic, onRestoreMusic, isMobile, onToggleSidebar, musicPlayerVisible, onResetConversation }: ChatPanelProps) {
+export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlayed, pendingTtsFallback, onTtsFallbackConsumed, onSend, onClear, onSendAudioFinal, onAudioStreamFinal, streamText: propStreamText, onDuckMusic, onRestoreMusic, isMobile, onToggleSidebar, musicPlayerVisible, onResetConversation }: ChatPanelProps) {
   const [input, setInput] = useState('');
   const [micActive, setMicActive] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -35,9 +36,7 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
     onResult: (text, isFinal) => { setInput(text); if (isFinal && text.trim()) { onSend(text.trim()); setInput(''); setMicActive(false); } },
     onError: () => setMicActive(false),
   });
-  // 浏览器 SpeechRecognition 在中国大陆连接 Google 服务器会导致页面挂死
   // 统一使用后端 faster-whisper 本地转写
-  const asrSupported = false;
 
   // 录音可视化状态（纯计时，不使用 AudioContext 避免与音乐播放冲突）
   const [recordingTime, setRecordingTime] = useState(0);
@@ -50,11 +49,19 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
   // 关键：关闭 echoCancellation/noiseSuppression 防止浏览器在音乐播放时过度抑制麦克风
   const _recRef = useRef<MediaRecorder | null>(null);
   const _recChunksRef = useRef<Blob[]>([]);
+  const _incrementalTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const _lastSentChunkIndexRef = useRef<number>(0);
+  const _sendChunkDuringRecRef = useRef<((b64: string) => void) | undefined>(undefined);
   const _ampCheckTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // 保持 onSendAudioFinal 为最新引用，避免 _stopRec 闭包过期
   const onSendAudioFinalRef = useRef(onSendAudioFinal);
-  useEffect(() => { onSendAudioFinalRef.current = onSendAudioFinal; }, [onSendAudioFinal]);
+  const _sendFinalRef = useRef<(() => void) | undefined>(undefined);
+  useEffect(() => {
+    onSendAudioFinalRef.current = onSendAudioFinal;
+    _sendChunkDuringRecRef.current = onSendAudioFinal;
+  }, [onSendAudioFinal]);
+  useEffect(() => { _sendFinalRef.current = onAudioStreamFinal; }, [onAudioStreamFinal]);
 
   // 连续对话模式
   const [continuousMode, setContinuousMode] = useState(false);
@@ -74,6 +81,57 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [continuousMode]);
+
+
+  // ── WebM Blob → base64 WAV/PCM（抽取为独立函数，供增量发送使用） ──
+  const _webmToWavBase64 = useCallback(async (chunks: Blob[]): Promise<string | null> => {
+    const blob = new Blob(chunks, { type: 'audio/webm' });
+    try {
+      const buf = await blob.arrayBuffer();
+      const decodeCtx = new AudioContext();
+      const audioBuf = await decodeCtx.decodeAudioData(buf);
+      const srcData = audioBuf.getChannelData(0);
+      decodeCtx.close().catch(() => {});
+
+      const targetSr = 16000;
+      const ratio = audioBuf.sampleRate / targetSr;
+      const outLen = Math.round(srcData.length / ratio);
+      const outData = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        outData[i] = srcData[Math.min(Math.round(i * ratio), srcData.length - 1)];
+      }
+      const pcm16 = new Int16Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const s = Math.max(-1, Math.min(1, outData[i]));
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+
+      const wavHeader = new ArrayBuffer(44);
+      const dv = new DataView(wavHeader);
+      dv.setUint32(0, 0x52494646, false);
+      dv.setUint32(4, 36 + pcm16.byteLength, true);
+      dv.setUint32(8, 0x57415645, false);
+      dv.setUint32(12, 0x666D7420, false);
+      dv.setUint32(16, 16, true);
+      dv.setUint16(20, 1, true);
+      dv.setUint16(22, 1, true);
+      dv.setUint32(24, targetSr, true);
+      dv.setUint32(28, targetSr * 2, true);
+      dv.setUint16(32, 2, true);
+      dv.setUint16(34, 16, true);
+      dv.setUint32(36, 0x64617461, false);
+      dv.setUint32(40, pcm16.byteLength, true);
+
+      const wavBlob = new Blob([wavHeader, pcm16.buffer], { type: 'audio/wav' });
+      const wavBuf = await wavBlob.arrayBuffer();
+      const bytes = new Uint8Array(wavBuf);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
+    } catch {
+      return null;
+    }
+  }, []);
 
   const _startRec = useCallback(async (): Promise<boolean> => {
     try {
@@ -133,8 +191,12 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
                   console.log('[连续对话] 静音超时，自动停止录音');
                   setMicActive(false);
                   _stopRec().then(b64 => {
-                    if (b64 && onSendAudioFinalRef.current) onSendAudioFinalRef.current(b64);
+                    if (b64 && onSendAudioFinalRef.current) {
+                      onSendAudioFinalRef.current(b64);
+                      if (_sendFinalRef.current) _sendFinalRef.current();
+                    }
                   });
+                  return;
                 }, 2000);
               }
             } else {
@@ -155,11 +217,30 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
       rec.ondataavailable = (e) => { if (e.data.size > 0) _recChunksRef.current.push(e.data); };
       rec.start(500); // 每 500ms 切片一次，避免大块数据
       _recRef.current = rec;
+
+      // 新增：每 2 秒将累积的音频片段发送到后端，实现实时转写可视化
+      _lastSentChunkIndexRef.current = 0;
+      if (_sendChunkDuringRecRef.current !== undefined) {
+        if (_incrementalTimerRef.current) clearInterval(_incrementalTimerRef.current);
+        _incrementalTimerRef.current = setInterval(async () => {
+          const chunks = _recChunksRef.current;
+          const from = _lastSentChunkIndexRef.current;
+          if (from < chunks.length) {
+            const newChunks = chunks.slice(from);
+            _lastSentChunkIndexRef.current = chunks.length;
+            const b64 = await _webmToWavBase64(newChunks);
+            if (b64 && _sendChunkDuringRecRef.current !== undefined) {
+              _sendChunkDuringRecRef.current(b64);
+            }
+          }
+        }, 2000);
+      }
       return true;
     } catch { return false; }
   }, [onDuckMusic]);
   const _stopRec = useCallback(async (): Promise<string | null> => {
-    // 清理静音定时器、诊断定时器、动画、计时器
+    // 清理定时器
+    if (_incrementalTimerRef.current) { clearInterval(_incrementalTimerRef.current); _incrementalTimerRef.current = null; }
     if (_silenceTimerRef.current) { clearTimeout(_silenceTimerRef.current); _silenceTimerRef.current = null; }
     if (_ampCheckTimerRef.current) { clearInterval(_ampCheckTimerRef.current); _ampCheckTimerRef.current = null; }
     if (animFrameRef.current) { cancelAnimationFrame(animFrameRef.current); animFrameRef.current = 0; }
@@ -176,12 +257,12 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
         _recChunksRef.current = [];
         _recRef.current = null;
         rec.stream.getTracks().forEach(t => t.stop());
+          let decodeCtx: AudioContext | null = null;
         try {
           const buf = await blob.arrayBuffer();
           console.log(`[录音诊断] 录制数据大小: ${buf.byteLength} bytes (${(buf.byteLength/1024).toFixed(1)} KB)`);
 
-          // 临时 AudioContext 仅用于解码 WebM → PCM，用完立即关闭
-          const decodeCtx = new AudioContext();
+                  decodeCtx = new AudioContext();
           const audioBuf = await decodeCtx.decodeAudioData(buf);
           const srcData = audioBuf.getChannelData(0);
 
@@ -381,7 +462,10 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
             if (micActive) {
               setMicActive(false);
               const b64 = await _stopRec();
-              if (b64 && onSendAudioFinal) onSendAudioFinal(b64);
+              if (b64 && onSendAudioFinal) {
+                onSendAudioFinal(b64);
+                onAudioStreamFinal?.();
+              }
             } else {
               _startRec().then(ok => { if (ok) setMicActive(true); });
             }

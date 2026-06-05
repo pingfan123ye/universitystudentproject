@@ -117,7 +117,10 @@ MUSIC_ACTIONS = {
               # 随机/泛化请求
               "随便来一首", "随便来一个", "随便来个", "随便放", "随便播", "随便放一首",
               "随机播放", "随机来", "随机来一首", "随意来一首", "随意放",
-              "随便什么", "都可以", "什么都行", "什么都可", "来点随机的", "来点随便的"],
+              "随便什么", "都可以", "什么都行", "什么都可", "来点随机的", "来点随便的",
+              # 短关键词：匹配 "放点不吵的学习歌" / "来点轻音乐" 等自然语言（作为 play 意图入口）
+              "放点", "放些", "来点", "播点", "来些", "播些", "放个",
+              "想听点", "想聽點", "想听些", "想聽些", "来首", "來首"],
     "pause": ["暂停音乐", "暂停播放", "暂停", "停止播放", "停止音乐",
               "关掉音乐", "关闭音乐", "关音乐", "停掉音乐", "别放了", "别唱了",
               "停了音乐", "把音乐关了", "把音乐关掉", "关背景音乐", "别播了", "别放了",
@@ -151,6 +154,10 @@ MUSIC_PLAY_PATTERNS = [
     re.compile(r"播\s*[一-龥a-zA-Z0-9]+"),
     # 泛化音乐请求："想听歌""听音乐""来点音乐""放点歌" 等
     re.compile(r"(想听|想聽|听|聽|来点|來點|放点|放點|播点|播點|来首|來首)\s*(歌|音乐|音樂|歌曲|什么歌|啥歌)"),
+    # 间隔式音乐请求："放点不吵的学习歌"、"来点轻松的轻音乐"、"放些安静的背景音乐"
+    re.compile(r"(放点|放些|来点|来些|播点|播些|想听点|想聽點).{0,15}(歌|音乐|音樂|歌曲|听的|聽的)"),
+    # "顺便放点...歌" / "再放点...音乐" —— 兼容器/修饰词在中间的请求
+    re.compile(r"(顺便|再|也|还|帮我|给我|帮忙)\s*(放点|放些|来点|播点).{0,15}(歌|音乐|音樂|歌曲)"),
     re.compile(r"(有点|有點|好)\s*(想听|想聽)\s*(歌|音乐|音樂|歌曲)"),
     # 随机/泛化请求："随便什么都可以""什么歌都行""随意来一首"
     re.compile(r"(随便|隨便|随意|隨意|随机|隨機|任意).*(歌|音乐|音樂|歌曲|首|曲|什么|什麼|啥)"),
@@ -185,7 +192,8 @@ def _extract_music_query(text: str) -> str:
     query = text
     for p in play_prefixes:
         if p in query:
-            query = query.replace(p, "", 1)
+            idx = query.find(p)
+            query = query[idx + len(p):]  # 只取关键词之后的部分（关键词可能在句子中间）
             break
     # 去掉标点和无意义字符
     PUNCT_RE = re.compile(r"[\s,，。！？、；：“”‘’《》!?;:'()]+")
@@ -407,6 +415,16 @@ def _check_xiaoai(text: str) -> RouteDecision | None:
     has_actionable = bool(device) or bool(music) or is_scene
 
     if has_actionable:
+        # 仅音乐意图 + 长文本 + 关键词不在开头 → 疑似对话中顺带提音乐
+        # 不拦截，留给 LLM 处理（LLM 应通过 [ACTIONS] 标签触发播放，兜底有启发式检测）
+        if music and not device and not is_scene and len(text) > 20:
+            first_pos = min(
+                (text.find(kw) for kw in MUSIC_ACTIONS["play"] if kw in text),
+                default=-1,
+            )
+            if first_pos > 8:
+                return None  # 对话为主，音乐在句子后半段 → 交给 LLM
+
         parts = []
         if device:
             parts.append(f"设备:{len(device)}项")

@@ -136,3 +136,71 @@ def get_all_songs() -> list[dict]:
          "filename": s["filename"], "url": s["url"]}
         for s in _local_playlist
     ]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 歌单（Playlist）功能 —— 基于 music/playlists/ 子文件夹
+# ═══════════════════════════════════════════════════════════════
+
+PLAYLISTS_DIR = os.path.join(MUSIC_DIR, "playlists")
+_playlists_cache: dict[str, list[dict]] = {}
+
+
+def refresh_playlists():
+    """扫描 music/playlists/ 下的子文件夹作为歌单，刷新缓存"""
+    global _playlists_cache
+    _playlists_cache = {}
+
+    if not os.path.isdir(PLAYLISTS_DIR):
+        os.makedirs(PLAYLISTS_DIR, exist_ok=True)
+        logger.info(f"歌单目录已自动创建: {PLAYLISTS_DIR}")
+
+    for folder in sorted(os.listdir(PLAYLISTS_DIR)):
+        folder_path = os.path.join(PLAYLISTS_DIR, folder)
+        if not os.path.isdir(folder_path):
+            continue
+        songs = []
+        for f in sorted(os.listdir(folder_path)):
+            if not f.endswith((".mp3", ".wav", ".flac", ".ogg")):
+                continue
+            info = _parse_filename(f)
+            # URL 指向歌单子文件夹内的文件
+            info["url"] = f"/music/playlists/{folder}/{f}"
+            songs.append(info)
+        _playlists_cache[folder] = songs
+
+    total = sum(len(v) for v in _playlists_cache.values())
+    logger.info(f"歌单已刷新: {len(_playlists_cache)} 个歌单, 共 {total} 首歌曲")
+
+
+def list_playlists() -> dict[str, int]:
+    """返回 {歌单名: 歌曲数}"""
+    if not _playlists_cache:
+        refresh_playlists()
+    return {k: len(v) for k, v in _playlists_cache.items()}
+
+
+def get_playlist(name: str) -> list[dict] | None:
+    """按歌单名获取歌曲列表（含 url 路径），支持精确和模糊匹配"""
+    if not _playlists_cache:
+        refresh_playlists()
+    if not _playlists_cache:
+        return None
+
+    # 精确匹配
+    if name in _playlists_cache:
+        return _playlists_cache[name]
+
+    # 大小写不敏感匹配
+    name_lower = name.lower()
+    for pname, songs in _playlists_cache.items():
+        if pname.lower() == name_lower:
+            return songs
+
+    # 模糊匹配：歌单名包含查询 或 查询包含歌单名
+    for pname, songs in _playlists_cache.items():
+        if name_lower in pname.lower() or pname.lower() in name_lower:
+            return songs
+
+    logger.warning(f"歌单未找到: '{name}'，可用歌单: {list(_playlists_cache.keys())}")
+    return None

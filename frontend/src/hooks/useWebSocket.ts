@@ -74,6 +74,7 @@ export function useWebSocket() {
           setMusicAction({
             id: musicActionIdRef.current,
             action: data.action,
+            playlist_name: data.playlist_name,
             song_id: data.song_id,
             song_name: data.song_name,
             singers: data.singers,
