@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Message } from '../types';
 import MessageBubble from './MessageBubble';
-import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
+import WakeWordEnrollment from './WakeWordEnrollment';
 import { useTTS } from '../hooks/useTTS';
+import { useVoiceInteraction } from '../hooks/useVoiceInteraction';
 import { FiSend, FiTrash2, FiRefreshCw, FiMic, FiMicOff, FiVolume2, FiVolumeX } from 'react-icons/fi';
 
 interface ChatPanelProps {
@@ -24,316 +25,104 @@ interface ChatPanelProps {
   onResetConversation?: () => void;
 }
 
-export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlayed, pendingTtsFallback, onTtsFallbackConsumed, onSend, onClear, onSendAudioFinal, onAudioStreamFinal, streamText: propStreamText, onDuckMusic, onRestoreMusic, isMobile, onToggleSidebar, onResetConversation }: ChatPanelProps) {
+const WAKE_WORD = '小爱同学';
+
+export default function ChatPanel({
+  messages, pendingTask, pendingTts, onTtsPlayed, pendingTtsFallback, onTtsFallbackConsumed,
+  onSend, onClear, onSendAudioFinal, onAudioStreamFinal, streamText: propStreamText,
+  onDuckMusic, onRestoreMusic, isMobile, onToggleSidebar, onResetConversation,
+}: ChatPanelProps) {
   const [input, setInput] = useState('');
   const [micActive, setMicActive] = useState(false);
+  const [showEnrollment, setShowEnrollment] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const prevLastMsgRef = useRef('');
 
-  const { interimText, errorMessage: asrError } = useSpeechRecognition({
-    lang: 'zh-CN',
-    onResult: (text, isFinal) => { setInput(text); if (isFinal && text.trim()) { onSend(text.trim()); setInput(''); setMicActive(false); } },
-    onError: () => setMicActive(false),
+  // ═══════════════════════════════════════
+  // 语音交互状态机（唤醒词 + 录音）
+  // ═══════════════════════════════════════
+  const [voiceState, voiceActions] = useVoiceInteraction({
+    wakeWord: WAKE_WORD,
+    onWakeDetected: () => {
+      console.log('[语音助手] 唤醒词检测成功');
+    },
+    onAudioChunk: (b64: string) => {
+      onSendAudioFinal?.(b64);
+    },
+    onAudioComplete: (b64: string) => {
+      onSendAudioFinal?.(b64);
+    },
+    onAudioFinal: () => {
+      onAudioStreamFinal?.();
+    },
+    onError: (err: string) => {
+      console.error('[语音助手] 错误:', err);
+    },
+    onDuckMusic,
+    onRestoreMusic,
   });
-  // 统一使用后端 faster-whisper 本地转写
 
-  // 录音可视化状态（纯计时，不使用 AudioContext 避免与音乐播放冲突）
-  const [recordingTime, setRecordingTime] = useState(0);
-  const [audioLevel, setAudioLevel] = useState(0);
-  const animFrameRef = useRef<number>(0);
-  const recStreamRef = useRef<MediaStream | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // ── 唤醒词注册完成 → 自动启用语音助手 ──
+  const handleEnrollmentComplete = useCallback(() => {
+    setShowEnrollment(false);
+    voiceActions.enable();
+  }, [voiceActions]);
 
-  // 录音：纯 MediaRecorder，零 AudioContext，零音频处理冲突
-  // 关键：关闭 echoCancellation/noiseSuppression 防止浏览器在音乐播放时过度抑制麦克风
-  const _recRef = useRef<MediaRecorder | null>(null);
-  const _recChunksRef = useRef<Blob[]>([]);
-  const _incrementalTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const _lastSentChunkIndexRef = useRef<number>(0);
-  const _sendChunkDuringRecRef = useRef<((b64: string) => void) | undefined>(undefined);
-  const _ampCheckTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // 保持 onSendAudioFinal 为最新引用，避免 _stopRec 闭包过期
-  const onSendAudioFinalRef = useRef(onSendAudioFinal);
-  const _sendFinalRef = useRef<(() => void) | undefined>(undefined);
-  useEffect(() => {
-    onSendAudioFinalRef.current = onSendAudioFinal;
-    _sendChunkDuringRecRef.current = onSendAudioFinal;
-  }, [onSendAudioFinal]);
-  useEffect(() => { _sendFinalRef.current = onAudioStreamFinal; }, [onAudioStreamFinal]);
-
-  // 连续对话模式
-  const [continuousMode, setContinuousMode] = useState(false);
-  const continuousModeRef = useRef(false);
-  useEffect(() => { continuousModeRef.current = continuousMode; }, [continuousMode]);
-  const _silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // 开启连续对话时自动开始录音
-  useEffect(() => {
-    if (continuousMode && !micActive) {
-      _startRec().then(ok => { if (ok) setMicActive(true); });
-    }
-    if (!continuousMode && micActive) {
-      // 关闭连续对话时停止录音
-      setMicActive(false);
-      _stopRec().then(() => {});
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [continuousMode]);
-
-
-  // ── WebM Blob → base64 WAV/PCM（抽取为独立函数，供增量发送使用） ──
-  const _webmToWavBase64 = useCallback(async (chunks: Blob[]): Promise<string | null> => {
-    const blob = new Blob(chunks, { type: 'audio/webm' });
-    try {
-      const buf = await blob.arrayBuffer();
-      const decodeCtx = new AudioContext();
-      const audioBuf = await decodeCtx.decodeAudioData(buf);
-      const srcData = audioBuf.getChannelData(0);
-      decodeCtx.close().catch(() => {});
-
-      const targetSr = 16000;
-      const ratio = audioBuf.sampleRate / targetSr;
-      const outLen = Math.round(srcData.length / ratio);
-      const outData = new Float32Array(outLen);
-      for (let i = 0; i < outLen; i++) {
-        outData[i] = srcData[Math.min(Math.round(i * ratio), srcData.length - 1)];
-      }
-      const pcm16 = new Int16Array(outLen);
-      for (let i = 0; i < outLen; i++) {
-        const s = Math.max(-1, Math.min(1, outData[i]));
-        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-      }
-
-      const wavHeader = new ArrayBuffer(44);
-      const dv = new DataView(wavHeader);
-      dv.setUint32(0, 0x52494646, false);
-      dv.setUint32(4, 36 + pcm16.byteLength, true);
-      dv.setUint32(8, 0x57415645, false);
-      dv.setUint32(12, 0x666D7420, false);
-      dv.setUint32(16, 16, true);
-      dv.setUint16(20, 1, true);
-      dv.setUint16(22, 1, true);
-      dv.setUint32(24, targetSr, true);
-      dv.setUint32(28, targetSr * 2, true);
-      dv.setUint16(32, 2, true);
-      dv.setUint16(34, 16, true);
-      dv.setUint32(36, 0x64617461, false);
-      dv.setUint32(40, pcm16.byteLength, true);
-
-      const wavBlob = new Blob([wavHeader, pcm16.buffer], { type: 'audio/wav' });
-      const wavBuf = await wavBlob.arrayBuffer();
-      const bytes = new Uint8Array(wavBuf);
-      let binary = '';
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-      return btoa(binary);
-    } catch {
-      return null;
-    }
+  const handleEnrollmentCancel = useCallback(() => {
+    setShowEnrollment(false);
   }, []);
 
-  const _startRec = useCallback(async (): Promise<boolean> => {
-    try {
-      // 方案一：禁用所有音频处理，防止浏览器在音乐播放时压低麦克风增益
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      recStreamRef.current = stream;
-
-      // 方案二：录音时降低音乐音量（ducking），录音结束后恢复
-      onDuckMusic?.();
-
-      // 计时器
-      const startTime = Date.now();
-      setRecordingTime(0);
-      timerRef.current = setInterval(() => {
-        setRecordingTime(Math.floor((Date.now() - startTime) / 1000));
-      }, 200);
-
-      // 模拟脉冲动画（不依赖 AudioContext）
-      const pulseUpdate = () => {
-        setAudioLevel(0.3 + 0.3 * Math.sin(Date.now() / 300));
-        animFrameRef.current = requestAnimationFrame(pulseUpdate);
-      };
-      pulseUpdate();
-
-      // 诊断 + 静音检测：每 1 秒检查一次麦克风输入振幅
-      // 使用一个临时的、极短命的 AudioContext 仅用于诊断（不与音乐路径共享）
-      const ampCheck = () => {
-        if (!recStreamRef.current) return;
-        try {
-          const tmpCtx = new AudioContext();
-          const src = tmpCtx.createMediaStreamSource(recStreamRef.current);
-          const analyser = tmpCtx.createAnalyser();
-          analyser.fftSize = 256;
-          src.connect(analyser);
-          const data = new Uint8Array(analyser.frequencyBinCount);
-          analyser.getByteFrequencyData(data);
-          const avg = data.reduce((a, b) => a + b, 0) / data.length;
-          console.log(`[麦克风诊断] 实时频域振幅: ${avg.toFixed(1)}/255 (${(avg/255*100).toFixed(1)}%)`);
-          if (avg < 5) {
-            console.warn('[麦克风诊断] ⚠️ 实时振幅极低，麦克风可能被占用或静音');
-          }
-
-          // 连续对话模式：静音检测 → 自动停止录音
-          if (continuousModeRef.current && _recRef.current?.state === 'recording') {
-            const SILENCE_THRESHOLD = 12;  // 振幅低于此值视为静音（放宽阈值，避免误触发）
-            const elapsed = Date.now() - startTime;
-            if (avg < SILENCE_THRESHOLD && elapsed > 2000) {  // 至少录 2 秒
-              if (!_silenceTimerRef.current) {
-                console.log('[连续对话] 检测到静音，3秒后自动停止...');
-                _silenceTimerRef.current = setTimeout(() => {
-                  console.log('[连续对话] 静音超时，自动停止录音');
-                  setMicActive(false);
-                  _stopRec().then(b64 => {
-                    if (b64 && onSendAudioFinalRef.current) {
-                      onSendAudioFinalRef.current(b64);
-                      if (_sendFinalRef.current) _sendFinalRef.current();
-                    }
-                  });
-                  return;
-                }, 3000);
-              }
-            } else {
-              if (_silenceTimerRef.current) {
-                clearTimeout(_silenceTimerRef.current);
-                _silenceTimerRef.current = null;
-              }
-            }
-          }
-          tmpCtx.close().catch(() => {});
-        } catch { /* 诊断失败不影响录音 */ }
-      };
-      ampCheck(); // 立即检查一次
-      _ampCheckTimerRef.current = setInterval(ampCheck, 1000);
-
-      const rec = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-      _recChunksRef.current = [];
-      rec.ondataavailable = (e) => { if (e.data.size > 0) _recChunksRef.current.push(e.data); };
-      rec.start(500); // 每 500ms 切片一次，避免大块数据
-      _recRef.current = rec;
-
-      // 新增：每 2 秒将累积的音频片段发送到后端，实现实时转写可视化
-      _lastSentChunkIndexRef.current = 0;
-      if (_sendChunkDuringRecRef.current !== undefined) {
-        if (_incrementalTimerRef.current) clearInterval(_incrementalTimerRef.current);
-        _incrementalTimerRef.current = setInterval(async () => {
-          const chunks = _recChunksRef.current;
-          const from = _lastSentChunkIndexRef.current;
-          if (from < chunks.length) {
-            const newChunks = chunks.slice(from);
-            _lastSentChunkIndexRef.current = chunks.length;
-            const b64 = await _webmToWavBase64(newChunks);
-            if (b64 && _sendChunkDuringRecRef.current !== undefined) {
-              _sendChunkDuringRecRef.current(b64);
-            }
-          }
-        }, 2000);
+  // ── 语音助手按钮 ──
+  const handleVoiceAssistantClick = useCallback(async () => {
+    const phase = voiceState.phase;
+    if (phase === 'idle') {
+      // 未注册 → 显示注册弹窗；已注册 → 直接启用
+      if (!voiceState.isEnrolled) {
+        setShowEnrollment(true);
+        return;
       }
-      return true;
-    } catch { return false; }
-  }, [onDuckMusic]);
-  const _stopRec = useCallback(async (): Promise<string | null> => {
-    // 清理定时器
-    if (_incrementalTimerRef.current) { clearInterval(_incrementalTimerRef.current); _incrementalTimerRef.current = null; }
-    if (_silenceTimerRef.current) { clearTimeout(_silenceTimerRef.current); _silenceTimerRef.current = null; }
-    if (_ampCheckTimerRef.current) { clearInterval(_ampCheckTimerRef.current); _ampCheckTimerRef.current = null; }
-    if (animFrameRef.current) { cancelAnimationFrame(animFrameRef.current); animFrameRef.current = 0; }
-    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-    if (recStreamRef.current) { recStreamRef.current.getTracks().forEach(t => t.stop()); recStreamRef.current = null; }
-    setAudioLevel(0);
-    setRecordingTime(0);
+      await voiceActions.enable();
+    } else if (phase === 'waiting_for_wake' || phase === 'wake_detected' || phase === 'recording') {
+      // 关闭语音助手
+      voiceActions.disable();
+    } else if (phase === 'initializing') {
+      // 加载中，取消
+      voiceActions.disable();
+    }
+  }, [voiceState.phase, voiceState.isEnrolled, voiceActions]);
 
-    const rec = _recRef.current;
-    if (!rec) return null;
-    return new Promise((resolve) => {
-      rec.onstop = async () => {
-        const blob = new Blob(_recChunksRef.current, { type: 'audio/webm' });
-        _recChunksRef.current = [];
-        _recRef.current = null;
-        rec.stream.getTracks().forEach(t => t.stop());
-          let decodeCtx: AudioContext | null = null;
-        try {
-          const buf = await blob.arrayBuffer();
-          console.log(`[录音诊断] 录制数据大小: ${buf.byteLength} bytes (${(buf.byteLength/1024).toFixed(1)} KB)`);
+  // ── 手动麦克风按钮（备用：不依赖唤醒词） ──
+  const handleMicClick = useCallback(async () => {
+    if (micActive) {
+      // 停止手动录音
+      setMicActive(false);
+      const b64 = await voiceActions.stopManualRecord();
+      if (b64 && onSendAudioFinal) {
+        onSendAudioFinal(b64);
+        onAudioStreamFinal?.();
+      }
+    } else {
+      // 开始手动录音
+      const ok = await voiceActions.startManualRecord();
+      if (ok) setMicActive(true);
+    }
+  }, [micActive, voiceActions, onSendAudioFinal, onAudioStreamFinal]);
 
-                  decodeCtx = new AudioContext();
-          const audioBuf = await decodeCtx.decodeAudioData(buf);
-          const srcData = audioBuf.getChannelData(0);
+  // ── 语音状态同步 micActive ──
+  useEffect(() => {
+    if (voiceState.phase === 'recording' || voiceState.phase === 'wake_detected') {
+      setMicActive(true);
+    } else if (voiceState.phase === 'processing' || voiceState.phase === 'waiting_for_wake' || voiceState.phase === 'idle') {
+      setMicActive(false);
+    }
+  }, [voiceState.phase]);
 
-          // 诊断振幅
-          let maxAmp = 0, sumAmp = 0;
-          for (let i = 0; i < srcData.length; i++) {
-            const abs = Math.abs(srcData[i]);
-            if (abs > maxAmp) maxAmp = abs;
-            sumAmp += abs;
-          }
-          const avgAmp = sumAmp / srcData.length;
-          const durationSec = srcData.length / audioBuf.sampleRate;
-          console.log(`[录音诊断] 原始: ${audioBuf.sampleRate}Hz ${durationSec.toFixed(1)}s | 最大振幅=${maxAmp.toFixed(4)} 平均振幅=${avgAmp.toFixed(6)}`);
-          if (maxAmp < 0.01) {
-            console.warn('[录音诊断] ⚠️ 录音振幅极低 (<0.01)，可能是浏览器音频处理抑制了麦克风');
-          }
+  // ═══════════════════════════════════════
+  // TTS
+  // ═══════════════════════════════════════
+  const { isSupported: ttsSupported, speaking, autoSpeak, toggleAutoSpeak, speak } = useTTS({ lang: 'zh-CN', rate: 1.1 });
 
-          // 重采样到 16kHz
-          const targetSr = 16000;
-          const ratio = audioBuf.sampleRate / targetSr;
-          const outLen = Math.round(srcData.length / ratio);
-          const outData = new Float32Array(outLen);
-          for (let i = 0; i < outLen; i++) {
-            outData[i] = srcData[Math.min(Math.round(i * ratio), srcData.length - 1)];
-          }
-          // 转 16-bit PCM
-          const pcm16 = new Int16Array(outLen);
-          for (let i = 0; i < outLen; i++) {
-            const s = Math.max(-1, Math.min(1, outData[i]));
-            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-          }
-          // WAV 封装
-          const wavHeader = new ArrayBuffer(44);
-          const dv = new DataView(wavHeader);
-          dv.setUint32(0, 0x52494646, false);
-          dv.setUint32(4, 36 + pcm16.byteLength, true);
-          dv.setUint32(8, 0x57415645, false);
-          dv.setUint32(12, 0x666D7420, false);
-          dv.setUint32(16, 16, true);
-          dv.setUint16(20, 1, true);
-          dv.setUint16(22, 1, true);
-          dv.setUint32(24, targetSr, true);
-          dv.setUint32(28, targetSr * 2, true);
-          dv.setUint16(32, 2, true);
-          dv.setUint16(34, 16, true);
-          dv.setUint32(36, 0x64617461, false);
-          dv.setUint32(40, pcm16.byteLength, true);
-          const wavBlob = new Blob([wavHeader, pcm16.buffer], { type: 'audio/wav' });
-          const wavBuf = await wavBlob.arrayBuffer();
-          const bytes = new Uint8Array(wavBuf);
-          let binary = '';
-          for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-
-          // 关闭临时 AudioContext
-          decodeCtx.close().catch(() => {});
-
-          // 录音处理完成，恢复音乐音量
-          onRestoreMusic?.();
-
-          resolve(btoa(binary));
-        } catch (decodeErr) {
-          console.warn('[录音诊断] 音频解码失败（浏览器可能不支持 WebM 解码），跳过转写:', decodeErr);
-          decodeCtx?.close?.()?.catch(() => {});
-          onRestoreMusic?.();
-          resolve(null);  // 返回 null 而非原始 WebM 字节（后端只认 WAV/PCM）
-        }
-      };
-      rec.stop();
-    });
-  }, [onRestoreMusic]);
-
-  // 后端 STT 转写结果 → 写入输入框（含清空）
+  // 后端 STT 转写结果 → 写入输入框
   useEffect(() => {
     if (propStreamText !== undefined && propStreamText !== input) {
       setInput(propStreamText);
@@ -341,42 +130,35 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [propStreamText]);
 
-  const { isSupported: ttsSupported, speaking, autoSpeak, toggleAutoSpeak, speak } = useTTS({ lang: 'zh-CN', rate: 1.1 });
-
-  // 只用 Edge TTS（不降级 speechSynthesis），等后端音频到了就播
-  useEffect(() => {
-    const lastMsg = messages[messages.length - 1];
-    if (lastMsg?.role === 'ai' && !lastMsg.isStreaming && lastMsg.id !== prevLastMsgRef.current) {
-      prevLastMsgRef.current = lastMsg.id;
-      // 不触发 speechSynthesis，纯等 Edge TTS
-    }
-  }, [messages]);
-
-  // Edge TTS 音频到达 → 播放，播完后连续对话模式下自动开始录音
+  // Edge TTS 音频到达 → 播放，播完后恢复唤醒词监听
   useEffect(() => {
     if (pendingTts && pendingTts.audio) {
       speak(pendingTts.text, pendingTts.audio, () => {
-        if (continuousModeRef.current) {
-          _startRec().then(ok => { if (ok) setMicActive(true); });
-        }
+        // TTS 播完 → 恢复唤醒词监听
+        voiceActions.resumeWakeListening();
       });
       onTtsPlayed?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingTts, speak, onTtsPlayed]);
 
-  // 后端 TTS 失败 → 降级浏览器 speechSynthesis，播完后连续对话模式下自动开始录音
+  // 后端 TTS 失败 → 降级浏览器 speechSynthesis，播完后恢复
   useEffect(() => {
     if (pendingTtsFallback) {
       speak(pendingTtsFallback, undefined, () => {
-        if (continuousModeRef.current) {
-          _startRec().then(ok => { if (ok) setMicActive(true); });
-        }
+        voiceActions.resumeWakeListening();
       });
       onTtsFallbackConsumed?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingTtsFallback]);
+
+  useEffect(() => {
+    const lastMsg = messages[messages.length - 1];
+    if (lastMsg?.role === 'ai' && !lastMsg.isStreaming && lastMsg.id !== prevLastMsgRef.current) {
+      prevLastMsgRef.current = lastMsg.id;
+    }
+  }, [messages]);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
@@ -385,8 +167,52 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
     onSend(input.trim()); setInput('');
   }, [input, onSend]);
 
+  // ── 语音助手按钮的标签和样式 ──
+  const voiceBtnLabel = (() => {
+    switch (voiceState.phase) {
+      case 'initializing': return '⏳ 加载中';
+      case 'waiting_for_wake': return '🔊 待命中';
+      case 'wake_detected': return '🟢 我在听';
+      case 'recording': return '🔴 录音中';
+      case 'processing': return '⏳ 思考中';
+      default: return '🤖 语音助手';
+    }
+  })();
+
+  const voiceBtnStyle: React.CSSProperties = {
+    padding: '4px 10px',
+    borderRadius: '6px',
+    border: 'none',
+    cursor: 'pointer',
+    fontSize: '11px',
+    fontWeight: 700,
+    whiteSpace: 'nowrap',
+    transition: 'all 0.2s',
+    color: voiceState.phase === 'idle' ? 'var(--text-muted)' : '#fff',
+    background:
+      voiceState.phase === 'initializing' ? '#f59e0b' :
+      voiceState.phase === 'waiting_for_wake' ? '#22c55e' :
+      voiceState.phase === 'wake_detected' ? '#22c55e' :
+      voiceState.phase === 'recording' ? '#dc2626' :
+      voiceState.phase === 'processing' ? '#f59e0b' :
+      'var(--bg-input)',
+    animation: voiceState.phase === 'waiting_for_wake' ? 'pulse 2s ease-in-out infinite' :
+                voiceState.phase === 'recording' ? 'pulse 0.8s ease-in-out infinite' :
+                voiceState.phase === 'initializing' ? 'pulse 1s ease-in-out infinite' : 'none',
+  };
+
   return (
     <div className="flex flex-col flex-1 min-h-0" style={{ background: 'var(--bg-root)' }}>
+      {/* ── 唤醒词注册弹窗 ── */}
+      {showEnrollment && (
+        <WakeWordEnrollment
+          wakeWord={WAKE_WORD}
+          onComplete={handleEnrollmentComplete}
+          onCancel={handleEnrollmentCancel}
+        />
+      )}
+
+      {/* ── 移动端顶栏 ── */}
       {isMobile && (
         <div className="flex items-center justify-between px-4 py-2 border-b" style={{ borderColor: 'var(--border)', background: 'var(--bg-surface)' }}>
           <span className="text-xs font-bold tracking-wider" style={{ color: 'var(--text-secondary)' }}>AI 语音助手</span>
@@ -396,6 +222,8 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
           </button>
         </div>
       )}
+
+      {/* ── 消息列表 ── */}
       <div className="flex-1 overflow-y-auto px-5 py-4">
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full" style={{ color: 'var(--text-muted)' }}>
@@ -403,20 +231,47 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
               <span className="text-2xl" style={{ color: 'var(--accent)' }}>◆</span>
             </div>
             <p className="text-lg font-bold" style={{ color: 'var(--text-secondary)' }}>AI 语音助手</p>
-            <p className="text-sm mt-2">输入文字或点击麦克风开始对话</p>
+            <p className="text-sm mt-2">点击「语音助手」或麦克风开始对话</p>
+            {!voiceState.isEnrolled && voiceState.phase === 'idle' && (
+              <button
+                onClick={() => setShowEnrollment(true)}
+                style={{
+                  marginTop: '16px', padding: '10px 24px', borderRadius: '12px',
+                  border: 'none', background: 'var(--accent)', color: '#fff',
+                  fontSize: '14px', fontWeight: 600, cursor: 'pointer',
+                }}
+              >
+                🎤 设置唤醒词 "{WAKE_WORD}"
+              </button>
+            )}
           </div>
         )}
         {messages.map((msg) => <MessageBubble key={msg.id} message={msg} />)}
-        {micActive && interimText && (
+
+        {/* 录音中显示实时转写文字 */}
+        {micActive && propStreamText && (
           <div className="flex justify-end my-2">
             <div className="px-4 py-2 text-sm italic max-w-[75%] rounded-2xl" style={{ background: 'var(--bg-input)', color: 'var(--text-muted)' }}>
-              {interimText}<span className="inline-block w-1.5 h-4 ml-0.5 rounded-sm align-middle animate-pulse" style={{ background: 'var(--accent)' }} />
+              {propStreamText}<span className="inline-block w-1.5 h-4 ml-0.5 rounded-sm align-middle animate-pulse" style={{ background: 'var(--accent)' }} />
             </div>
           </div>
         )}
+
+        {/* 唤醒状态提示 */}
+        {voiceState.phase === 'waiting_for_wake' && (
+          <div className="flex justify-center my-2">
+            <span className="text-[11px] px-3 py-1 rounded-full" style={{
+              background: 'rgba(34,197,94,0.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.2)',
+            }}>
+              🔊 说 "{WAKE_WORD}" 唤醒我
+            </span>
+          </div>
+        )}
+
         <div ref={bottomRef} />
       </div>
 
+      {/* ── 待审批任务提示 ── */}
       {pendingTask && (
         <div className="mx-5 mb-2 px-4 py-3 rounded border text-sm animate-slide-up" style={{ background: 'var(--accent-glow)', borderColor: 'var(--accent)', color: 'var(--text-primary)' }}>
           <span className="font-bold" style={{ color: 'var(--accent)' }}>⏳ 待审批：</span>
@@ -425,74 +280,96 @@ export default function ChatPanel({ messages, pendingTask, pendingTts, onTtsPlay
         </div>
       )}
 
+      {/* ── 底部输入栏 ── */}
       <div className="p-4 border-t" style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}>
         <div className="flex items-end gap-2 max-w-3xl mx-auto">
+          {/* 重置对话 */}
           {onResetConversation && (
             <button onClick={onResetConversation} className="p-2.5 rounded hover:opacity-70 transition-opacity" style={{ color: 'var(--text-muted)' }} title="重置对话（清空上下文）">
               <FiRefreshCw size={16} />
             </button>
           )}
+          {/* 清空消息 */}
           <button onClick={onClear} className="p-2.5 rounded hover:opacity-70 transition-opacity" style={{ color: 'var(--text-muted)' }} title="清空消息"><FiTrash2 size={16} /></button>
+          {/* 播报开关 */}
           {ttsSupported && (
             <button onClick={toggleAutoSpeak} className="p-2.5 rounded transition-opacity" style={{ color: autoSpeak ? 'var(--accent)' : 'var(--text-muted)' }} title={autoSpeak ? '播报中' : '静音'}>
               {autoSpeak ? <FiVolume2 size={16} /> : <FiVolumeX size={16} />}
             </button>
           )}
+          {/* 语音助手开关（替代旧的连续对话按钮） */}
           <button
-            onClick={() => setContinuousMode(prev => !prev)}
-            className={`p-2.5 rounded transition-all text-[11px] font-bold whitespace-nowrap ${continuousMode ? 'animate-pulse' : ''}`}
-            style={{
-              color: continuousMode ? '#fff' : 'var(--text-muted)',
-              background: continuousMode ? 'var(--accent)' : 'var(--bg-input)',
-            }}
-            title={continuousMode ? '连续对话中，点击关闭' : '开启连续对话，免点击录音'}
+            onClick={handleVoiceAssistantClick}
+            style={voiceBtnStyle}
+            title={
+              voiceState.phase === 'idle' ? '启用语音助手（唤醒词免提交互）' :
+              voiceState.phase === 'waiting_for_wake' ? '点击关闭语音助手' :
+              voiceState.phase === 'recording' ? '点击关闭语音助手' :
+              '语音助手中'
+            }
           >
-            {continuousMode ? '🔊 连续中' : '🎤 连续'}
+            {voiceBtnLabel}
           </button>
+          {/* 输入框 */}
           <div className="flex-1">
-            <textarea value={input} onChange={(e) => setInput(e.target.value)}
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(); } }}
-              placeholder={micActive ? '聆听中...' : '说点什么...'} rows={1} readOnly={micActive}
+              placeholder={
+                voiceState.phase === 'waiting_for_wake' ? `说 "${WAKE_WORD}" 唤醒我...` :
+                micActive ? '聆听中...' : '说点什么...'
+              }
+              rows={1}
+              readOnly={micActive}
               className="input-field w-full px-4 py-3 resize-none text-sm placeholder:opacity-30"
               style={{ maxHeight: '120px' }}
               onInput={(e) => { const el = e.currentTarget; el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }} />
           </div>
-          <button onClick={async () => {
-            if (micActive) {
-              setMicActive(false);
-              const b64 = await _stopRec();
-              if (b64 && onSendAudioFinal) {
-                onSendAudioFinal(b64);
-                onAudioStreamFinal?.();
-              }
-            } else {
-              _startRec().then(ok => { if (ok) setMicActive(true); });
-            }
-          }}
-            className="p-3 rounded transition-all" style={{ color: micActive ? '#dc2626' : 'var(--text-muted)', background: micActive ? '#dc2626' : 'var(--bg-input)' }}>
+          {/* 手动麦克风按钮（备用） */}
+          <button
+            onClick={handleMicClick}
+            className="p-3 rounded transition-all"
+            style={{
+              color: micActive ? '#dc2626' : 'var(--text-muted)',
+              background: micActive ? '#dc2626' : 'var(--bg-input)',
+            }}
+            title={micActive ? '停止录音' : '手动录音（不需要唤醒词）'}
+          >
             {micActive ? <FiMicOff size={18} /> : <FiMic size={18} />}
           </button>
+          {/* 发送按钮 */}
           <button onClick={handleSubmit} disabled={!input.trim()} className="accent-btn p-3"><FiSend size={18} /></button>
         </div>
+
+        {/* 录音状态栏 */}
         {micActive && (
           <div className="mt-2 animate-fade-in">
             <div className="flex items-center gap-3 justify-center mb-1">
               <span className="text-[11px] font-mono" style={{ color: 'var(--accent)' }}>
-                {String(Math.floor(recordingTime / 60)).padStart(2, '0')}:{String(recordingTime % 60).padStart(2, '0')}
+                {String(Math.floor(voiceState.recordingTime / 60)).padStart(2, '0')}:{String(voiceState.recordingTime % 60).padStart(2, '0')}
               </span>
               <div className="flex-1 max-w-[120px] h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--bg-input)' }}>
                 <div className="h-full rounded-full transition-all duration-75" style={{
-                  width: `${Math.min(audioLevel * 100, 100)}%`,
-                  background: audioLevel > 0.3 ? 'var(--accent)' : 'var(--text-muted)',
+                  width: `${Math.min(voiceState.audioLevel * 100, 100)}%`,
+                  background: voiceState.audioLevel > 0.2 ? 'var(--accent)' : 'var(--text-muted)',
                 }} />
               </div>
-              <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>录音中</span>
+              <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                {voiceState.phase === 'wake_detected' ? '唤醒中...' : '录音中'}
+              </span>
             </div>
-            <div className="text-center text-[11px]" style={{ color: 'var(--text-muted)' }}>点击停止按钮结束录音</div>
+            <div className="text-center text-[11px]" style={{ color: 'var(--text-muted)' }}>
+              {voiceState.phase === 'wake_detected' ? '即将开始录音...' :
+               '说话后静音 2 秒自动停止'}
+            </div>
           </div>
         )}
+
+        {/* TTS 播报中 */}
         {speaking && <div className="text-center mt-2 text-[11px]" style={{ color: 'var(--text-muted)' }}>AI 正在播报...</div>}
-        {asrError && <div className="text-center mt-2 text-[11px] text-red-500">{asrError}</div>}
+        {/* 语音错误 */}
+        {voiceState.error && <div className="text-center mt-2 text-[11px]" style={{ color: '#ef4444' }}>{voiceState.error}</div>}
       </div>
     </div>
   );

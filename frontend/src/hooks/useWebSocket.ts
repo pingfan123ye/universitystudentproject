@@ -8,6 +8,45 @@ function nextId() {
   return `msg-${++msgCounter}-${Date.now()}`;
 }
 
+// ── 会话持久化 ──
+const SESSION_KEY = 'smart_speaker_session';
+const MAX_PERSISTED_MESSAGES = 50;
+
+function loadPersistedMessages(): Message[] {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (raw) {
+      const data = JSON.parse(raw);
+      if (Array.isArray(data)) {
+        console.log(`[会话] 从本地恢复了 ${data.length} 条历史消息`);
+        return data as Message[];
+      }
+    }
+  } catch (e) {
+    console.warn('[会话] 恢复历史失败:', e);
+  }
+  return [];
+}
+
+let _saveTimer: ReturnType<typeof setTimeout> | null = null;
+function persistMessages(messages: Message[]): void {
+  if (_saveTimer) clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => {
+    try {
+      const toSave = messages.slice(-MAX_PERSISTED_MESSAGES);
+      localStorage.setItem(SESSION_KEY, JSON.stringify(toSave));
+    } catch (e) {
+      // localStorage 可能已满，静默失败
+    }
+  }, 2000);
+}
+
+function clearPersistedMessages(): void {
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch { /* ignore */ }
+}
+
 export function useWebSocket() {
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [messages, setMessages] = useState<Message[]>([]);
@@ -52,15 +91,31 @@ export function useWebSocket() {
 
     ws.onopen = () => {
       setStatus('connected');
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: nextId(),
-          role: 'system',
-          content: '已连接到服务器，可以开始对话',
-          timestamp: Date.now(),
-        },
-      ]);
+      // 恢复上次会话的历史消息
+      const persisted = loadPersistedMessages();
+      if (persisted.length > 0) {
+        setMessages([
+          ...persisted,
+          {
+            id: nextId(),
+            role: 'system',
+            content: `已连接到服务器（恢复了 ${persisted.length} 条历史消息）`,
+            timestamp: Date.now(),
+          },
+        ]);
+        // 恢复后清除，避免反复叠加
+        clearPersistedMessages();
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: nextId(),
+            role: 'system',
+            content: '已连接到服务器，可以开始对话',
+            timestamp: Date.now(),
+          },
+        ]);
+      }
     };
 
     ws.onmessage = (event) => {
@@ -341,6 +396,13 @@ export function useWebSocket() {
     };
   }, [connect]);
 
+  // ── 会话持久化：消息变化时自动保存 ──
+  useEffect(() => {
+    if (messages.length > 0 && status === 'connected') {
+      persistMessages(messages);
+    }
+  }, [messages, status]);
+
   const sendMessage = useCallback((text: string) => {
     if (!text.trim()) return;
 
@@ -370,6 +432,7 @@ export function useWebSocket() {
   const clearMessages = useCallback(() => {
     setMessages([]);
     currentAiMsgRef.current = '';
+    clearPersistedMessages();
   }, []);
 
   const fetchCacheList = useCallback(() => {
@@ -466,6 +529,7 @@ export function useWebSocket() {
   const resetConversation = useCallback(() => {
     currentAiMsgRef.current = '';
     setMessages([]);
+    clearPersistedMessages();
     safeSend({ type: 'reset' });
   }, [safeSend]);
 

@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "autoprefixer": "^10.5.0",
+    "mellon": "^0.0.26",
     "postcss": "^8.5.14",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",

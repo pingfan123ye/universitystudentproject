@@ -10,6 +10,46 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# ── Whisper 幻觉检测：这些模式表示音频实际是静音/噪声，模型产生了随机输出 ──
+HALLUCINATION_PATTERNS: list[str] = [
+    "字幕by", "字幕由", "字幕",           # 视频字幕幻觉
+    "索兰娅", "索蘭婭",                   # 具体幻觉人名
+    "蝙蝠绿狗",                           # 经典幻觉
+    "谢谢观看", "謝謝觀賞", "感谢观看",    # 视频结尾幻觉
+    "欢迎收听", "歡迎收聽",               # 播客幻觉
+    "一林 ", " 一林",                     # 碎片幻觉
+]
+
+# 纯英文/乱码检测：中文语音助手中，纯英文长句 → 幻觉
+_PURE_ASCII_RE = re.compile(r'^[a-zA-Z0-9\s.,!?;:\'\"\-]+$')
+
+
+def _is_hallucination(text: str) -> bool:
+    """检测 STT 结果是否为 Whisper 在噪声上的幻觉输出"""
+    if not text or not text.strip():
+        return False
+    stripped = text.strip()
+
+    # 1. 子串匹配已知幻觉模式
+    for pat in HALLUCINATION_PATTERNS:
+        if pat in stripped:
+            logger.info(f"STT 幻觉检测 (匹配'{pat}'): {stripped[:60]}")
+            return True
+
+    # 2. 纯英文长句（>15 chars，无中文字符）
+    if len(stripped) > 15:
+        has_chinese = any('一' <= c <= '鿿' for c in stripped)
+        if not has_chinese:
+            logger.info(f"STT 幻觉检测 (纯英文长句): {stripped[:60]}")
+            return True
+
+    # 3. 文本全由单字重复组成（如"呃呃呃呃"、"好好好好"）
+    if len(stripped) >= 3 and len(set(stripped)) <= 2:
+        logger.info(f"STT 幻觉检测 (重复字符): {stripped[:60]}")
+        return True
+
+    return False
+
 # 精确替换表（按长度降序，确保长匹配优先）
 CORRECTIONS: dict[str, str] = {
     # ── 歌名纠错 ──
@@ -123,10 +163,14 @@ def correct(text: str) -> str:
         text: Whisper 转写的原始文本
 
     Returns:
-        纠正后的文本
+        纠正后的文本（幻觉输出返回空字符串）
     """
     if not text or not text.strip():
         return text
+
+    # 0. 幻觉检测：噪声上的随机输出 → 直接返回空
+    if _is_hallucination(text):
+        return ""
 
     original = text
     result = text

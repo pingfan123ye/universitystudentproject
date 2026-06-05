@@ -154,3 +154,20 @@ export interface MusicControlData {
   ext?: string;
   songs?: SongInfo[];
 }
+
+// ── 语音交互状态机 ──
+export type VoicePhase =
+  | 'idle'              // 未启用
+  | 'initializing'      // 加载 Mellon 模型中
+  | 'waiting_for_wake'  // 监听唤醒词
+  | 'wake_detected'     // 唤醒成功
+  | 'recording'         // 录音中
+  | 'processing';       // 处理中（发送后端）
+
+export interface VoiceInteractionState {
+  phase: VoicePhase;
+  recordingTime: number;   // 录音计时（秒）
+  audioLevel: number;      // 模拟电平（0-1）
+  error: string;
+  isEnrolled: boolean;     // 是否已完成唤醒词注册
+}
