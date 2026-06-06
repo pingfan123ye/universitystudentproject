@@ -1,5 +1,5 @@
 export type MessageRole = 'user' | 'ai' | 'system';
-export type RoutePath = 'xiaoai' | 'llm' | 'reasonix' | 'cache' | 'unknown';
+export type RoutePath = 'xiaoai' | 'llm' | 'reasonix' | 'cache' | 'cet6' | 'unknown';
 
 export interface Message {
   id: string;
@@ -47,7 +47,9 @@ export interface WSResponse {
     | 'proactive_alert' | 'alerts_suppressed'
     | 'safety_confirm' | 'engine_config'
     | 'search_status' | 'music_search_status' | 'chat_error'
-    | 'transcription_text' | 'stt_result' | 'tts_failed';
+    | 'transcription_text' | 'stt_result' | 'tts_failed'
+    | 'cet6_paper' | 'cet6_answers' | 'cet6_search_results'
+    | 'chat_attachment';
   text?: string;
   path?: RoutePath;
   reply?: string;
@@ -87,6 +89,21 @@ export interface WSResponse {
   reset?: boolean;
   status?: string;
   result?: string;
+  // CET-6
+  paper_id?: string;
+  title?: string;
+  pdf_url?: string;
+  has_audio?: boolean;
+  audio_url?: string;
+  has_answers?: boolean;
+  answers?: Record<string, string>;
+  // CET-6 answers (PDF)
+  pdf_url?: string;
+  // CET-6 search results
+  results?: Cet6SearchResult[];
+  // chat_attachment
+  label?: string;
+  url?: string;
 }
 
 export interface DeviceInfo {
@@ -170,4 +187,24 @@ export interface VoiceInteractionState {
   audioLevel: number;      // 模拟电平（0-1）
   error: string;
   isEnrolled: boolean;     // 是否已完成唤醒词注册
+}
+
+// ── CET-6 备考 ──
+export interface Cet6Paper {
+  paperId: string;
+  title: string;
+  pdfUrl: string;
+  hasAudio: boolean;
+  audioUrl?: string;
+  hasAnswers: boolean;
+  answersUrl?: string;
+}
+
+export interface Cet6SearchResult {
+  paper_id: string;
+  title: string;
+  year: number;
+  month: number;
+  set_num: string;
+  downloaded: boolean;
 }

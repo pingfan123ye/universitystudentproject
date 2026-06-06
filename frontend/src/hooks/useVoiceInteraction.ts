@@ -31,7 +31,10 @@ export interface VoiceInteractionActions {
 
 // ── 常量 ──
 const STORAGE_KEY = 'mellon-xiaoai-refs';
-const MAX_RECORD_SECONDS = 15;        // 最长录音秒数
+const MAX_RECORD_SECONDS = 30;        // 最长录音秒数
+const MIN_RECORDING_BEFORE_AUTO_STOP_MS = 4000;  // 前4秒不触发自动停止
+const WAKE_CONFIDENCE_THRESHOLD = 0.7;   // 唤醒词最低置信度（防止误唤醒）
+const WAKE_COOLDOWN_MS = 2000;           // 两次唤醒最小间隔（防止连触发）
 
 // AnalyserNode 自适应静音检测参数
 const LEVEL_CHECK_INTERVAL_MS = 250;    // 电平检测间隔
@@ -39,7 +42,7 @@ const NOISE_WINDOW_SAMPLES = 12;        // 噪声基线窗口 = 12 × 250ms = 3 
 const SPEECH_RATIO = 3.0;               // 语音阈值 = 噪声基线 × 3
 const SPEECH_THRESHOLD_MIN = 0.03;      // 语音阈值最低值（安静环境下）
 const MIN_SPEECH_DURATION_MS = 500;     // 最少连续语音时长（避免短噪声触发）
-const SILENCE_TIMEOUT_MS = 2000;        // 连续静音超时 → 自动停止
+const SILENCE_TIMEOUT_MS = 2500;        // 连续静音超时 → 自动停止（容忍自然停顿）
 
 // ── WebM → WAV/PCM 16kHz base64 ──
 // reuseCtx: 可选，复用已有的 AudioContext 进行解码，避免创建过多实例
@@ -117,23 +120,26 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
   const levelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const enabledRef = useRef(false);
   const phaseRef = useRef<VoicePhase>('idle');
-  const chunkSendTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const lastSentChunkRef = useRef(0);
   // 标记 auto-stop 是否已触发（防止手动停止时重复处理）
   const autoStoppedRef = useRef(false);
+  // 标记录音是否被用户主动取消（阻止 onstop 发送音频 + 切 processing 状态）
+  const cancelledRef = useRef(false);
+  // 唤醒词防连触发：记录上次唤醒时间
+  const lastWakeTimeRef = useRef(0);
 
   // 同步 state → ref
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
   // ── 清理所有资源 ──
   const cleanup = useCallback(() => {
+    // 标记取消：阻止异步 onstop 发送音频 + 切到 processing
+    cancelledRef.current = true;
     if (detectorRef.current) {
       detectorRef.current.stop().catch(() => { });
       detectorRef.current = null;
     }
     if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
     if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => { }); audioCtxRef.current = null; }
-    if (chunkSendTimerRef.current) { clearInterval(chunkSendTimerRef.current); chunkSendTimerRef.current = null; }
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     if (recStreamRef.current) { recStreamRef.current.getTracks().forEach(t => t.stop()); recStreamRef.current = null; }
     if (recRef.current && recRef.current.state !== 'inactive') {
@@ -141,7 +147,6 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
     }
     recRef.current = null;
     recChunksRef.current = [];
-    lastSentChunkRef.current = 0;
     autoStoppedRef.current = false;
     setRecordingTime(0);
     setAudioLevel(0);
@@ -169,6 +174,9 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
 
   const startRecording = useCallback(async (): Promise<boolean> => {
     try {
+      // 新一轮录音开始，重置取消标志
+      cancelledRef.current = false;
+
       // 先确保 Mellon 已停止（释放其麦克风流）
       if (detectorRef.current?.listening) {
         await detectorRef.current.stop();
@@ -239,8 +247,13 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
           }
         }
 
-        // 确认语音后，连续静音超 2 秒 → 自动停止
+        // 确认语音后，连续静音超 2.5 秒 + 录音超过 4 秒最小保护时间 → 自动停止
         if (hasSpeech && silenceDuration >= SILENCE_TIMEOUT_MS) {
+          const recordingElapsed = Date.now() - startTime;
+          if (recordingElapsed < MIN_RECORDING_BEFORE_AUTO_STOP_MS) {
+            // 仍在最小录音保护时间内，不触发自动停止
+            return;
+          }
           const r = recRef.current;
           if (r && r.state === 'recording') {
             console.log(`[静音检测] noiseFloor=${noiseFloor.toFixed(4)} thr=${speechThreshold.toFixed(4)} rms=${rms.toFixed(4)} silence=${silenceDuration}ms → 自动停止`);
@@ -287,15 +300,29 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
       };
 
       // ═══════════════════════════════════════
-      // ★★★ onstop 统一出口（修复致命 Bug）★★★
-      // 静音自动停止 / 超时 / 手动停止 三条路径均触发此处理
+      // ★★★ onstop 统一出口 ★★★
+      // 静音自动停止 / 超时 / 手动停止 / 用户取消 四条路径均触发此处理
       // ═══════════════════════════════════════
       rec.onstop = async () => {
+        // 用户主动取消（disable/cleanup）→ 跳过音频发送，避免误切 processing
+        if (cancelledRef.current) {
+          console.log('[录音] 已被用户取消，跳过音频处理');
+          if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
+          if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+          if (recStreamRef.current) { recStreamRef.current.getTracks().forEach(t => t.stop()); recStreamRef.current = null; }
+          if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => { }); audioCtxRef.current = null; }
+          setAudioLevel(0);
+          setRecordingTime(0);
+          onRestoreMusic?.();
+          recChunksRef.current = [];
+          recRef.current = null;
+          return;
+        }
+
         console.log('[录音] onstop 触发，收集音频...');
 
         // 1. 停止所有定时器
         if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
-        if (chunkSendTimerRef.current) { clearInterval(chunkSendTimerRef.current); chunkSendTimerRef.current = null; }
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
 
         // 2. 停止麦克风流
@@ -325,28 +352,43 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
           }
         }
         onAudioFinal();
+
+        // 7. 立即恢复唤醒词监听（不等 TTS 播完）
+        // 录音结束就重启 Mellon，这样用户在 AI 语音播报期间也能用唤醒词打断
+        if (enabledRef.current) {
+          try {
+            if (detectorRef.current && !detectorRef.current.listening) {
+              await detectorRef.current.start();
+              setPhase('waiting_for_wake');
+              console.log('[唤醒词] 录音结束，已恢复监听（不等 TTS）');
+            }
+          } catch (err: any) {
+            console.error('[唤醒词] 恢复监听失败:', err);
+            // 静默失败，不影响录音流程
+          }
+        }
       };
 
       rec.start(500);
 
-      // ── 增量发送（每 2 秒）──
-      // 复用 audioCtxRef 进行解码，避免创建多余的 AudioContext
-      lastSentChunkRef.current = 0;
-      chunkSendTimerRef.current = setInterval(async () => {
-        const chunks = recChunksRef.current;
-        const from = lastSentChunkRef.current;
-        if (from < chunks.length) {
-          const newChunks = chunks.slice(from);
-          lastSentChunkRef.current = chunks.length;
-          const b64 = await webmToWavBase64(newChunks, audioCtxRef.current);
-          if (b64) onAudioChunk(b64);
-        }
-      }, 2000);
-
+      // B-3: 不再增量发送。录音结束后一次性将完整音频发送到后端。
       return true;
     } catch (err: any) {
+      console.error('[录音] startRecording 失败:', err.message);
       setError(err.message || '麦克风访问失败');
-      setPhase('idle');
+      // 恢复 Mellon 唤醒词监听：startRecording 前已停止 Mellon，失败必须重启
+      if (enabledRef.current && detectorRef.current && !detectorRef.current.listening) {
+        try {
+          await detectorRef.current.start();
+          setPhase('waiting_for_wake');
+          console.log('[唤醒词] startRecording 失败，已恢复监听');
+        } catch (e: any) {
+          console.error('[唤醒词] 恢复监听也失败:', e.message);
+          setPhase('idle');
+        }
+      } else {
+        setPhase('idle');
+      }
       return false;
     }
   }, [onDuckMusic, onAudioChunk, onAudioComplete, onAudioFinal, onRestoreMusic]);
@@ -363,7 +405,6 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
 
     // 手动停止：先清理定时器，再覆盖 onstop 以接收 Promise 结果
     if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
-    if (chunkSendTimerRef.current) { clearInterval(chunkSendTimerRef.current); chunkSendTimerRef.current = null; }
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
 
     return new Promise((resolve) => {
@@ -414,11 +455,28 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
           triggers: [{ name: wakeWord }],
           onMatch: async (triggerName: string, confidence: number) => {
             console.log(`[唤醒词] 检测到 "${triggerName}" 置信度=${confidence.toFixed(2)}`);
+
+            // 置信度过滤：低于阈值视为噪声/误触发（如 TTS 回声）
+            if (confidence < WAKE_CONFIDENCE_THRESHOLD) {
+              console.log(`[唤醒词] 置信度过低 (${confidence.toFixed(2)} < ${WAKE_CONFIDENCE_THRESHOLD})，忽略`);
+              return;
+            }
+
+            // 冷却检查：防止短时间内连触发
+            const now = Date.now();
+            if (now - lastWakeTimeRef.current < WAKE_COOLDOWN_MS) {
+              console.log(`[唤醒词] 冷却中 (距上次 ${now - lastWakeTimeRef.current}ms < ${WAKE_COOLDOWN_MS}ms)，忽略`);
+              return;
+            }
+            lastWakeTimeRef.current = now;
+
             if (detectorRef.current?.listening) {
               await detectorRef.current.stop();
             }
             onWakeDetected();
             setPhase('wake_detected');
+            // 延时 600ms 确保扬声器 TTS/音乐残响完全消散后再开始录音
+            // 300ms 不够：扬声器音频尾巴会被麦克风捕获，导致 STT 识别为噪声
             setTimeout(async () => {
               if (enabledRef.current) {
                 const ok = await startRecording();
@@ -426,7 +484,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
                   console.log('[唤醒词] 自动开始录音');
                 }
               }
-            }, 300);
+            }, 600);
           },
         }],
         {

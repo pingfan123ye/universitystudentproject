@@ -73,6 +73,12 @@ class MemoryEngine:
     def __init__(self):
         _init_db()
 
+    # STT 常见误识别噪声词（不应被记忆）
+    STT_NOISE_WORDS = {
+        "被烤", "背考", "贝考", "备烤", "六集", "六极", "留级",
+        "呃呃", "嗯嗯嗯", "对不起", "那个那个", "好的吧",
+    }
+
     def extract_and_store(self, user_text: str):
         """从用户文本中提取并存储记忆"""
         stored = []
@@ -84,6 +90,9 @@ class MemoryEngine:
                 except IndexError:
                     value = m.group(0)
                 if not value or len(value) < 2 or len(value) > 30:
+                    continue
+                # 过滤 STT 噪声词
+                if value.strip() in self.STT_NOISE_WORDS:
                     continue
                 # 避免重复存储
                 if self._exists(category, value):

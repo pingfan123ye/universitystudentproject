@@ -23,14 +23,18 @@ from services.xiaoai_service import execute as xiaoai_execute
 from services.reasonix_executor import execute as reasonix_execute, is_reasonix_available, get_pending_manager
 from services.cache_engine import get_cache
 from services.memory_engine import get_memory
-from services.whisper_stt import transcribe_audio_base64 as stt_transcribe, is_available as stt_available
+from services.stt_pipeline import transcribe as stt_transcribe, get_status as stt_status
 from services.stt_corrector import correct as stt_correct
 from services.tts_service import text_to_speech_base64
 from services.context_engine import get_context_engine
 from services.search_service import search_to_context
 from services.safety_filter import assess_risk, format_confirm_message, requires_confirmation
-from services.llm_service import strip_search_tags, parse_actions
+from services.llm_service import strip_search_tags, parse_actions, _strip_actions_tags
 from services.engine_config import get_config
+from services.cet6_service import select_random_paper, get_answers as cet6_get_answers, build_index as cet6_build_index, _load_index
+from services.cet6_online import (
+    fetch_online_index, search_papers, download_paper, get_online_count,
+)
 from models.virtual_home import VirtualHome, get_virtual_time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -150,8 +154,45 @@ def _is_chinese_query(query: str) -> bool:
 
 
 def _clean_for_tts(text: str) -> str:
-    """清洗 Markdown / 结构化格式字符，让 TTS 只朗读纯文本"""
+    """清洗 Markdown / 结构化格式字符 + Emoji，让 TTS 只朗读纯文本"""
     import re as _re
+    # 0. 最终防线：清除所有 [ACTIONS] 标签（防止泄露到 TTS 朗读）
+    text = _strip_actions_tags(text)
+    if not text:
+        return ""
+    # 0.5 去除 Emoji 表情符号（TTS 无法朗读，避免读出乱码）
+    _EMOJI_BLOCKS = _re.compile(
+        '['
+        '\U0001F600-\U0001F64F'   # 表情符号 (😀-🙏)
+        '\U0001F300-\U0001F5FF'   # 杂项符号与象形文字 (🌀-🗿)
+        '\U0001F680-\U0001F6FF'   # 交通与地图 (🚀-🛿)
+        '\U0001F1E0-\U0001F1FF'   # 国旗字母 (🇦-🇿)
+        '\U00002702-\U000027B0'   # 装饰符号 (✂-➰)
+        '\U0001F900-\U0001F9FF'   # 补充符号与象形文字 (🤀-🧿)
+        '\U0001FA00-\U0001FA6F'   # 象棋符号
+        '\U0001FA70-\U0001FAFF'   # 符号与象形文字扩展A
+        '\U00002600-\U000026FF'   # 杂项符号 (☀-⛿)
+        '\U0000FE00-\U0000FE0F'   # 变体选择器
+        '\U0000200D'               # 零宽连字符 ZWJ (组合 emoji)
+        ']+',
+        flags=_re.UNICODE,
+    )
+    # 额外单独的符号字符（不在上述块中的常见 emoji/符号，TTS 无法发音）
+    _EXTRA_SYMBOLS = _re.compile(
+        '['
+        '©®™ℹ'          # © ® ™ ℹ
+        '⏏⏩-⏳⏸-⏺'   # 播放控制与时钟符号
+        'Ⓜ'                  # Ⓜ
+        '▪▫▶◀◻-◾'      # 几何图形符号
+        '㊗㊙〰〽'        # 常见装饰符号
+        '⭐⭕'           # 星号与圆圈 (U+2B50, U+2B55)
+        ']+',
+        flags=_re.UNICODE,
+    )
+    text = _EMOJI_BLOCKS.sub('', text)
+    text = _EXTRA_SYMBOLS.sub('', text)
+    if not text.strip():
+        return ""
     # 1. 去掉代码块（```...```）
     text = _re.sub(r'```[\s\S]*?```', '', text)
     # 2. 去掉行内代码 (`code`)
@@ -173,6 +214,24 @@ def _clean_for_tts(text: str) -> str:
     # 9. 去掉多余空白行
     text = _re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+def _is_low_quality_stt(text: str) -> bool:
+    """检测低质量 STT 文本，避免被存入记忆。"""
+    if not text or not text.strip():
+        return True
+    t = text.strip()
+    # 过短
+    if len(t) < 3:
+        return True
+    # 纯重复字符（如"嗯嗯嗯""好好好"）
+    if len(t) >= 3 and len(set(t)) <= 2:
+        return True
+    # 纯英文乱码
+    import re as _re
+    if _re.match(r'^[a-zA-Z\s.,!?;:\'\"\-]+$', t) and len(t) > 10:
+        return True
+    return False
 
 
 def _mood_to_english(query: str) -> str:
@@ -200,20 +259,19 @@ def _mood_to_english(query: str) -> str:
     return ""
 
 
-async def _announce_and_play(ws, song: dict, all_local_songs: list[dict] | None = None):
+async def _announce_and_play(ws, song: dict, queue_songs: list[dict] | None = None):
     """发送播放指令 + TTS 语音播报歌名。
-    当 all_local_songs 提供时，将其打包为完整队列发给前端（当前歌曲排第一，其余随机），
+    当 queue_songs 提供时，将其打包为完整队列发给前端（当前歌曲排第一，其余随机），
     这样前端有完整队列，切歌/上一首可以直接在队列中推进。"""
     name = song.get("song_name", "")
     singer = song.get("singers", "")
 
-    # 构建歌曲队列（当前歌曲 + 其余本地歌曲随机排列）
-    if all_local_songs:
+    # 构建歌曲队列（当前歌曲 + 其余歌曲随机排列）
+    if queue_songs:
         import random as _random
-        # 将当前命中的歌曲排第一，其余随机打乱（用 song_id 去重）
-        current_filename = song.get("song_id", "").replace("local_", "")
-        others = [_build_local_song(s) for s in all_local_songs
-                  if s.get("filename") != current_filename]
+        # 用 song_id 去重，当前歌曲排第一，其余随机打乱
+        current_id = song.get("song_id", "")
+        others = [s for s in queue_songs if s.get("song_id") != current_id]
         _random.shuffle(others)
         songs_payload = [song] + others
     else:
@@ -239,7 +297,7 @@ async def _announce_and_play(ws, song: dict, all_local_songs: list[dict] | None 
     else:
         announce_text = f"好的，为你播放{name}"
     asyncio.create_task(_maybe_tts(ws, announce_text, "music"))
-    logger.info(f"播放: {name} - {singer}" + (f" (队列 {len(songs_payload)} 首)" if all_local_songs else ""))
+    logger.info(f"播放: {name} - {singer}" + (f" (队列 {len(songs_payload)} 首)" if queue_songs else ""))
 
 
 def _build_local_song(picked: dict) -> dict:
@@ -250,6 +308,48 @@ def _build_local_song(picked: dict) -> dict:
         "cover_url": "", "download_url": picked["url"], "ext": "mp3",
         "file_size": "", "file_size_bytes": 0, "quality": "", "lyric": "",
     }
+
+
+# ═══════════════════════════════════════
+# 音乐请求交叉验证：防止 LLM 幻觉式 ACTIONS 标签
+# ═══════════════════════════════════════
+# 用户必须明确说了音乐相关指令，否则即使 LLM 输出音乐 ACTIONS 也跳过。
+# 这是针对小模型（qwen2.5:7b）将回复中的短语（如"相信自己"）幻觉成歌曲名的防线。
+_MUSIC_REQUEST_PATTERNS = [
+    # 播放类
+    "播放", "放歌", "放音乐", "放点音乐", "放点歌", "放首歌", "放个歌", "放一首", "放个音乐",
+    "来首歌", "来点音乐", "来点歌", "来首", "来一首", "来一曲", "来一段音乐",
+    "听歌", "听音乐", "听首", "想听歌", "想听音乐", "想听",
+    "播歌", "播音乐", "播点音乐", "播点歌", "播一首",
+    "点歌", "点一首", "点首",
+    "唱首歌", "唱歌",
+    # 控制类
+    "切歌", "下一首", "下一曲", "上一首", "上一曲", "换一首", "换个歌",
+    "暂停音乐", "暂停播放", "暂停", "停止播放", "停止音乐",
+    "继续播放", "继续",
+    "关掉音乐", "关闭音乐", "关音乐", "别放了", "别唱了",
+    # 繁体
+    "聽歌", "聽音樂", "想聽", "放音樂", "播放音樂", "播放歌曲",
+    "暫停音樂", "繼續播放",
+    # 泛化
+    "随便来一首", "随便放", "随机播放", "随机来一首",
+    "来点背景音乐", "放点背景音乐", "放背景音乐",
+    "放点", "来点",  # "放点不吵的学习歌" / "来点轻音乐"
+    # 歌单类
+    "歌单", "收藏", "轻音乐",
+]
+
+
+def _user_requested_music(user_prompt: str) -> bool:
+    """检查用户原文是否包含音乐播放/控制请求。
+    返回 True 表示用户确实在请求音乐操作，False 表示 LLM 很可能在幻觉。
+    """
+    if not user_prompt or not user_prompt.strip():
+        return False
+    for kw in _MUSIC_REQUEST_PATTERNS:
+        if kw in user_prompt:
+            return True
+    return False
 
 
 async def _send_music_control(ws, music_action: dict):
@@ -459,7 +559,7 @@ async def _send_music_control(ws, music_action: dict):
             if all_local:
                 import random as _random
                 picked = _random.choice(all_local)
-                await _announce_and_play(ws, _build_local_song(picked), all_local)
+                await _announce_and_play(ws, _build_local_song(picked), [_build_local_song(s) for s in all_local])
                 logger.info(f"泛化播放，随机选择: {picked['song_name']} - {picked['artist']}")
                 return
             logger.info("泛化播放请求但本地歌单为空，使用默认纯音乐")
@@ -477,7 +577,7 @@ async def _send_music_control(ws, music_action: dict):
         local_hit = search_local(clean_query) if clean_query else None
         if local_hit:
             all_local = get_all_songs()
-            await _announce_and_play(ws, _build_local_song(local_hit), all_local)
+            await _announce_and_play(ws, _build_local_song(local_hit), [_build_local_song(s) for s in all_local])
             logger.info(f"本地命中: {local_hit['song_name']} - {local_hit['artist']} (队列 {len(all_local)} 首)")
             return
 
@@ -486,7 +586,7 @@ async def _send_music_control(ws, music_action: dict):
         if jamendo_songs:
             first = jamendo_songs[0]
             if first.get("download_url"):
-                await _announce_and_play(ws, first)
+                await _announce_and_play(ws, first, jamendo_songs)
                 logger.info(f"Jamendo 命中: {first.get('song_name', '')} - {first.get('singers', '')}")
                 return
 
@@ -498,7 +598,7 @@ async def _send_music_control(ws, music_action: dict):
             if jamendo_mood:
                 first = jamendo_mood[0]
                 if first.get("download_url"):
-                    await _announce_and_play(ws, first)
+                    await _announce_and_play(ws, first, jamendo_mood)
                     logger.info(f"Jamendo mood 命中: {first.get('song_name', '')} - {first.get('singers', '')}")
                     return
 
@@ -508,7 +608,7 @@ async def _send_music_control(ws, music_action: dict):
         if pixabay_songs:
             first = pixabay_songs[0]
             if first.get("download_url"):
-                await _announce_and_play(ws, first)
+                await _announce_and_play(ws, first, pixabay_songs)
                 logger.info(f"Pixabay 命中: {first.get('song_name', '')}")
                 return
 
@@ -519,7 +619,7 @@ async def _send_music_control(ws, music_action: dict):
 
             first = songs[0]
             if first.get("download_url"):
-                await _announce_and_play(ws, first)
+                await _announce_and_play(ws, first, songs)
                 logger.info(f"163 播放: {first.get('song_name', '')} by {first.get('singers', '')}")
                 return
             logger.info(f"163 结果无播放链接: {first.get('song_name', '')}")
@@ -555,7 +655,7 @@ async def _send_music_control(ws, music_action: dict):
             picked = _random.choice(all_local)
             fallback_msg = f"抱歉，我没找到「{query}」的可播放版本，为你随机播放一首本地歌曲吧"
             await ws.send_json({"type": "chat_error", "message": fallback_msg})
-            await _announce_and_play(ws, _build_local_song(picked), all_local)
+            await _announce_and_play(ws, _build_local_song(picked), [_build_local_song(s) for s in all_local])
             logger.info(f"回退本地随机: {picked['song_name']} - {picked['artist']}")
         else:
             await ws.send_json({
@@ -571,7 +671,7 @@ async def _send_music_control(ws, music_action: dict):
         if all_local:
             import random as _random
             picked = _random.choice(all_local)
-            await _announce_and_play(ws, _build_local_song(picked), all_local)
+            await _announce_and_play(ws, _build_local_song(picked), [_build_local_song(s) for s in all_local])
             logger.info(f"随机播放本地: {picked['song_name']} - {picked['artist']}")
         else:
             # 本地歌单为空，尝试 Pixabay 随机抓取
@@ -580,7 +680,7 @@ async def _send_music_control(ws, music_action: dict):
             if pixabay_songs:
                 first = pixabay_songs[0]
                 if first.get("download_url"):
-                    await _announce_and_play(ws, first)
+                    await _announce_and_play(ws, first, pixabay_songs)
                     logger.info(f"随机播放 Pixabay: {first.get('song_name', '')}")
                     return
             logger.info("随机播放失败：本地和 Pixabay 都无歌曲")
@@ -601,7 +701,297 @@ async def _send_music_control(ws, music_action: dict):
 # ===== 全局虚拟家庭实例 =====
 virtual_home = VirtualHome()
 _pending_safety_cmd: str | None = None  # 待安全确认的命令
+
+# ===== CET-6 会话跟踪 =====
+# key: id(websocket), value: {
+#     "paper_id": str,              # 当前活跃试卷
+#     "search_results": list[dict],  # 最近在线搜索结果
+# }
+_cet6_sessions: dict[int, dict] = {}
+
 APP_VERSION = "0.2.0"
+
+
+# ===== CET-6 辅助函数 =====
+
+async def _send_cet6_paper(ws: WebSocket, paper: dict, tts_text: str | None = None):
+    """发送 CET-6 试卷到前端（含 PDF 附件气泡 + 听力自动播放）"""
+    await ws.send_json({
+        "type": "cet6_paper",
+        "paper_id": paper["id"],
+        "title": paper["title"],
+        "pdf_url": paper["pdf_url"],
+        "has_audio": paper.get("has_audio", False),
+        "audio_url": paper.get("audio_url", ""),
+        "has_answers": paper.get("has_answers", False),
+        "answers_url": paper.get("answers_url", ""),
+    })
+    # 附件气泡（聊天气泡中的可点击下载链接）
+    await ws.send_json({
+        "type": "chat_attachment",
+        "label": f"📎 下载 {paper['title']} 真题",
+        "url": paper["pdf_url"],
+    })
+    # 听力自动播放
+    if paper.get("has_audio") and paper.get("audio_url"):
+        await ws.send_json({
+            "type": "music_control", "action": "play",
+            "song_name": paper["title"] + " 听力音频",
+            "download_url": paper["audio_url"],
+            "source": "local",
+        })
+        logger.info(f"CET-6 听力播放: {paper['title']}")
+    # TTS 语音播报
+    if tts_text:
+        asyncio.create_task(_maybe_tts(ws, tts_text, "cet6"))
+
+
+async def _handle_cet6_action(ws: WebSocket, action: dict, session_id: int):
+    """执行 LLM 通过 [ACTIONS]{{"cet6":{{...}}}} 输出的 CET-6 操作。
+
+    与音乐/设备控制完全一致的模式：LLM 自主决定何时调用 CET-6 功能，
+    后端负责执行具体的试卷查找、听力播放、答案获取等操作。
+    """
+    act_type = action.get("action", "")
+    state = _cet6_sessions.get(session_id, {})
+
+    if act_type == "random_paper":
+        year = action.get("year")
+        month = action.get("month")
+        set_num = action.get("set")
+        paper = select_random_paper(year=year, month=month, set_num=set_num)
+        if paper:
+            _cet6_sessions[session_id] = {"paper_id": paper["id"]}
+            await _send_cet6_paper(ws, paper,
+                tts_text=f"好的，为你准备了{paper['title']}，先做听力部分吧")
+            logger.info(f"CET-6 [ACTIONS] random_paper: {paper['title']} (year={year}, month={month}, set={set_num})")
+        else:
+            # 本地没有匹配的试卷 → 尝试在线搜索
+            year_str = f"{year}年" if year else ""
+            month_str = f"{month}月" if month else ""
+            logger.info(f"CET-6 [ACTIONS] random_paper 本地无匹配 (year={year}, month={month})，转在线搜索")
+            await fetch_online_index()
+            results = search_papers(year=year, month=month)
+            if results:
+                state["search_results"] = results
+                _cet6_sessions[session_id] = state
+                await ws.send_json({
+                    "type": "cet6_search_results",
+                    "results": [
+                        {
+                            "paper_id": r["paper_id"],
+                            "title": r["title"],
+                            "year": r["year"],
+                            "month": r["month"],
+                            "set_num": r["set_num"],
+                            "downloaded": r.get("downloaded", False),
+                        }
+                        for r in results
+                    ],
+                })
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": f"本地没有{year_str}{month_str}的真题，但在线找到了 {len(results)} 套，要下载哪一套？",
+                    "model": "cet6",
+                })
+            else:
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": f"抱歉，本地和在线都没有找到{year_str}{month_str}的六级真题，你可以换个年份试试",
+                    "model": "cet6",
+                })
+
+    elif act_type == "paper":
+        year = action.get("year")
+        month = action.get("month")
+        set_num = action.get("set")
+        papers = _load_index()
+        matched = None
+        for p in papers:
+            pid = p.get("id", "")
+            parts = pid.split("-")
+            if len(parts) >= 3:
+                if year is not None and parts[0] != str(year):
+                    continue
+                if month is not None and parts[1] != str(month).zfill(2):
+                    continue
+                if set_num is not None and parts[2] != str(set_num):
+                    continue
+                matched = p
+                break
+        if matched:
+            _cet6_sessions[session_id] = {"paper_id": matched["id"]}
+            await _send_cet6_paper(ws, matched,
+                tts_text=f"好的，为你找到{matched['title']}，开始练习吧")
+            logger.info(f"CET-6 [ACTIONS] paper: {matched['title']}")
+        else:
+            # 本地没有 → 触发在线搜索
+            logger.info(f"CET-6 [ACTIONS] paper 本地未匹配 year={year} month={month}，转在线搜索")
+            await fetch_online_index()
+            results = search_papers(year=year, month=month)
+            if results:
+                state["search_results"] = results
+                _cet6_sessions[session_id] = state
+                await ws.send_json({
+                    "type": "cet6_search_results",
+                    "results": [
+                        {
+                            "paper_id": r["paper_id"],
+                            "title": r["title"],
+                            "year": r["year"],
+                            "month": r["month"],
+                            "set_num": r["set_num"],
+                            "downloaded": r.get("downloaded", False),
+                        }
+                        for r in results
+                    ],
+                })
+                year_str = f"{year}年" if year else "相关"
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": f"本地没有{year_str}的真题，但在线找到了 {len(results)} 套，要下载哪一套？",
+                    "model": "cet6",
+                })
+            else:
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": f"抱歉，本地和在线都没有找到{'{}年'.format(year) if year else '相关'}的六级真题",
+                    "model": "cet6",
+                })
+
+    elif act_type == "browse":
+        papers = _load_index()
+        if papers:
+            # 构建搜索结果列表（供前端 CET6Panel 展示）
+            local_results = []
+            for p in papers:
+                pid = p.get("id", "")
+                pid_parts = pid.split("-") if "-" in pid else []
+                local_results.append({
+                    "paper_id": pid,
+                    "title": p["title"],
+                    "year": pid_parts[0] if len(pid_parts) >= 1 else "",
+                    "month": pid_parts[1] if len(pid_parts) >= 2 else "",
+                    "set_num": pid_parts[2] if len(pid_parts) >= 3 else "",
+                    "downloaded": True,
+                })
+            await ws.send_json({
+                "type": "cet6_search_results",
+                "results": local_results,
+            })
+            # 构建文字列表
+            lines = []
+            for i, p in enumerate(papers, 1):
+                audio_tag = "🎧" if p.get("has_audio") else ""
+                ans_tag = "📝" if p.get("has_answers") else ""
+                lines.append(f"{i}. {p['title']} {audio_tag}{ans_tag}")
+            summary = "当前题库有以下真题：\n" + "\n".join(lines) + "\n\n告诉我你要做哪一套，或者说「做第一套」"
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": summary,
+                "model": "cet6",
+            })
+            logger.info(f"CET-6 [ACTIONS] browse: {len(papers)} 套本地试卷")
+        else:
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": "本地题库暂时为空，你可以说「联网找真题」来搜索下载",
+                "model": "cet6",
+            })
+
+    elif act_type == "search":
+        year = action.get("year")
+        await fetch_online_index()
+        results = search_papers(year=year)
+        if results:
+            state["search_results"] = results
+            _cet6_sessions[session_id] = state
+            await ws.send_json({
+                "type": "cet6_search_results",
+                "results": [
+                    {
+                        "paper_id": r["paper_id"],
+                        "title": r["title"],
+                        "year": r["year"],
+                        "month": r["month"],
+                        "set_num": r["set_num"],
+                        "downloaded": r.get("downloaded", False),
+                    }
+                    for r in results
+                ],
+            })
+            years = sorted(set(r["year"] for r in results))
+            year_str = f"{years[0]}年" if len(years) == 1 else f"{years[0]}-{years[-1]}年"
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": f"找到 {len(results)} 套{year_str}的六级真题，要下载哪一套？",
+                "model": "cet6",
+            })
+            logger.info(f"CET-6 [ACTIONS] search: {len(results)} 套在线试卷")
+        else:
+            online_count = get_online_count()
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": f"在线题库中未找到匹配的试卷（目前有 {online_count} 套在线试卷）",
+                "model": "cet6",
+            })
+
+    elif act_type == "answers":
+        paper_id = state.get("paper_id")
+        if paper_id:
+            answers = cet6_get_answers(paper_id)
+            await ws.send_json({
+                "type": "cet6_answers",
+                "paper_id": paper_id,
+                "pdf_url": answers.get("pdf_url", ""),
+                "error": answers.get("error", ""),
+            })
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": "已展示答案，请核对" if "pdf_url" in answers else "抱歉，这份试卷暂无答案解析",
+                "model": "cet6",
+            })
+            logger.info(f"CET-6 [ACTIONS] answers: paper={paper_id}")
+        else:
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": "当前没有活跃的试卷，请先说「做真题」来选择一套",
+                "model": "cet6",
+            })
+
+    elif act_type == "listening":
+        paper_id = state.get("paper_id")
+        if paper_id:
+            papers = _load_index()
+            paper = next((p for p in papers if p["id"] == paper_id), None)
+            if paper and paper.get("has_audio") and paper.get("audio_url"):
+                await ws.send_json({
+                    "type": "music_control", "action": "play",
+                    "song_name": paper["title"] + " 听力音频",
+                    "download_url": paper["audio_url"],
+                    "source": "local",
+                })
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": f"正在播放 {paper['title']} 的听力音频 🎧",
+                    "model": "cet6",
+                })
+                logger.info(f"CET-6 [ACTIONS] listening: {paper['title']}")
+            else:
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": "当前试卷没有听力音频文件",
+                    "model": "cet6",
+                })
+        else:
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": "当前没有活跃的试卷，请先说「做真题」来选择一套",
+                "model": "cet6",
+            })
+
+    else:
+        logger.warning(f"CET-6 未知 action: {act_type}")
 
 
 @asynccontextmanager
@@ -623,6 +1013,10 @@ async def lifespan(app: FastAPI):
     logger.info("预加载 Whisper STT 模型（后台下载）...")
     from services.whisper_stt import preload_model
     await preload_model()
+    logger.info("扫描 CET-6 试卷索引...")
+    cet6_build_index()
+    logger.info("预加载 CET-6 在线索引（后台）...")
+    asyncio.create_task(fetch_online_index())
     logger.info("三道路由分发已启用")
     yield
 
@@ -634,6 +1028,7 @@ app = FastAPI(title="智能音箱_无实物 API", version="0.2.0", lifespan=life
 async def health_check():
     model_ok = await check_model_available()
     deepseek_ok = await check_deepseek_available()
+    stt = await stt_status()
     from services.intent_router import classify
     d = classify("测试路由")
     return JSONResponse({
@@ -643,6 +1038,7 @@ async def health_check():
         "model": DEFAULT_MODEL,
         "deepseek_available": deepseek_ok,
         "reasonix_available": is_reasonix_available(),
+        "stt": stt,
         "router": "xiaoai | info_query | mixed | reasonix | llm",
         "last_route": d.path,
     })
@@ -724,6 +1120,14 @@ async def websocket_endpoint(ws: WebSocket):
         "type": "time_sync",
         "time": vt.to_dict(),
     })
+    # 发送 STT 引擎状态（离线/在线）
+    _stt = await stt_status()
+    await ws.send_json({
+        "type": "stt_status",
+        "whisper_ready": _stt["whisper_ready"],
+        "xunfei_configured": _stt["xunfei_configured"],
+        "primary_engine": _stt["primary_engine"],
+    })
 
     # 启动情境引擎
     async def _on_alert(alert: dict):
@@ -751,6 +1155,9 @@ async def websocket_endpoint(ws: WebSocket):
 
     # 安全确认命令（模块级变量声明）
     global _pending_safety_cmd
+
+    # 取消事件：唤醒词打断正在生成的 LLM 回复
+    cancel_event = asyncio.Event()
 
     try:
         while True:
@@ -896,35 +1303,128 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "engine_config", "config": cfg.to_dict(), "reset": True})
                 continue
 
+            if msg_type == "cancel":
+                # 唤醒词打断：取消正在进行的 LLM 流式生成
+                logger.info("收到取消信号（唤醒词打断）")
+                cancel_event.set()
+                await ws.send_json({"type": "cancelled"})
+                continue
+
             if msg_type == "reset":
                 conversation_history.clear()
+                cancel_event.clear()  # 重置取消信号
                 logger.info("对话历史已重置")
                 await ws.send_json({"type": "chat_reset", "message": "对话已重置"})
                 continue
 
-            # ===== 流式 STT：分段音频 → 实时增量返回 =====
+            # ===== CET-6 在线搜索（前端直接触发） =====
+            if msg_type == "cet6_online_search":
+                query = data.get("query", "")
+                year = data.get("year")
+                month = data.get("month")
+                logger.info(f"CET-6 在线搜索: query={query}, year={year}, month={month}")
+
+                await fetch_online_index()
+                results = search_papers(year=year, month=month, exclude_downloaded=False)
+                await ws.send_json({
+                    "type": "cet6_search_results",
+                    "results": [
+                        {
+                            "paper_id": r["paper_id"],
+                            "title": r["title"],
+                            "year": r["year"],
+                            "month": r["month"],
+                            "set_num": r["set_num"],
+                            "downloaded": r.get("downloaded", False),
+                        }
+                        for r in results
+                    ],
+                })
+                continue
+
+            # ===== CET-6 下载试卷（前端直接触发） =====
+            if msg_type == "cet6_download_paper":
+                paper_id = data.get("paper_id", "")
+                if not paper_id:
+                    await ws.send_json({"type": "error", "error": "缺少 paper_id"})
+                    continue
+                logger.info(f"CET-6 下载试卷: {paper_id}")
+                await ws.send_json({"type": "route", "path": "cet6", "reason": "下载试卷"})
+                downloaded = await download_paper(paper_id)
+                if downloaded:
+                    _cet6_sessions[id(ws)] = {"paper_id": downloaded["id"]}
+                    await ws.send_json({
+                        "type": "cet6_paper",
+                        "paper_id": downloaded["id"],
+                        "title": downloaded["title"],
+                        "pdf_url": downloaded["pdf_url"],
+                        "has_audio": downloaded.get("has_audio", False),
+                        "audio_url": downloaded.get("audio_url", ""),
+                        "has_answers": downloaded.get("has_answers", False),
+                    })
+                    # 同步发送附件消息到聊天气泡
+                    await ws.send_json({
+                        "type": "chat_attachment",
+                        "label": f"📎 下载 {downloaded['title']} 真题",
+                        "url": downloaded["pdf_url"],
+                    })
+                    if downloaded.get("has_audio") and downloaded.get("audio_url"):
+                        await ws.send_json({
+                            "type": "music_control", "action": "play",
+                            "song_name": downloaded["title"] + " 听力音频",
+                            "download_url": downloaded["audio_url"],
+                            "source": "local",
+                        })
+                    await ws.send_json({
+                        "type": "done", "path": "cet6",
+                        "reply": f"已下载 {downloaded['title']}",
+                        "model": "cet6",
+                    })
+                else:
+                    await ws.send_json({
+                        "type": "done", "path": "cet6",
+                        "reply": "下载失败，请稍后重试",
+                        "model": "cet6",
+                    })
+                continue
+
+            # ===== CET-6 关闭面板：清除后端会话状态 =====
+            if msg_type == "cet6_close":
+                _cet6_sessions.pop(id(ws), None)
+                logger.info("CET-6 会话已清除")
+                continue
+
+            # ===== B-3: 完整音频一次转写 =====
             if msg_type == "audio_stream":
                 audio_b64 = data.get("audio", "")
                 is_final = data.get("final", False)
 
+                # B-3 主路径：完整音频（final=true, audio=完整WAV）
+                if is_final and audio_b64:
+                    logger.info("STT 完整转写 (%d bytes)", len(audio_b64))
+                    text = await stt_transcribe(audio_b64)
+                    if text:
+                        text = stt_correct(text)
+                    await ws.send_json({"type": "stt_result", "text": text or "", "final": True})
+                    continue
+
+                # 兼容旧增量模式：final=true 无音频 → 刷新缓冲区
                 if is_final and not audio_b64:
-                    # final=true 且无音频：结束标记
                     final_text = _stt_buffer.strip()
                     _stt_buffer = ""
                     if final_text:
                         await ws.send_json({"type": "stt_result", "text": final_text, "final": True})
                     continue
 
+                # 旧增量模式：非 final 音频片段
                 if not audio_b64:
                     continue
-
-                logger.info("STT 转写 (%d bytes, final=%s)", len(audio_b64), is_final)
+                logger.info("STT 增量转写 (%d bytes)", len(audio_b64))
                 text = await stt_transcribe(audio_b64)
                 if text:
                     text = stt_correct(text)
                     _stt_buffer += " " if _stt_buffer and not _stt_buffer.endswith(("。","！","？","，")) else ""
                     _stt_buffer += text
-                    # 每次返回完整累积文本，前端直接替换输入框即可
                     await ws.send_json({"type": "stt_result", "text": _stt_buffer, "final": False})
                 continue
 
@@ -984,6 +1484,92 @@ async def websocket_endpoint(ws: WebSocket):
                         await _maybe_tts(ws, full_output.strip(), "reasonix")
                         continue
 
+                # ===== CET-6 会话前置拦截 =====
+                _cet6_state = _cet6_sessions.get(id(ws))
+
+
+                # 答案请求
+                if _cet6_state and _cet6_state.get("paper_id") and any(kw in text for kw in ["答案", "对答案", "核对答案", "检查答案", "参考答案", "看看答案"]):
+                    logger.info(f"CET-6 答案请求: paper={_cet6_state['paper_id']}")
+                    answers = cet6_get_answers(_cet6_state["paper_id"])
+                    await ws.send_json({
+                        "type": "cet6_answers",
+                        "paper_id": _cet6_state["paper_id"],
+                        "pdf_url": answers.get("pdf_url", ""),
+                        "error": answers.get("error", ""),
+                    })
+                    await ws.send_json({
+                        "type": "done", "path": "cet6",
+                        "reply": "已展示答案，请核对" if "pdf_url" in answers else "抱歉，这份试卷暂无答案解析",
+                        "model": "cet6",
+                    })
+                    continue
+
+                # 在线搜索结果中选择下载
+                if _cet6_state and _cet6_state.get("search_results") and any(kw in text for kw in ["下载", "就要", "就选", "要这个", "这套", "选这个", "第一套", "第二套", "第三套", "就要这个"]):
+                    results = _cet6_state["search_results"]
+                    # 尝试从文本中匹配套号
+                    matched = None
+                    set_map = {"第一套": "1", "第二套": "2", "第三套": "3", "1": "1", "2": "2", "3": "3"}
+                    for kw, sn in set_map.items():
+                        if kw in text:
+                            matched = next((r for r in results if r.get("set_num") == sn), None)
+                            if matched:
+                                break
+                    # 如果只有一个搜索结果，直接用
+                    if not matched and len(results) == 1:
+                        matched = results[0]
+                    # 用 LLM 简短回复匹配信息，然后执行下载
+                    if matched:
+                        logger.info(f"CET-6 用户选择下载: {matched['paper_id']}")
+                        await ws.send_json({"type": "route", "path": "cet6", "reason": "在线下载试卷"})
+                        downloaded = await download_paper(matched["paper_id"])
+                        if downloaded:
+                            _cet6_state["paper_id"] = downloaded["id"]
+                            _cet6_state.pop("search_results", None)
+                            await ws.send_json({
+                                "type": "cet6_paper",
+                                "paper_id": downloaded["id"],
+                                "title": downloaded["title"],
+                                "pdf_url": downloaded["pdf_url"],
+                                "has_audio": downloaded.get("has_audio", False),
+                                "audio_url": downloaded.get("audio_url", ""),
+                                "has_answers": downloaded.get("has_answers", False),
+                            })
+                            # 同步发送附件消息到聊天气泡
+                            await ws.send_json({
+                                "type": "chat_attachment",
+                                "label": f"📎 下载 {downloaded['title']} 真题",
+                                "url": downloaded["pdf_url"],
+                            })
+                            if downloaded.get("has_audio") and downloaded.get("audio_url"):
+                                await ws.send_json({
+                                    "type": "music_control", "action": "play",
+                                    "song_name": downloaded["title"] + " 听力音频",
+                                    "download_url": downloaded["audio_url"],
+                                    "source": "local",
+                                })
+                            await ws.send_json({
+                                "type": "done", "path": "cet6",
+                                "reply": f"已下载 {downloaded['title']}，请开始练习吧",
+                                "model": "cet6",
+                            })
+                        else:
+                            await ws.send_json({
+                                "type": "done", "path": "cet6",
+                                "reply": "抱歉，下载失败了，请稍后重试",
+                                "model": "cet6",
+                            })
+                    else:
+                        # 模糊匹配，提示用户明确选择
+                        titles = ", ".join(r.get("set_num", "?") for r in results)
+                        await ws.send_json({
+                            "type": "done", "path": "cet6",
+                            "reply": f"请明确要哪一套？（可选: {titles}）",
+                            "model": "cet6",
+                        })
+                    continue
+
                 # ===== 意图分类 =====
                 decision = classify(text)
                 logger.info(f"路由决策: path={decision.path}, reason={decision.reason}")
@@ -999,7 +1585,7 @@ async def websocket_endpoint(ws: WebSocket):
                 cache = get_cache()
                 memory = get_memory()
 
-                async def call_llm(prompt: str, route_path: str = "llm", auto_search: bool = False, prefer_cloud: bool = False):
+                async def call_llm(prompt: str, route_path: str = "llm", auto_search: bool = False, prefer_cloud: bool = False, extra_context: str = ""):
                     # 0. 查缓存
                     cached = cache.check_and_get(prompt)
                     if cached:
@@ -1019,7 +1605,8 @@ async def websocket_endpoint(ws: WebSocket):
                                     logger.info(f"缓存 [ACTIONS] 恢复: {actions_json[:200]}")
                                 except json.JSONDecodeError:
                                     logger.warning(f"缓存 actions_json 解析失败: {actions_json[:100]}")
-                        # 发送回复
+                        # 发送回复（防御性剥离 ACTIONS 标签）
+                        reply_text = _strip_actions_tags(reply_text)
                         await ws.send_json({"type": "token", "text": reply_text})
                         await ws.send_json({"type": "done", "path": "cache", "reply": reply_text, "model": "cache"})
                         asyncio.create_task(_maybe_tts(ws, reply_text, "cache"))
@@ -1028,8 +1615,14 @@ async def websocket_endpoint(ws: WebSocket):
                             music_act = cached_actions.get("music")
                             device_acts = cached_actions.get("devices", [])
                             if music_act and isinstance(music_act, dict):
-                                await _send_music_control(ws, music_act)
-                                logger.info(f"[缓存] 执行音乐: {music_act}")
+                                if _user_requested_music(prompt):
+                                    await _send_music_control(ws, music_act)
+                                    logger.info(f"[缓存] 执行音乐: {music_act}")
+                                else:
+                                    logger.warning(
+                                        f"[缓存] 跳过幻觉音乐标签: {json.dumps(music_act, ensure_ascii=False)[:120]} "
+                                        f"| 用户原文未包含音乐请求: {prompt[:80]}"
+                                    )
                             if device_acts:
                                 for da in device_acts:
                                     virtual_home.execute(da.get("device", ""), da.get("action", "toggle"))
@@ -1038,6 +1631,8 @@ async def websocket_endpoint(ws: WebSocket):
 
                     # 0.5 自动搜索（信息查询类）
                     mem_ctx = memory.get_context()
+                    if extra_context:
+                        mem_ctx = extra_context + "\n" + mem_ctx if mem_ctx else extra_context
 
                     # 注入当前可用歌单列表（供 LLM 做歌单匹配）
                     try:
@@ -1074,6 +1669,7 @@ async def websocket_endpoint(ws: WebSocket):
                     model_used: list[str] = []
                     actions_out: list[str] = []  # 侧通道：收集流式中的 [ACTIONS] 标签
                     full_reply = ""
+                    cancel_event.clear()  # 重置取消信号（新请求开始）
                     try:
                         async for token in generate_stream(
                             prompt,
@@ -1082,6 +1678,7 @@ async def websocket_endpoint(ws: WebSocket):
                             prefer_cloud=prefer_cloud,
                             model_used=model_used,
                             actions_out=actions_out,
+                            cancel_event=cancel_event,
                         ):
                             await ws.send_json({"type": "token", "text": token})
                             full_reply += token
@@ -1091,6 +1688,12 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({"type": "error", "error": str(e)})
                         await ws.send_json({"type": "done", "path": route_path, "reply": full_reply, "model": model_used[0] if model_used else "unknown"})
                         await _maybe_tts(ws, full_reply, route_path)
+                        return
+
+                    # 检查是否被取消（唤醒词打断）
+                    if cancel_event.is_set():
+                        logger.info("LLM 流被取消（唤醒词打断），丢弃部分回复")
+                        await ws.send_json({"type": "cancelled"})
                         return
 
                     # 处理 [ACTIONS] 标签：模型主动输出的设备/音乐操作
@@ -1108,25 +1711,42 @@ async def websocket_endpoint(ws: WebSocket):
                             logger.info(f"LLM 输出 [ACTIONS] (兜底): {json.dumps(llm_actions, ensure_ascii=False)[:200]}")
 
                     full_reply = strip_search_tags(full_reply)
-                    # 清洗 Markdown 格式字符（双保险：前端显示 + TTS 都不含格式符号）
-                    full_reply = _clean_for_tts(full_reply)
+                    # 分离显示文本与 TTS 文本：
+                    # 显示文本：只剥离 ACTIONS 标签，保留 emoji 和轻量格式（有人情味）
+                    # TTS 文本：彻底清洗所有格式字符（纯文本朗读）
+                    display_reply = _strip_actions_tags(full_reply)
+                    tts_reply = _clean_for_tts(display_reply)  # _clean_for_tts 已内置 _strip_actions_tags
                     actual_model = model_used[0] if model_used else "unknown"
                     logger.info(f"大模型回复完成, 模型: {actual_model}")
-                    await ws.send_json({"type": "done", "path": route_path, "reply": full_reply.strip(), "model": actual_model})
+                    await ws.send_json({"type": "done", "path": route_path, "reply": display_reply.strip(), "model": actual_model})
 
-                    asyncio.create_task(_maybe_tts(ws, full_reply.strip(), route_path))
+                    asyncio.create_task(_maybe_tts(ws, tts_reply.strip(), route_path))
 
                     # 执行 LLM 通过 [ACTIONS] 标签输出的操作
                     if llm_actions:
                         music_act = llm_actions.get("music")
                         device_acts = llm_actions.get("devices", [])
                         if music_act and isinstance(music_act, dict):
-                            await _send_music_control(ws, music_act)
-                            logger.info(f"[ACTIONS] 执行音乐: {music_act}")
+                            # 交叉验证：检查用户原文是否真的包含音乐请求
+                            # 防止 LLM 将回复中的短语幻觉成歌曲名（如鼓励语中的"相信自己"）
+                            if _user_requested_music(prompt):
+                                await _send_music_control(ws, music_act)
+                                logger.info(f"[ACTIONS] 执行音乐: {music_act}")
+                            else:
+                                logger.warning(
+                                    f"[ACTIONS] 跳过幻觉音乐标签: {json.dumps(music_act, ensure_ascii=False)[:120]} "
+                                    f"| 用户原文未包含音乐请求: {prompt[:80]}"
+                                )
                         if device_acts:
                             for da in device_acts:
                                 virtual_home.execute(da.get("device", ""), da.get("action", "toggle"))
                             await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
+
+                        # 执行 LLM 通过 [ACTIONS] 输出的 CET-6 操作（与音乐/设备控制一致的模式）
+                        cet6_act = llm_actions.get("cet6")
+                        if cet6_act and isinstance(cet6_act, dict):
+                            await _handle_cet6_action(ws, cet6_act, id(ws))
+
 
                     # 4.5 兜底音乐检测：LLM 未输出 ACTIONS 但回复确认了播放
                     # 场景：小模型（qwen2.5:7b）有时忽略 ACTIONS 指令但仍会在文字中确认"轻音乐已就位"
@@ -1206,8 +1826,13 @@ async def websocket_endpoint(ws: WebSocket):
 
                     # 3. 记忆提取（用户原文 + LLM 回复双向提取）
                     if route_path == "llm" and full_reply.strip():
-                        # 从用户原文提取
-                        new_memories = memory.extract_and_store(prompt)
+                        # 过滤低质量 STT 文本，避免存入"背靠""真体券"等误识别记忆
+                        if not _is_low_quality_stt(prompt):
+                            # 从用户原文提取
+                            new_memories = memory.extract_and_store(prompt)
+                        else:
+                            logger.info(f"记忆跳过（低质量文本）: {prompt[:40]}")
+                            new_memories = []
                         # 也从 LLM 回复中提取（LLM 可能复述了用户信息）
                         new_memories += memory.extract_and_store(full_reply.strip())
                         if new_memories:
@@ -1338,8 +1963,10 @@ async def websocket_endpoint(ws: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("WebSocket 客户端已断开")
+        _cet6_sessions.pop(id(ws), None)
     except Exception as e:
         logger.error(f"WebSocket 异常: {e}")
+        _cet6_sessions.pop(id(ws), None)
     finally:
         # 停止情境引擎
         await ce.stop()

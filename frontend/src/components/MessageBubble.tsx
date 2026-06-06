@@ -1,5 +1,19 @@
 import { Message } from '../types';
 
+// 防御性清除 [ACTIONS]...[/ACTIONS] 和 【ACTIONS】...【/ACTIONS】 标签
+// 支持闭合标签和不闭合标签（从开标签到文末）
+const ACTIONS_STRIP_RE = /\[[【]ACTIONS[\]】][\s\S]*?\[[【]\/ACTIONS[\]】]/g;
+const ACTIONS_UNCLOSED_RE = /\[[【]ACTIONS[\]】][\s\S]*$/g;
+
+function sanitizeContent(text: string): string {
+  if (!text) return text;
+  // 第一遍：清除闭合的 ACTIONS 标签
+  let clean = text.replace(ACTIONS_STRIP_RE, '');
+  // 第二遍：清除未闭合的 ACTIONS 残片
+  clean = clean.replace(ACTIONS_UNCLOSED_RE, '');
+  return clean.trim();
+}
+
 const pathBadge: Record<string, string> = {
   xiaoai: 'bg-blue-100 text-blue-700', llm: 'bg-purple-100 text-purple-700',
   reasonix: 'bg-teal-100 text-teal-700', cache: 'bg-green-100 text-green-700',
@@ -56,7 +70,7 @@ export default function MessageBubble({ message }: Props) {
             border: isUser ? '1px solid var(--accent-glow)' : '1px solid var(--border)',
             borderRadius: isUser ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
           }}>
-          {content}
+          {sanitizeContent(content)}
           {isStreaming && <span className="inline-block w-1.5 h-4 ml-0.5 rounded-sm align-middle animate-pulse" style={{ background: 'var(--accent)' }} />}
         </div>
         <div className="mt-1 flex items-center gap-1.5">

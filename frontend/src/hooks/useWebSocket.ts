@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Message, WSResponse, DeviceInfo, CacheEntry, RoutePath, TTSAudio, TimeState, SafetyConfirm, MusicControlData } from '../types';
+import { Message, WSResponse, DeviceInfo, CacheEntry, RoutePath, TTSAudio, TimeState, SafetyConfirm, MusicControlData, Cet6Paper, Cet6SearchResult } from '../types';
 
 export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
 
@@ -68,6 +68,9 @@ export function useWebSocket() {
     message?: string;
     query?: string;
   }>({ status: '' });
+  const [cet6Paper, setCet6Paper] = useState<Cet6Paper | null>(null);
+  const [cet6Answers, setCet6Answers] = useState<{ pdf_url: string } | null>(null);
+  const [cet6SearchResults, setCet6SearchResults] = useState<Cet6SearchResult[]>([]);
   const [timeState, setTimeState] = useState<TimeState>({
     simulated: false, current_time: '', speed: 1, paused: false,
   });
@@ -154,6 +157,7 @@ export function useWebSocket() {
           setTranscriptionText(data.text || '');
           // 只在最终结果时自动发送（final=true），中间结果仅更新输入框预览
           if (data.final && data.text?.trim() && wsRef.current?.readyState === WebSocket.OPEN) {
+            setTranscriptionText('');  // 立即清空输入框，避免旧文字残留
             const text = data.text.trim();
             // 添加用户消息到列表
             setMessages((prev) => [...prev, {
@@ -294,6 +298,52 @@ export function useWebSocket() {
           return;
         }
 
+        if (data.type === 'cet6_paper') {
+          setCet6Paper({
+            paperId: data.paper_id || '',
+            title: data.title || '',
+            pdfUrl: data.pdf_url || '',
+            hasAudio: data.has_audio || false,
+            audioUrl: data.audio_url || '',
+            hasAnswers: data.has_answers || false,
+            answersUrl: data.answers_url || '',
+          });
+          setCet6Answers(null);  // 新试卷 → 清除旧答案
+          return;
+        }
+
+        if (data.type === 'cet6_answers') {
+          if (data.pdf_url) {
+            setCet6Answers({ pdf_url: data.pdf_url });
+          }
+          return;
+        }
+
+        if (data.type === 'cet6_search_results') {
+          setCet6SearchResults(data.results || []);
+          return;
+        }
+
+        // ── 附件消息：在聊天气泡中显示可点击的下载链接 ──
+        if (data.type === 'chat_attachment') {
+          const label = data.label || '📎 下载文件';
+          const url = data.url || '';
+          const ext = (url.match(/\.(\w+)(?:\?|$)/) || [])[1] || '文件';
+          const attachmentHtml = url
+            ? `<a href="${url}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);text-decoration:underline;font-weight:500;">${label}（.${ext}）</a>`
+            : label;
+          currentAiMsgRef.current = '';
+          setMessages((prev) => [...prev, {
+            id: nextId(),
+            role: 'ai',
+            content: attachmentHtml,
+            timestamp: Date.now(),
+            path: 'cet6',
+            isStreaming: false,
+          }]);
+          return;
+        }
+
         if (data.type === 'token') {
           currentAiMsgRef.current += data.text || '';
           setMessages((prev) => {
@@ -358,6 +408,19 @@ export function useWebSocket() {
               timestamp: Date.now(),
             },
           ]);
+        }
+
+        if (data.type === 'cancelled') {
+          // 唤醒词打断：移除最后一个未完成的流式 AI 消息
+          currentAiMsgRef.current = '';
+          setMessages((prev) => {
+            const lastMsg = prev[prev.length - 1];
+            if (lastMsg?.role === 'ai' && lastMsg.isStreaming) {
+              return prev.slice(0, -1);  // 移除未完成的消息
+            }
+            return prev;
+          });
+          return;
         }
 
         if (data.type === 'chat_error') {
@@ -499,15 +562,29 @@ export function useWebSocket() {
     safeSend({ type: 'toggle_suppress_alerts', suppressed });
   }, [safeSend]);
 
-  const sendAudioChunk = useCallback((audioBase64: string) => {
+  // B-3: 发送完整音频（录音结束后一次发送）
+  const sendCompleteAudio = useCallback((audioBase64: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'audio_stream', audio: audioBase64, final: false }));
+      wsRef.current.send(JSON.stringify({ type: 'audio_stream', audio: audioBase64, final: true }));
     }
   }, []);
 
-  const sendAudioFinal = useCallback(() => {
+  // 唤醒词打断：取消正在进行的 LLM 流式生成
+  const sendCancel = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'audio_stream', final: true }));
+      wsRef.current.send(JSON.stringify({ type: 'cancel' }));
+    }
+  }, []);
+
+  const sendCet6Download = useCallback((paperId: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'cet6_download_paper', paper_id: paperId }));
+    }
+  }, []);
+
+  const sendCet6Close = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'cet6_close' }));
     }
   }, []);
 
@@ -546,6 +623,8 @@ export function useWebSocket() {
     sendMessage, clearMessages, fetchCacheList, deleteCache,
     fetchMemoryList, deleteMemory, clearMemories,
     musicSearchStatus,
-    sendAudioChunk, sendAudioFinal, resetConversation,
+    cet6Paper, setCet6Paper, cet6Answers, setCet6Answers,
+    cet6SearchResults, sendCet6Download,
+    sendCompleteAudio, sendCancel, sendCet6Close, resetConversation,
   };
 }

@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Message } from '../types';
+import { Message, Cet6Paper, Cet6SearchResult } from '../types';
 import MessageBubble from './MessageBubble';
 import WakeWordEnrollment from './WakeWordEnrollment';
+import CET6Panel from './CET6Panel';
 import { useTTS } from '../hooks/useTTS';
 import { useVoiceInteraction } from '../hooks/useVoiceInteraction';
 import { FiSend, FiTrash2, FiRefreshCw, FiMic, FiMicOff, FiVolume2, FiVolumeX } from 'react-icons/fi';
@@ -11,32 +12,49 @@ interface ChatPanelProps {
   pendingTask?: { task: string; message?: string } | null;
   pendingTts?: { text: string; audio: string } | null;
   onTtsPlayed?: () => void;
+  onTtsFinished?: () => void;   // TTS 自然播完 → 播队列下一个
+  onTtsClear?: () => void;      // 唤醒词打断 → 清空整个 TTS 队列
   pendingTtsFallback?: string;
   onTtsFallbackConsumed?: () => void;
   onSend: (text: string) => void;
   onClear: () => void;
-  onSendAudioFinal?: (base64: string) => void;
-  onAudioStreamFinal?: () => void;
+  onSendCompleteAudio?: (base64: string) => void;
+  onCancel?: () => void;  // 唤醒词打断：取消正在进行的 LLM 生成
   streamText?: string;
   onDuckMusic?: () => void;
   onRestoreMusic?: () => void;
   isMobile?: boolean;
   onToggleSidebar?: () => void;
   onResetConversation?: () => void;
+  // CET-6
+  cet6Paper?: Cet6Paper | null;
+  cet6Answers?: Record<string, string> | null;
+  onCet6Close?: () => void;
+  cet6SearchResults?: Cet6SearchResult[];
+  onCet6Download?: (paperId: string) => void;
 }
 
 const WAKE_WORD = '小爱同学';
 
 export default function ChatPanel({
-  messages, pendingTask, pendingTts, onTtsPlayed, pendingTtsFallback, onTtsFallbackConsumed,
-  onSend, onClear, onSendAudioFinal, onAudioStreamFinal, streamText: propStreamText,
+  messages, pendingTask, pendingTts, onTtsPlayed, onTtsFinished, onTtsClear,
+  pendingTtsFallback, onTtsFallbackConsumed,
+  onSend, onClear, onSendCompleteAudio, onCancel, streamText: propStreamText,
   onDuckMusic, onRestoreMusic, isMobile, onToggleSidebar, onResetConversation,
+  cet6Paper, cet6Answers, onCet6Close,
+  cet6SearchResults, onCet6Download,
 }: ChatPanelProps) {
   const [input, setInput] = useState('');
   const [micActive, setMicActive] = useState(false);
   const [showEnrollment, setShowEnrollment] = useState(false);
+  const [showCet6Card, setShowCet6Card] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const prevLastMsgRef = useRef('');
+
+  // ═══════════════════════════════════════
+  // TTS（必须在语音交互之前初始化，供打断回调使用）
+  // ═══════════════════════════════════════
+  const { isSupported: ttsSupported, speaking, autoSpeak, toggleAutoSpeak, speak, stop: stopTts } = useTTS({ lang: 'zh-CN', rate: 1.1 });
 
   // ═══════════════════════════════════════
   // 语音交互状态机（唤醒词 + 录音）
@@ -45,15 +63,22 @@ export default function ChatPanel({
     wakeWord: WAKE_WORD,
     onWakeDetected: () => {
       console.log('[语音助手] 唤醒词检测成功');
+      // 立即闪避音乐音量，减少扬声器残响干扰后续录音
+      onDuckMusic?.();
+      // 打断 TTS：停止当前播报 + 清空整个待播队列
+      stopTts();
+      onTtsClear?.();
+      onTtsFallbackConsumed?.();
+      // 取消正在进行的 LLM 生成（后端流式输出 + 前端流式消息）
+      onCancel?.();
     },
-    onAudioChunk: (b64: string) => {
-      onSendAudioFinal?.(b64);
-    },
+    // B-3: 录音结束后发送完整音频
     onAudioComplete: (b64: string) => {
-      onSendAudioFinal?.(b64);
+      onSendCompleteAudio?.(b64);
     },
     onAudioFinal: () => {
-      onAudioStreamFinal?.();
+      // 唤醒词监听恢复已移至 useVoiceInteraction 内部自动处理
+      // 录音结束 → onstop → 自动重启 Mellon，不等 TTS 播完
     },
     onError: (err: string) => {
       console.error('[语音助手] 错误:', err);
@@ -94,19 +119,18 @@ export default function ChatPanel({
   // ── 手动麦克风按钮（备用：不依赖唤醒词） ──
   const handleMicClick = useCallback(async () => {
     if (micActive) {
-      // 停止手动录音
+      // 停止手动录音 → 发送完整音频
       setMicActive(false);
       const b64 = await voiceActions.stopManualRecord();
-      if (b64 && onSendAudioFinal) {
-        onSendAudioFinal(b64);
-        onAudioStreamFinal?.();
+      if (b64) {
+        onSendCompleteAudio?.(b64);
       }
     } else {
       // 开始手动录音
       const ok = await voiceActions.startManualRecord();
       if (ok) setMicActive(true);
     }
-  }, [micActive, voiceActions, onSendAudioFinal, onAudioStreamFinal]);
+  }, [micActive, voiceActions, onSendCompleteAudio]);
 
   // ── 语音状态同步 micActive ──
   useEffect(() => {
@@ -117,11 +141,6 @@ export default function ChatPanel({
     }
   }, [voiceState.phase]);
 
-  // ═══════════════════════════════════════
-  // TTS
-  // ═══════════════════════════════════════
-  const { isSupported: ttsSupported, speaking, autoSpeak, toggleAutoSpeak, speak } = useTTS({ lang: 'zh-CN', rate: 1.1 });
-
   // 后端 STT 转写结果 → 写入输入框
   useEffect(() => {
     if (propStreamText !== undefined && propStreamText !== input) {
@@ -130,28 +149,30 @@ export default function ChatPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [propStreamText]);
 
-  // Edge TTS 音频到达 → 播放，播完后恢复唤醒词监听
+  // Edge TTS 音频到达 → 播放，播完后恢复唤醒词监听 + 推进队列
   useEffect(() => {
     if (pendingTts && pendingTts.audio) {
       speak(pendingTts.text, pendingTts.audio, () => {
-        // TTS 播完 → 恢复唤醒词监听
+        // TTS 播完 → 恢复唤醒词监听 + 播队列下一个
         voiceActions.resumeWakeListening();
+        onTtsFinished?.();
       });
       onTtsPlayed?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingTts, speak, onTtsPlayed]);
+  }, [pendingTts, speak, onTtsPlayed, onTtsFinished]);
 
-  // 后端 TTS 失败 → 降级浏览器 speechSynthesis，播完后恢复
+  // 后端 TTS 失败 → 降级浏览器 speechSynthesis，播完后恢复 + 推进队列
   useEffect(() => {
     if (pendingTtsFallback) {
       speak(pendingTtsFallback, undefined, () => {
         voiceActions.resumeWakeListening();
+        onTtsFinished?.();
       });
       onTtsFallbackConsumed?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingTtsFallback]);
+  }, [pendingTtsFallback, onTtsFinished]);
 
   useEffect(() => {
     const lastMsg = messages[messages.length - 1];
@@ -161,6 +182,13 @@ export default function ChatPanel({
   }, [messages]);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+
+  // 新试卷到达 → 收起卡片，显示圆点
+  useEffect(() => {
+    if (cet6Paper) {
+      setShowCet6Card(false);
+    }
+  }, [cet6Paper]);
 
   const handleSubmit = useCallback(() => {
     if (!input.trim()) return;
@@ -270,6 +298,56 @@ export default function ChatPanel({
 
         <div ref={bottomRef} />
       </div>
+
+      {/* ── CET-6 试卷指示器标签（仅发送试卷时显示，实时更新标题）─── */}
+      {cet6Paper && !showCet6Card && (
+        <div className="flex justify-center mb-2">
+          <button
+            onClick={() => setShowCet6Card(true)}
+            className="cet6-dot-btn"
+            title="点击展开试卷卡片"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '5px 14px',
+              borderRadius: '20px',
+              border: '1px solid var(--accent-strong, rgba(167,139,250,0.25))',
+              cursor: 'pointer',
+              background: 'var(--bg-elevated)',
+              animation: 'cet6-dot-pulse 2s ease-in-out infinite',
+              fontSize: '12px',
+              fontWeight: 600,
+              color: 'var(--accent)',
+              whiteSpace: 'nowrap',
+              maxWidth: '90%',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            }}
+          >
+            <span style={{ flexShrink: 0 }}>📖</span>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {cet6Paper.title}
+            </span>
+          </button>
+        </div>
+      )}
+
+      {/* ── CET-6 备考面板（弹出式卡片，默认收起）─── */}
+      {showCet6Card && (cet6Paper || (cet6SearchResults && cet6SearchResults.length > 0)) && (
+        <div className="mx-4 mb-2">
+          <CET6Panel
+            paper={cet6Paper || null}
+            answers={cet6Answers || null}
+            onClose={() => {
+              // 关闭卡片 → 回到圆点（不清除试卷）
+              setShowCet6Card(false);
+            }}
+            searchResults={cet6SearchResults}
+            onDownloadPaper={onCet6Download}
+          />
+        </div>
+      )}
 
       {/* ── 待审批任务提示 ── */}
       {pendingTask && (

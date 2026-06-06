@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useMusicPlayer } from './hooks/useMusicPlayer';
 import StatusBar from './components/StatusBar';
@@ -20,8 +20,10 @@ export default function App() {
     timeState, setTime, setTimeSpeed, toggleTimePause, toggleTimeSim, toggleSuppressAlerts,
     sendMessage, clearMessages, fetchCacheList, deleteCache,
     fetchMemoryList, deleteMemory, clearMemories,
-    sendAudioChunk, sendAudioFinal, transcriptionText, ttsFallbackText,
+    sendCompleteAudio, sendCancel, sendCet6Close, transcriptionText, ttsFallbackText,
     musicSearchStatus,
+    cet6Paper, setCet6Paper, cet6Answers, setCet6Answers,
+    cet6SearchResults, sendCet6Download,
     resetConversation,
   } = useWebSocket();
 
@@ -42,13 +44,45 @@ export default function App() {
     }
   }, [musicSearchStatus, setPlayerState]);
 
-  // Edge TTS 音频播放（ttsAudio 变化时触发）
+  // ═══════════════════════════════════════
+  // TTS 队列：防止音乐/CET-6 播报打断 LLM 回复
+  // ═══════════════════════════════════════
+  const ttsQueueRef = useRef<{ text: string; audio: string }[]>([]);
+  const ttsPlayingRef = useRef(false);
   const [pendingTts, setPendingTts] = useState<{ text: string; audio: string } | null>(null);
+
+  const playNextTts = useCallback(() => {
+    if (ttsQueueRef.current.length > 0) {
+      const next = ttsQueueRef.current.shift()!;
+      ttsPlayingRef.current = true;
+      setPendingTts(next);
+    } else {
+      ttsPlayingRef.current = false;
+    }
+  }, []);
+
+  // 新 TTS 音频到达 → 入队，空闲则立即播放
   useEffect(() => {
     if (ttsAudio?.audio) {
-      setPendingTts({ text: ttsAudio.text, audio: ttsAudio.audio });
+      ttsQueueRef.current.push({ text: ttsAudio.text, audio: ttsAudio.audio });
+      if (!ttsPlayingRef.current) {
+        playNextTts();
+      }
     }
-  }, [ttsAudio]);
+  }, [ttsAudio, playNextTts]);
+
+  // 当前 TTS 播放完毕 → 出队播下一个
+  const handleTtsFinished = useCallback(() => {
+    setPendingTts(null);
+    playNextTts();
+  }, [playNextTts]);
+
+  // 唤醒词打断 → 清空整个队列
+  const handleTtsClear = useCallback(() => {
+    ttsQueueRef.current = [];
+    ttsPlayingRef.current = false;
+    setPendingTts(null);
+  }, []);
 
   // TTS 降级文本（后端 TTS 失败时触发浏览器 speechSynthesis）
   const [pendingTtsFallback, setPendingTtsFallback] = useState('');
@@ -98,11 +132,17 @@ export default function App() {
           style={!isMobile ? { borderRight: '1px solid var(--border)' } : {}}>
           <ChatPanel messages={messages} pendingTask={pendingTask ? { task: pendingTask } : null} onSend={sendMessage} onClear={clearMessages}
             pendingTts={pendingTts} onTtsPlayed={() => setPendingTts(null)}
+            onTtsFinished={handleTtsFinished} onTtsClear={handleTtsClear}
             pendingTtsFallback={pendingTtsFallback} onTtsFallbackConsumed={() => setPendingTtsFallback('')}
-            onSendAudioFinal={(b64: string) => sendAudioChunk(b64)} onAudioStreamFinal={() => sendAudioFinal()} streamText={transcriptionText}
+            onSendCompleteAudio={(b64: string) => sendCompleteAudio(b64)} onCancel={() => sendCancel()}
+            streamText={transcriptionText}
             onDuckMusic={duckForRecording} onRestoreMusic={restoreVolumeAfterRecording}
             isMobile={isMobile} onToggleSidebar={() => setSidebarOpen(true)}
-            onResetConversation={resetConversation} />
+            onResetConversation={resetConversation}
+            cet6Paper={cet6Paper} cet6Answers={cet6Answers}
+            onCet6Close={() => { setCet6Paper(null); setCet6Answers(null); sendCet6Close(); }}
+            cet6SearchResults={cet6SearchResults}
+            onCet6Download={sendCet6Download} />
           {/* 音乐导航栏：仅占左栏宽度，不遮挡侧栏 */}
           <MusicPlayer
             playerState={playerState}

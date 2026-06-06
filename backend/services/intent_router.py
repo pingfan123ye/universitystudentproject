@@ -7,6 +7,7 @@
   info_query → 信息查询（天气/新闻/百科等，进双引擎调度）
   mixed     → 混合意图（拆分子任务分别路由）
   llm       → 大模型兜底（含强制走大模型）
+  noise     → 音乐串扰过滤（忽略）
 """
 import re
 from dataclasses import dataclass, field
@@ -14,7 +15,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class RouteDecision:
-    path: str               # reasonix | xiaoai | info_query | mixed | llm
+    path: str               # reasonix | cet6 | xiaoai | info_query | mixed | llm
     confidence: float
     reason: str
     matched_key: str = ""
@@ -239,6 +240,25 @@ def _extract_music_query(text: str) -> str:
     if len(query) < 2 or len(query) > 40:
         return ""
     return query
+def _detect_music_action_fallback(text: str) -> dict | None:
+    """
+    宽松匹配：当严格正则失败时，只要文本包含动作词+音乐词就认为要播音乐。
+    用于补偿 STT 误识别导致的音乐命令丢失。
+    """
+    play_hints = ["播放", "放首", "放一", "想听", "来一首", "来一",
+                  "放点", "放些", "来点", "播点", "播", "听", "聽"]
+    music_hints = ["歌", "音乐", "音樂", "曲", "背景", "轻音", "純音", "纯音"]
+    has_play = any(p in text for p in play_hints)
+    has_music = any(m in text for m in music_hints)
+    if has_play and has_music:
+        query = _extract_music_query(text)
+        result = {"action": "play"}
+        if query:
+            result["query"] = query
+        return result
+    return None
+
+
 def _detect_music_action(text: str) -> dict | None:
     action = None
     for kw in MUSIC_ACTIONS["resume"]:
@@ -276,6 +296,12 @@ def _detect_music_action(text: str) -> dict | None:
     if not action and any(kw in text for kw in VOLUME_KEYWORDS):
         if _is_music_play_intent(text):
             action = "play"
+
+    # 宽松 fallback：严格匹配失败但明显是音乐请求
+    if not action:
+        fallback = _detect_music_action_fallback(text)
+        if fallback:
+            action = fallback["action"]
 
     if action:
         result = {"action": action}
@@ -405,6 +431,75 @@ def _detect_mixed(text: str) -> RouteDecision | None:
 
 
 # ═══════════════════════════════════════
+# CET-6 备考检测
+# ═══════════════════════════════════════
+
+CET6_KEYWORDS = [
+    "六级", "CET6", "CET-6", "cet6", "cet-6", "英语六级", "四六级",
+    "备考", "背单词", "学英语", "英语学习",
+    "做真题", "做卷子", "刷题", "模拟考试", "模考",
+]
+
+
+def _detect_cet6(text: str) -> bool:
+    """检测是否涉及六级备考：内置迷你纠错 + 六级关键词 + 学习/备考意图 + 弱意图兜底"""
+    t = text
+    # 内置迷你纠错（不依赖 stt_corrector，双保险）
+    # ---- 备考类纠错 ----
+    t = t.replace("背考", "备考").replace("被烤", "备考").replace("贝考", "备考").replace("备烤", "备考")
+    t = t.replace("背靠", "备考").replace("被靠", "备考").replace("贝靠", "备考").replace("备靠", "备考")
+    t = t.replace("背搞", "备考").replace("贝搞", "备考")
+    # ---- 六级类纠错 ----
+    t = t.replace("六集", "六级").replace("六极", "六级").replace("留级", "六级").replace("流利", "六级")
+    t = t.replace("六业", "六级").replace("六页", "六级").replace("六耶", "六级").replace("六液", "六级")
+    t = t.replace("61", "六级").replace("6级", "六级").replace("6集", "六级")
+    # ---- 真题类纠错 ----
+    t = t.replace("真体券", "真题").replace("整体券", "真题").replace("真体全", "真题")
+    t = t.replace("真体圈", "真题").replace("正题圈", "真题").replace("正题全", "真题")
+    t = t.replace("真题券", "真题").replace("真题卷", "真题")
+    # ---- 学习类纠错 ----
+    t = t.replace("学系", "学习").replace("学西", "学习")
+
+    t = t.lower()
+    has_cet = any(kw in t for kw in ["六级", "cet6", "cet-6", "英语六级", "四六级",
+                                       "四六级考试", "英语考试"])
+    has_study = any(kw in t for kw in [
+        "备考", "复习", "学习", "真题", "做题", "练习", "考试",
+        "模拟", "模拟考", "刷题", "卷子", "做卷", "测试",
+        "听力", "口语", "阅读", "写作", "翻译", "完形",
+        "背单词", "做卷子",
+    ])
+
+    # 音乐命令过滤：如果文本以音乐动作词开头且不含强学习意图关键词，不触发 CET-6
+    # 避免"播放六级听力""听六级"等被误路由到 cet6（会先于 xiaoai 设备路由匹配）
+    music_start = any(t.startswith(kw) for kw in ["播放", "听", "唱", "放", "来首", "来一"])
+    strong_study = any(kw in t for kw in ["真题", "做题", "备考", "试卷", "做卷", "刷题",
+                                           "阅读", "写作", "翻译", "复习", "练习"])
+    if has_cet and music_start and not strong_study:
+        return False
+
+    # 主路径：必须同时满足六级关键词 + 学习意图
+    if has_cet and has_study:
+        return True
+
+    # 弱意图兜底路径：文本包含"六级"+"做/要/想/学/背靠"等弱意图且不与其他路由冲突
+    # 解决 STT 严重错误时"真体券→真题"纠错后仍不匹配 has_study 的情况
+    weak_intent = any(kw in t for kw in [
+        "背靠",  # "背靠六级" → 独立检测（纠错前原文可能就有）
+        "被靠", "贝靠",
+    ])
+    if has_cet and weak_intent:
+        return True
+
+    # 长度兜底：文本很短（≤6字符）且包含"六级"或"cet6" → 大概率是要备考
+    # 避免"播放六级听力"等误触发（这类文本通常含"播放""听"等动作词）
+    if has_cet and len(t) <= 6 and not any(kw in t for kw in ["播放", "听", "唱", "放"]):
+        return True
+
+    return has_cet and has_study
+
+
+# ═══════════════════════════════════════
 # 设备检测（纯设备/音乐/场景）
 # ═══════════════════════════════════════
 
@@ -528,7 +623,7 @@ def classify(text: str) -> RouteDecision:
     if d:
         return d
 
-    # 5. 信息查询（进双引擎调度）
+    # 6. 信息查询（进双引擎调度）
     if _is_info_query(text):
         return RouteDecision(
             path="info_query", confidence=0.7, reason="信息查询",
