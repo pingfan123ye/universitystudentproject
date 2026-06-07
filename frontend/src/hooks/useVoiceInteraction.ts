@@ -31,21 +31,27 @@ export interface VoiceInteractionActions {
 
 // ── 常量 ──
 const STORAGE_KEY = 'mellon-xiaozhi-refs';
-const MAX_RECORD_SECONDS = 15;        // 最长录音秒数
-const WAKE_CONFIDENCE_THRESHOLD = 0.55;  // 唤醒词最低置信度（用户声纹 sim≈0.66~0.68，留 0.1 余量防误触发）
+const MAX_RECORD_SECONDS = 12;        // 最长录音秒数
+const WAKE_CONFIDENCE_THRESHOLD = 0.60;  // 唤醒词最低置信度（用户声纹 sim≈0.66~0.68，留 ~0.06 余量）
 const WAKE_COOLDOWN_MS = 2000;           // 两次唤醒最小间隔（防止连触发）
 
-// AnalyserNode 自适应静音检测参数
-// autoGainControl=true 时 AGC 会放大静音底噪、压低语音增益，导致语音/底噪对比度大幅降低。
-// 因此使用双阈值滞后（hysteresis）：语音触发阈值较低，静音判定阈值更低。
+// AnalyserNode 自适应静音检测参数（三策略融合）
+// 策略A（主）：语音峰值衰减 — RMS < 峰值×20% 判定疑似停止，解决 AGC 放大底噪
+// 策略B（辅）：快速停止 — RMS < 峰值×10% 仅需 800ms 确认
+// 策略C（兜底）：双阈值滞后 — 噪声基线×比率，适用于安静环境
 const LEVEL_CHECK_INTERVAL_MS = 250;    // 电平检测间隔
 const NOISE_WINDOW_SAMPLES = 16;        // 噪声基线窗口 = 16 × 250ms = 4 秒
 const SPEECH_RATIO = 2.5;               // 语音触发：RMS > 噪声基线 × 2.5（AGC 下约 1.5~3 倍）
 const SPEECH_THRESHOLD_MIN = 0.004;     // 语音触发最低绝对值（用户语音 RMS ~0.005）
-const SILENCE_RATIO = 1.8;              // 静音判定：RMS < 噪声基线 × 1.8（滞后，避免 AGC 底噪阻止静音检测）
+const SILENCE_RATIO = 2.5;              // 静音判定：RMS < 噪声基线 × 2.5（兜底策略，主策略为峰值衰减检测）
 const SILENCE_THRESHOLD_MIN = 0.002;    // 静音判定最低绝对值（与语音阈值保持比例）
-const MIN_SPEECH_DURATION_MS = 400;     // 最少连续语音时长
-const SILENCE_TIMEOUT_MS = 2000;        // 连续静音超时 → 自动停止
+const MIN_SPEECH_DURATION_MS = 300;     // 最少连续语音时长
+const SILENCE_TIMEOUT_MS = 1500;        // 连续静音超时 → 自动停止
+const PEAK_DECAY_RATIO = 0.20;           // 峰值衰减检测：RMS < 语音峰值 × 20% → 疑似停止（AGC 环境下主策略）
+const QUICK_STOP_RATIO = 0.10;          // 快速停止：RMS < 语音峰值 × 10% → 确认时间缩短至 800ms
+const QUICK_STOP_TIMEOUT_MS = 800;      // 快速停止的静音确认时间
+const PEAK_WINDOW_SAMPLES = 8;          // 语音峰值追踪窗口 = 8 × 250ms = 2 秒
+const NO_SPEECH_TIMEOUT_MS = 3000;      // 无语音超时：3 秒未检测到语音 → 自动停止（防止幽灵唤醒浪费录音）
 
 // ── WebM → WAV/PCM 16kHz base64 ──
 // reuseCtx: 可选，复用已有的 AudioContext 进行解码，避免创建过多实例
@@ -130,6 +136,10 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
   const cancelledRef = useRef(false);
   // 唤醒词防连触发：记录上次唤醒时间
   const lastWakeTimeRef = useRef(0);
+  // 标记是否正在录音（防止录音期间唤醒词误触发 → cancel 打断自身）
+  const recordingRef = useRef(false);
+  // TTS 反馈防护：录音结束后短暂失聪期，防止扬声器 TTS 音频被麦克风捕获误触发唤醒
+  const wakeDeafUntilRef = useRef(0);
 
   // 同步 state → ref
   useEffect(() => { phaseRef.current = phase; }, [phase]);
@@ -152,6 +162,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
     recRef.current = null;
     recChunksRef.current = [];
     autoStoppedRef.current = false;
+    recordingRef.current = false;
     setRecordingTime(0);
     setAudioLevel(0);
   }, []);
@@ -185,13 +196,18 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
 
   const startRecording = useCallback(async (): Promise<boolean> => {
     try {
-      // 新一轮录音开始，重置取消标志
-      cancelledRef.current = false;
+      // ★ 如果已被外部取消（disable/cleanup 在 setTimeout 间隙触发），不再启动
+      if (cancelledRef.current) {
+        console.log('[录音] 已被外部取消，跳过 startRecording');
+        return false;
+      }
 
       // 先确保 Mellon 已停止（释放其麦克风流）
       if (detectorRef.current?.listening) {
         await detectorRef.current.stop();
       }
+      // ★ 标记录音中：防止 onMatch 在录音期间误触发 cancel
+      recordingRef.current = true;
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -202,6 +218,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
       });
       recStreamRef.current = stream;
       autoStoppedRef.current = false;
+      cancelledRef.current = false;  // ★ 确认启动成功后才清除取消标志（防止覆盖 disable() 的取消）
       onDuckMusic?.();
 
       // ── 电平检测 AudioContext（录音期间复用 1 个）──
@@ -215,13 +232,17 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
       // 不 connect 到 destination — 避免回声
       const timeData = new Float32Array(analyser.fftSize);  // ★ 32-bit 浮点精度，低振幅准确
 
-      // ── 自适应噪声基线 + 双阈值滞后静音检测 ──
-      // 关键：AGC 环境下语音/底噪比仅 1.5~3 倍，单阈值无法同时满足"灵敏触发"和"准确静音"
-      // 方案：语音触发用较高阈值（SPEECH_RATIO），静音判定用较低阈值（SILENCE_RATIO）
-      const noiseWindow: number[] = [];       // 滑动窗口 RMS 历史
+      // ── 三策略融合静音检测 ──
+      // 策略A（主）：语音峰值衰减 — RMS < 峰值×20% 判定疑似停止，解决 AGC 放大底噪
+      // 策略B（辅）：快速停止 — RMS < 峰值×10% 仅需 800ms 确认
+      // 策略C（兜底）：噪声基线双阈值滞后 — 安静环境下噪声基线×比率
+      const noiseWindow: number[] = [];       // 滑动窗口 RMS 历史（用于噪声基线）
+      const peakWindow: number[] = [];        // 语音峰值追踪窗口
       let speechDuration = 0;                 // 连续语音累计
       let silenceDuration = 0;                // 连续静音累计
       let hasSpeech = false;                  // 是否已确认检测到语音
+      let speechPeak = 0.05;                  // 语音峰值（默认 0.05，启动后由实际语音更新）
+      let noSpeechDuration = 0;               // 无语音累计（用于幽灵唤醒检测：3 秒无声 → 停止）
       let sampleCount = 0;                    // ★ 诊断：采样计数
       const LOG_SAMPLES = 20;                 // ★ 诊断：前 20 次采样详细日志
 
@@ -239,14 +260,18 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         noiseWindow.push(rms);
         if (noiseWindow.length > NOISE_WINDOW_SAMPLES) noiseWindow.shift();
 
-        // 噪声基线 = 窗口内最小值（稳定环境 3 秒找底噪）
+        // 噪声基线 = 窗口内最小值（稳定环境找底噪）
         const noiseFloor = noiseWindow.length > 0
           ? noiseWindow.reduce((a, b) => Math.min(a, b), Infinity)
           : 0.01;
 
-        // ★ 双阈值：语音触发阈值 > 静音判定阈值（滞后）
+        // ★ 双阈值：语音触发阈值 > 静音判定阈值（滞后，兜底策略C）
         const speechThreshold = Math.max(noiseFloor * SPEECH_RATIO, SPEECH_THRESHOLD_MIN);
         const silenceThreshold = Math.max(noiseFloor * SILENCE_RATIO, SILENCE_THRESHOLD_MIN);
+
+        // ★ 策略A/B：基于语音峰值的衰减阈值
+        const peakDecayThreshold = speechPeak * PEAK_DECAY_RATIO;   // 峰值 20% → 疑似停止
+        const quickStopThreshold = speechPeak * QUICK_STOP_RATIO;   // 峰值 10% → 快速停止
 
         // 更新 UI 电平条
         setAudioLevel(Math.min(rms / 0.2, 1));
@@ -255,46 +280,93 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         if (sampleCount <= LOG_SAMPLES) {
           console.log(
             `[静音检测 #${sampleCount}] rms=${rms.toFixed(5)} ` +
-            `noiseFloor=${noiseFloor.toFixed(5)} ` +
-            `speechThr=${speechThreshold.toFixed(5)} ` +
-            `silenceThr=${silenceThreshold.toFixed(5)} ` +
+            `noiseFloor=${noiseFloor.toFixed(5)} speechPeak=${speechPeak.toFixed(5)} ` +
+            `speechThr=${speechThreshold.toFixed(5)} silenceThr=${silenceThreshold.toFixed(5)} ` +
+            `peakDecayThr=${peakDecayThreshold.toFixed(5)} quickStopThr=${quickStopThreshold.toFixed(5)} ` +
             `hasSpeech=${hasSpeech} speechDur=${speechDuration}ms silenceDur=${silenceDuration}ms`
           );
         }
 
-        // ★ 滞后状态机
+        // ★★★ 三策略融合状态机 ★★★
         if (!hasSpeech) {
           // 状态 A：等待语音触发 → 使用较高阈值
           if (rms > speechThreshold) {
             speechDuration += LEVEL_CHECK_INTERVAL_MS;
             silenceDuration = 0;
+            noSpeechDuration = 0;  // 有声音 → 重置无语音计时
+            // 语音激活期间追踪峰值
+            peakWindow.push(rms);
+            if (peakWindow.length > PEAK_WINDOW_SAMPLES) peakWindow.shift();
+            if (rms > speechPeak) speechPeak = rms;  // 即时更新峰值（上升沿）
             if (speechDuration >= MIN_SPEECH_DURATION_MS) {
               hasSpeech = true;
               silenceDuration = 0;
-              console.log(`[静音检测] ✅ 语音确认 (rms=${rms.toFixed(5)} > speechThr=${speechThreshold.toFixed(5)}, 累计${speechDuration}ms)`);
+              // 确认语音后，用窗口内最大值校准 speechPeak
+              if (peakWindow.length > 0) {
+                speechPeak = peakWindow.reduce((a, b) => Math.max(a, b), speechPeak);
+              }
+              console.log(`[静音检测] ✅ 语音确认 (rms=${rms.toFixed(5)} > speechThr=${speechThreshold.toFixed(5)}, peak=${speechPeak.toFixed(5)}, 累计${speechDuration}ms)`);
             }
           } else {
             speechDuration = Math.max(0, speechDuration - LEVEL_CHECK_INTERVAL_MS);  // 逐渐衰减，容忍短暂波动
-          }
-        } else {
-          // 状态 B：已确认语音 → 使用较低阈值检测静音
-          if (rms < silenceThreshold) {
-            silenceDuration += LEVEL_CHECK_INTERVAL_MS;
-            if (silenceDuration >= SILENCE_TIMEOUT_MS) {
+            // 无语音时清空峰值窗口（避免残留噪声污染峰值）
+            if (peakWindow.length > 0 && speechDuration === 0) peakWindow.length = 0;
+            // ★ 无语音超时：幽灵唤醒（环境噪声误触发）→ 3 秒无声自动停止
+            noSpeechDuration += LEVEL_CHECK_INTERVAL_MS;
+            if (noSpeechDuration >= NO_SPEECH_TIMEOUT_MS) {
               const r = recRef.current;
               if (r && r.state === 'recording') {
                 console.log(
-                  `[静音检测] 🛑 自动停止 ` +
-                  `rms=${rms.toFixed(5)} < silenceThr=${silenceThreshold.toFixed(5)} ` +
-                  `noiseFloor=${noiseFloor.toFixed(5)} silence=${silenceDuration}ms`
+                  `[静音检测] 🛑 无语音超时停止 ` +
+                  `rms=${rms.toFixed(5)} < speechThr=${speechThreshold.toFixed(5)} ` +
+                  `noSpeech=${noSpeechDuration}ms (阈值${NO_SPEECH_TIMEOUT_MS}ms)`
+                );
+                autoStoppedRef.current = true;
+                r.stop();
+              }
+            }
+          }
+        } else {
+          // 状态 B：已确认语音 → 三策略融合判定停止
+          // 策略A：峰值衰减检测（AGC 环境主策略）
+          const isSilenceByPeakDecay = rms < peakDecayThreshold;
+          // 策略C：噪声基线兜底（安静环境）
+          const isSilenceByNoiseFloor = rms < silenceThreshold;
+          // 策略B：快速停止条件
+          const isQuickStop = rms < quickStopThreshold;
+
+          // 综合判断：峰值衰减 OR 噪声基线 任一满足即视为静音
+          const isSilence = isSilenceByPeakDecay || isSilenceByNoiseFloor;
+
+          if (isSilence) {
+            silenceDuration += LEVEL_CHECK_INTERVAL_MS;
+            // 策略B：快速停止使用更短的确认时间
+            const effectiveTimeout = isQuickStop ? QUICK_STOP_TIMEOUT_MS : SILENCE_TIMEOUT_MS;
+            if (silenceDuration >= effectiveTimeout) {
+              const r = recRef.current;
+              if (r && r.state === 'recording') {
+                const trigger = isQuickStop ? '快速停止' : (isSilenceByPeakDecay ? '峰值衰减' : '噪声基线');
+                console.log(
+                  `[静音检测] 🛑 自动停止(${trigger}) ` +
+                  `rms=${rms.toFixed(5)} peakDecayThr=${peakDecayThreshold.toFixed(5)} ` +
+                  `silenceThr=${silenceThreshold.toFixed(5)} silence=${silenceDuration}ms`
                 );
                 autoStoppedRef.current = true;
                 r.stop();
               }
             }
           } else {
-            // 还有语音 → 重置静音计时
+            // 还有语音 → 重置静音计时 + 更新语音峰值
             silenceDuration = 0;
+            peakWindow.push(rms);
+            if (peakWindow.length > PEAK_WINDOW_SAMPLES) peakWindow.shift();
+            // 仅在 RMS 上升时更新峰值，防止噪声污染峰值
+            if (rms > speechPeak) speechPeak = rms;
+            // 定期用窗口最大值校准（捕获缓慢上升的语音趋势）
+            if (peakWindow.length >= PEAK_WINDOW_SAMPLES && sampleCount % 4 === 0) {
+              const windowMax = peakWindow.reduce((a, b) => Math.max(a, b), 0);
+              if (windowMax > speechPeak * 0.8) speechPeak = Math.max(speechPeak, windowMax * 0.9);
+            }
           }
         }
       }, LEVEL_CHECK_INTERVAL_MS);
@@ -343,6 +415,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         // 用户主动取消（disable/cleanup）→ 跳过音频发送，避免误切 processing
         if (cancelledRef.current) {
           console.log('[录音] 已被用户取消，跳过音频处理');
+          recordingRef.current = false;
           if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
           if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
           if (recStreamRef.current) { recStreamRef.current.getTracks().forEach(t => t.stop()); recStreamRef.current = null; }
@@ -356,6 +429,9 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         }
 
         console.log('[录音] onstop 触发，收集音频...');
+
+        // 0. 清除录音标记（防止后续 onMatch 误触发）
+        recordingRef.current = false;
 
         // 1. 停止所有定时器
         if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
@@ -389,8 +465,9 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         }
         onAudioFinal();
 
-        // 7. 立即恢复唤醒词监听（不等 TTS 播完）
+        // 7. 恢复唤醒词监听（设置短暂失聪期防止 TTS 反馈触发误唤醒）
         if (enabledRef.current) {
+          wakeDeafUntilRef.current = Date.now() + 1500;  // 1.5 秒失聪期
           await restartDetector();
         }
       };
@@ -514,7 +591,16 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
       });
 
       if (refs.length === 0) {
-        console.warn('[唤醒词] ⚠️ 无声纹，需要先注册');
+        // ★ IndexedDB 可能暂时不可读（Mellon 异步操作未完成），重试一次
+        console.warn('[唤醒词] ⚠️ 第一次读取声纹为空，1 秒后重试...');
+        await new Promise(r => setTimeout(r, 1000));
+        savedRefs = Storage.loadWords(STORAGE_KEY);
+        refs = savedRefs || [];
+        console.log('[唤醒词] 重试后声纹总数: %d', refs.length);
+      }
+
+      if (refs.length === 0) {
+        console.warn('[唤醒词] ⚠️ 重试仍无声纹，需要重新注册');
         setIsEnrolled(false);
         return false;
       }
@@ -536,6 +622,18 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
               return;
             }
 
+            // ★ 录音期间忽略唤醒词（防止用户说话中的"小智"触发 cancel 打断自身）
+            if (recordingRef.current) {
+              console.log(`[唤醒词] 录音中，忽略唤醒词检测 (confidence=${confidence.toFixed(3)})`);
+              return;
+            }
+
+            // ★ TTS 反馈防护：录音刚结束的失聪期内忽略唤醒
+            if (Date.now() < wakeDeafUntilRef.current) {
+              console.log(`[唤醒词] 失聪期内忽略 (剩余${wakeDeafUntilRef.current - Date.now()}ms)`);
+              return;
+            }
+
             const now = Date.now();
             if (now - lastWakeTimeRef.current < WAKE_COOLDOWN_MS) {
               console.log(`[唤醒词] 冷却中 (${now - lastWakeTimeRef.current}ms)，忽略`);
@@ -550,9 +648,12 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
             onWakeDetected();
             setPhase('wake_detected');
             setTimeout(async () => {
-              if (enabledRef.current) {
+              // ★ 600ms 内用户可能已点 disable → 检查 phase 防止死循环
+              if (enabledRef.current && phaseRef.current === 'wake_detected') {
                 const ok = await startRecording();
                 if (ok) console.log('[唤醒词] 自动开始录音');
+              } else {
+                console.log('[唤醒词] 超时到达但已取消 (phase=' + phaseRef.current + ')');
               }
             }, 600);
           },
@@ -566,10 +667,31 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
       detectorRef.current = detector;
       console.log('[唤醒词] ✅ Detector 创建完成');
 
-      // ★ 步骤 4：加载模型 + 初始化
+      // ★ 步骤 4：加载模型 + 初始化（带重试，CDN 可能间歇断连）
       console.log('[唤醒词] 🧠 步骤4: detector.init() — 加载 ONNX 模型、WASM、声纹嵌入...');
       const t0 = Date.now();
-      await detector.init();
+      let initOk = false;
+      let initErr: any;
+      for (let retry = 0; retry <= 3; retry++) {
+        try {
+          if (retry > 0) {
+            const delay = Math.min(1000 * Math.pow(2, retry - 1), 8000);
+            console.log(`[唤醒词] init 重试 ${retry}/3，等待 ${delay}ms...`);
+            await new Promise(r => setTimeout(r, delay));
+          }
+          await detector.init();
+          initOk = true;
+          break;
+        } catch (err: any) {
+          initErr = err;
+          if (retry < 3) {
+            console.warn(`[唤醒词] init 失败 (${err.message})，准备重试...`);
+          }
+        }
+      }
+      if (!initOk) {
+        throw initErr || new Error('detector.init 所有重试均失败');
+      }
       console.log('[唤醒词] ✅ detector.init() 完成 (%dms)', Date.now() - t0);
 
       // ★ 步骤 5：启动麦克风监听
@@ -628,6 +750,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
 
   const enable = useCallback(async () => {
     enabledRef.current = true;
+    cancelledRef.current = false;  // ★ 新会话：重置取消标志（上次 disable 可能遗留 true）
     setError('');
     setPhase('initializing');
 

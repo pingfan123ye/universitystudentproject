@@ -191,3 +191,71 @@ async def _edge_tts_check() -> bool:
         return True
     except Exception:
         return False
+
+
+# ═══════════════════════════════════════════════════════════
+# TTS 文本清洗
+# ═══════════════════════════════════════════════════════════
+
+def clean_for_tts(text: str) -> str:
+    """清洗 Markdown / 结构化格式字符 + Emoji，让 TTS 只朗读纯文本"""
+    import re as _re
+
+    # 0. 最终防线：清除所有 [ACTIONS] 标签（防止泄露到 TTS 朗读）
+    from services.llm_service import _strip_actions_tags
+    text = _strip_actions_tags(text)
+    if not text:
+        return ""
+    # 0.5 去除 Emoji 表情符号（TTS 无法朗读，避免读出乱码）
+    _EMOJI_BLOCKS = _re.compile(
+        '['
+        '\U0001F600-\U0001F64F'
+        '\U0001F300-\U0001F5FF'
+        '\U0001F680-\U0001F6FF'
+        '\U0001F1E0-\U0001F1FF'
+        '\U00002702-\U000027B0'
+        '\U0001F900-\U0001F9FF'
+        '\U0001FA00-\U0001FA6F'
+        '\U0001FA70-\U0001FAFF'
+        '\U00002600-\U000026FF'
+        '\U0000FE00-\U0000FE0F'
+        '\U0000200D'
+        ']+',
+        flags=_re.UNICODE,
+    )
+    _EXTRA_SYMBOLS = _re.compile(
+        '['
+        '©®™ℹ'
+        '⏏⏩-⏳⏸-⏺'
+        'Ⓜ'
+        '▪▫▶◀◻-◾'
+        '㊗㊙〰〽'
+        '⭐⭕'
+        ']+',
+        flags=_re.UNICODE,
+    )
+    text = _EMOJI_BLOCKS.sub('', text)
+    text = _EXTRA_SYMBOLS.sub('', text)
+    if not text.strip():
+        return ""
+    # 1. 去掉代码块（```...```）
+    text = _re.sub(r'```[\s\S]*?```', '', text)
+    # 2. 去掉行内代码 (`code`)
+    text = _re.sub(r'`([^`]+)`', r'\1', text)
+    # 3. 去掉粗体标记（**text**, __text__）
+    text = _re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = _re.sub(r'__([^_]+)__', r'\1', text)
+    # 4. 去掉斜体标记（*text* / _text_）
+    text = _re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'\1', text)
+    text = _re.sub(r'(?<!_)_([^_\n]+)_(?!_)', r'\1', text)
+    # 5. 去掉标题标记（# ## ### 等，只在行首匹配）
+    text = _re.sub(r'^#{1,6}\s+', '', text, flags=_re.MULTILINE)
+    # 6. 去掉无序列表标记（- * + 开头）
+    text = _re.sub(r'^[\-\*\+]\s+', '', text, flags=_re.MULTILINE)
+    # 7. 去掉有序列表标记（1. 2. 等）
+    text = _re.sub(r'^\d+\.\s+', '', text, flags=_re.MULTILINE)
+    # 8. 去掉删除线（~~text~~）
+    text = _re.sub(r'~~([^~]+)~~', r'\1', text)
+    # 9. 去掉多余空白行
+    text = _re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()

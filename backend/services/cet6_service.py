@@ -223,3 +223,316 @@ def get_answers(paper_id: str) -> dict:
 def get_paper_count() -> int:
     """返回可用试卷数量"""
     return len(_load_index())
+
+
+# ═══════════════════════════════════════════════════════════
+# CET-6 会话状态管理
+# ═══════════════════════════════════════════════════════════
+
+# key: id(websocket), value: {
+#     "paper_id": str,              # 当前活跃试卷
+#     "search_results": list[dict],  # 最近在线搜索结果
+# }
+_cet6_sessions: dict[int, dict] = {}
+
+
+def get_cet6_session(session_id: int) -> dict:
+    """获取或创建 CET-6 会话状态"""
+    if session_id not in _cet6_sessions:
+        _cet6_sessions[session_id] = {}
+    return _cet6_sessions[session_id]
+
+
+# ═══════════════════════════════════════════════════════════
+# CET-6 试卷发送
+# ═══════════════════════════════════════════════════════════
+
+async def send_cet6_paper(ws, paper: dict, tts_text: str | None = None, tts_callback=None):
+    """发送 CET-6 试卷到前端（含 PDF 附件气泡 + 听力自动播放）
+
+    tts_callback: async (ws, text, path) — TTS 播报回调，避免循环导入
+    """
+    await ws.send_json({
+        "type": "cet6_paper",
+        "paper_id": paper["id"],
+        "title": paper["title"],
+        "pdf_url": paper["pdf_url"],
+        "has_audio": paper.get("has_audio", False),
+        "audio_url": paper.get("audio_url", ""),
+        "has_answers": paper.get("has_answers", False),
+        "answers_url": paper.get("answers_url", ""),
+    })
+    await ws.send_json({
+        "type": "chat_attachment",
+        "label": f"📎 下载 {paper['title']} 真题",
+        "url": paper["pdf_url"],
+    })
+    # 听力自动播放
+    if paper.get("has_audio") and paper.get("audio_url"):
+        await ws.send_json({
+            "type": "music_control", "action": "play",
+            "song_name": paper["title"] + " 听力音频",
+            "download_url": paper["audio_url"],
+            "source": "local",
+        })
+        logger.info(f"CET-6 听力播放: {paper['title']}")
+    # TTS 语音播报
+    if tts_text and tts_callback:
+        import asyncio
+        asyncio.create_task(tts_callback(ws, tts_text, "cet6"))
+
+
+# ═══════════════════════════════════════════════════════════
+# CET-6 操作执行
+# ═══════════════════════════════════════════════════════════
+
+async def handle_cet6_action(ws, action: dict, session_id: int, tts_callback=None):
+    """执行 LLM 通过 [ACTIONS]{{"cet6":{{...}}}} 输出的 CET-6 操作。
+
+    与音乐/设备控制完全一致的模式：LLM 自主决定何时调用 CET-6 功能，
+    后端负责执行具体的试卷查找、听力播放、答案获取等操作。
+
+    tts_callback: async (ws, text, path) — TTS 播报回调，避免循环导入
+    """
+    from services.cet6_online import (
+        fetch_online_index, search_papers, download_paper, get_online_count,
+    )
+
+    act_type = action.get("action", "")
+    state = get_cet6_session(session_id)
+
+    if act_type == "random_paper":
+        year = action.get("year")
+        month = action.get("month")
+        set_num = action.get("set")
+        paper = select_random_paper(year=year, month=month, set_num=set_num)
+        if paper:
+            _cet6_sessions[session_id] = {"paper_id": paper["id"]}
+            await send_cet6_paper(ws, paper,
+                tts_text=f"好的，为你准备了{paper['title']}，先做听力部分吧",
+                tts_callback=tts_callback)
+            logger.info(f"CET-6 [ACTIONS] random_paper: {paper['title']} (year={year}, month={month}, set={set_num})")
+        else:
+            year_str = f"{year}年" if year else ""
+            month_str = f"{month}月" if month else ""
+            logger.info(f"CET-6 [ACTIONS] random_paper 本地无匹配 (year={year}, month={month})，转在线搜索")
+            await fetch_online_index()
+            results = search_papers(year=year, month=month)
+            if results:
+                state["search_results"] = results
+                _cet6_sessions[session_id] = state
+                await ws.send_json({
+                    "type": "cet6_search_results",
+                    "results": [
+                        {
+                            "paper_id": r["paper_id"],
+                            "title": r["title"],
+                            "year": r["year"],
+                            "month": r["month"],
+                            "set_num": r["set_num"],
+                            "downloaded": r.get("downloaded", False),
+                        }
+                        for r in results
+                    ],
+                })
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": f"本地没有{year_str}{month_str}的真题，但在线找到了 {len(results)} 套，要下载哪一套？",
+                    "model": "cet6",
+                })
+            else:
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": f"抱歉，本地和在线都没有找到{year_str}{month_str}的六级真题，你可以换个年份试试",
+                    "model": "cet6",
+                })
+
+    elif act_type == "paper":
+        year = action.get("year")
+        month = action.get("month")
+        set_num = action.get("set")
+        papers = _load_index()
+        matched = None
+        for p in papers:
+            pid = p.get("id", "")
+            parts = pid.split("-")
+            if len(parts) >= 3:
+                if year is not None and parts[0] != str(year):
+                    continue
+                if month is not None and parts[1] != str(month).zfill(2):
+                    continue
+                if set_num is not None and parts[2] != str(set_num):
+                    continue
+                matched = p
+                break
+        if matched:
+            _cet6_sessions[session_id] = {"paper_id": matched["id"]}
+            await send_cet6_paper(ws, matched,
+                tts_text=f"好的，为你找到{matched['title']}，开始练习吧",
+                tts_callback=tts_callback)
+            logger.info(f"CET-6 [ACTIONS] paper: {matched['title']}")
+        else:
+            logger.info(f"CET-6 [ACTIONS] paper 本地未匹配 year={year} month={month}，转在线搜索")
+            await fetch_online_index()
+            results = search_papers(year=year, month=month)
+            if results:
+                state["search_results"] = results
+                _cet6_sessions[session_id] = state
+                await ws.send_json({
+                    "type": "cet6_search_results",
+                    "results": [
+                        {
+                            "paper_id": r["paper_id"],
+                            "title": r["title"],
+                            "year": r["year"],
+                            "month": r["month"],
+                            "set_num": r["set_num"],
+                            "downloaded": r.get("downloaded", False),
+                        }
+                        for r in results
+                    ],
+                })
+                year_str = f"{year}年" if year else "相关"
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": f"本地没有{year_str}的真题，但在线找到了 {len(results)} 套，要下载哪一套？",
+                    "model": "cet6",
+                })
+            else:
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": f"抱歉，本地和在线都没有找到{'{}年'.format(year) if year else '相关'}的六级真题",
+                    "model": "cet6",
+                })
+
+    elif act_type == "browse":
+        papers = _load_index()
+        if papers:
+            local_results = []
+            for p in papers:
+                pid = p.get("id", "")
+                pid_parts = pid.split("-") if "-" in pid else []
+                local_results.append({
+                    "paper_id": pid,
+                    "title": p["title"],
+                    "year": pid_parts[0] if len(pid_parts) >= 1 else "",
+                    "month": pid_parts[1] if len(pid_parts) >= 2 else "",
+                    "set_num": pid_parts[2] if len(pid_parts) >= 3 else "",
+                    "downloaded": True,
+                })
+            await ws.send_json({
+                "type": "cet6_search_results",
+                "results": local_results,
+            })
+            lines = []
+            for i, p in enumerate(papers, 1):
+                audio_tag = "🎧" if p.get("has_audio") else ""
+                ans_tag = "📝" if p.get("has_answers") else ""
+                lines.append(f"{i}. {p['title']} {audio_tag}{ans_tag}")
+            summary = "当前题库有以下真题：\n" + "\n".join(lines) + "\n\n告诉我你要做哪一套，或者说「做第一套」"
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": summary,
+                "model": "cet6",
+            })
+            logger.info(f"CET-6 [ACTIONS] browse: {len(papers)} 套本地试卷")
+        else:
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": "本地题库暂时为空，你可以说「联网找真题」来搜索下载",
+                "model": "cet6",
+            })
+
+    elif act_type == "search":
+        year = action.get("year")
+        await fetch_online_index()
+        results = search_papers(year=year)
+        if results:
+            state["search_results"] = results
+            _cet6_sessions[session_id] = state
+            await ws.send_json({
+                "type": "cet6_search_results",
+                "results": [
+                    {
+                        "paper_id": r["paper_id"],
+                        "title": r["title"],
+                        "year": r["year"],
+                        "month": r["month"],
+                        "set_num": r["set_num"],
+                        "downloaded": r.get("downloaded", False),
+                    }
+                    for r in results
+                ],
+            })
+            years = sorted(set(r["year"] for r in results))
+            year_str = f"{years[0]}年" if len(years) == 1 else f"{years[0]}-{years[-1]}年"
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": f"找到 {len(results)} 套{year_str}的六级真题，要下载哪一套？",
+                "model": "cet6",
+            })
+            logger.info(f"CET-6 [ACTIONS] search: {len(results)} 套在线试卷")
+        else:
+            online_count = get_online_count()
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": f"在线题库中未找到匹配的试卷（目前有 {online_count} 套在线试卷）",
+                "model": "cet6",
+            })
+
+    elif act_type == "answers":
+        paper_id = state.get("paper_id")
+        if paper_id:
+            answers = get_answers(paper_id)
+            await ws.send_json({
+                "type": "cet6_answers",
+                "paper_id": paper_id,
+                "pdf_url": answers.get("pdf_url", ""),
+                "error": answers.get("error", ""),
+            })
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": "已展示答案，请核对" if "pdf_url" in answers else "抱歉，这份试卷暂无答案解析",
+                "model": "cet6",
+            })
+            logger.info(f"CET-6 [ACTIONS] answers: paper={paper_id}")
+        else:
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": "当前没有活跃的试卷，请先说「做真题」来选择一套",
+                "model": "cet6",
+            })
+
+    elif act_type == "listening":
+        paper_id = state.get("paper_id")
+        if paper_id:
+            papers = _load_index()
+            paper = next((p for p in papers if p["id"] == paper_id), None)
+            if paper and paper.get("has_audio") and paper.get("audio_url"):
+                await ws.send_json({
+                    "type": "music_control", "action": "play",
+                    "song_name": paper["title"] + " 听力音频",
+                    "download_url": paper["audio_url"],
+                    "source": "local",
+                })
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": f"正在播放 {paper['title']} 的听力音频 🎧",
+                    "model": "cet6",
+                })
+                logger.info(f"CET-6 [ACTIONS] listening: {paper['title']}")
+            else:
+                await ws.send_json({
+                    "type": "done", "path": "cet6",
+                    "reply": "当前试卷没有听力音频文件",
+                    "model": "cet6",
+                })
+        else:
+            await ws.send_json({
+                "type": "done", "path": "cet6",
+                "reply": "当前没有活跃的试卷，请先说「做真题」来选择一套",
+                "model": "cet6",
+            })
+
+    else:
+        logger.warning(f"CET-6 未知 action: {act_type}")

@@ -180,66 +180,12 @@ XIAOAI_UTILITY = ["闹钟", "提醒", "倒计时", "计时"]
 
 
 def _extract_music_query(text: str) -> str:
-    """
-    从文本中提取歌曲搜索关键词。
-    例如：
-      "播放周杰伦的晴天" -> "周杰伦 晴天"
-      "来一首七里香" -> "七里香"
-      "我想听陈奕迅的歌" -> "陈奕迅"
-      "我想听歌了请帮我播放歌曲" -> ""（播放本地歌单）
-    """
-    # 去掉通用音乐关键词前缀（按长度降序匹配最长的）
-    play_prefixes = sorted(MUSIC_ACTIONS["play"], key=len, reverse=True)
-    query = text
-    for p in play_prefixes:
-        if p in query:
-            idx = query.find(p)
-            query = query[idx + len(p):]  # 只取关键词之后的部分（关键词可能在句子中间）
-            break
-    # 去掉标点和无意义字符
-    PUNCT_RE = re.compile(r"[\s,，。！？、；：“”‘’《》!?;:'()]+")
-    query = PUNCT_RE.sub(' ', query).strip()
-    # 去掉自然语言碎片（不是歌曲名/歌手名的一部分）
-    noise = [
-        '请帮我', '请帮助', '請幫我', '請幫助', '帮我', '幫我', '给我', '給我',
-        '我想', '我要', '请你', '請你', '我让', '我讓', '让你', '讓你',
-        '来一首', '來一首', '来一个', '来一段', '来一曲', '来个',
-        '一首', '一个', '一段', '一曲',
-        '听歌', '聽歌', '听音乐', '聽音樂', '放歌', '放音樂',
-        '有点', '有點', '有少少', '想', '歌曲', '一下', '下',
-        # 口语填充词/应答词（Whisper 常把语气词转录为这些）
-        '好的', '好', '好吧', '行吧', '可以', '那个', '這個', '那个',
-        '进行', '一下', '给我', '给我来', '来帮我', '來幫我',
-        '选首', '選首', '选个', '選個', '帮我选', '幫我選',
-        '选手', '選手', '选手给', '選手給',  # Whisper 常把"选首"误识别为"选手"
-        # 随机/泛化请求词
-        '随机', '隨機', '随机多', '随便', '隨便', '随意', '隨意', '任意',
-        '多放', '多来', '多',  # "随机多放一首" → 多/多放 是修饰词
-        '字幕',  # 歌曲歌词被误识别后的常见前缀
-    ]
-    for w in sorted(noise, key=len, reverse=True):
-        query = query.replace(w, ' ')
-    # 去掉独立的单字代词（仅当它们前后是空格或边界时才移除，避免误伤歌名如《我》《你》）
-    query = re.sub(r'(?:^|\s)[我你他她它](?=\s|$)', ' ', query)
-    # 去掉末尾语气词（包括句首虚词）
-    query = re.sub(r'^[了吧啊呀哦啦呗么嗯了]+', '', query)
-    query = re.sub(r'[了吧啊呀哦啦呗么嗯了]+$', '', query).strip()
-    # 去掉末尾的"的歌"、"的音乐"、"的歌曲"、以及单独的"的"
-    query = re.sub(r'的(歌|音乐|歌曲)*$', '', query).strip()
-    # 去掉唤醒词（可能在任意位置，如"我想听歌了小智"中的"小智"）
-    query = re.sub(r'(小智小智|小智|小字小字|小字|小子小子|小子)', ' ', query)
-    # 合并多余空格
-    query = re.sub(r'\s+', ' ', query).strip()
-    # 如果清洗后只剩无意义词，返回空（触发本地歌单/默认播放）
-    if query in ("", "歌", "音乐", "音樂", "一首", "个", "點", "下", "首", "曲", "歌曲",
-                 "听歌", "聽歌", "听音乐", "聽音樂", "想听", "想聽",
-                 "好的", "好", "行", "可以", "行吧", "好吧",
-                 "随便", "随意", "随机", "任意", "都可以", "什么都行", "啥都行"):
-        return ""
-    # 太短（单字）或太长（>40字）不靠谱
-    if len(query) < 2 or len(query) > 40:
-        return ""
-    return query
+    """从自然语言中提取歌名+歌手关键词（统一委托到 music_service.clean_music_query）"""
+    from services.music_service import clean_music_query
+    return clean_music_query(text)
+
+
+
 def _detect_music_action_fallback(text: str) -> dict | None:
     """
     宽松匹配：当严格正则失败时，只要文本包含动作词+音乐词就认为要播音乐。
@@ -442,25 +388,8 @@ CET6_KEYWORDS = [
 
 
 def _detect_cet6(text: str) -> bool:
-    """检测是否涉及六级备考：内置迷你纠错 + 六级关键词 + 学习/备考意图 + 弱意图兜底"""
-    t = text
-    # 内置迷你纠错（不依赖 stt_corrector，双保险）
-    # ---- 备考类纠错 ----
-    t = t.replace("背考", "备考").replace("被烤", "备考").replace("贝考", "备考").replace("备烤", "备考")
-    t = t.replace("背靠", "备考").replace("被靠", "备考").replace("贝靠", "备考").replace("备靠", "备考")
-    t = t.replace("背搞", "备考").replace("贝搞", "备考")
-    # ---- 六级类纠错 ----
-    t = t.replace("六集", "六级").replace("六极", "六级").replace("留级", "六级").replace("流利", "六级")
-    t = t.replace("六业", "六级").replace("六页", "六级").replace("六耶", "六级").replace("六液", "六级")
-    t = t.replace("61", "六级").replace("6级", "六级").replace("6集", "六级")
-    # ---- 真题类纠错 ----
-    t = t.replace("真体券", "真题").replace("整体券", "真题").replace("真体全", "真题")
-    t = t.replace("真体圈", "真题").replace("正题圈", "真题").replace("正题全", "真题")
-    t = t.replace("真题券", "真题").replace("真题卷", "真题")
-    # ---- 学习类纠错 ----
-    t = t.replace("学系", "学习").replace("学西", "学习")
-
-    t = t.lower()
+    """检测是否涉及六级备考。STT 纠错已在调用前完成（stt_corrector.correct），此处只做关键词匹配。"""
+    t = text.lower()
     has_cet = any(kw in t for kw in ["六级", "cet6", "cet-6", "英语六级", "四六级",
                                        "四六级考试", "英语考试"])
     has_study = any(kw in t for kw in [
@@ -470,33 +399,22 @@ def _detect_cet6(text: str) -> bool:
         "背单词", "做卷子",
     ])
 
-    # 音乐命令过滤：如果文本以音乐动作词开头且不含强学习意图关键词，不触发 CET-6
-    # 避免"播放六级听力""听六级"等被误路由到 cet6（会先于 xiaoai 设备路由匹配）
+    # 音乐命令过滤：避免"播放六级听力"被误路由到 cet6
     music_start = any(t.startswith(kw) for kw in ["播放", "听", "唱", "放", "来首", "来一"])
     strong_study = any(kw in t for kw in ["真题", "做题", "备考", "试卷", "做卷", "刷题",
                                            "阅读", "写作", "翻译", "复习", "练习"])
     if has_cet and music_start and not strong_study:
         return False
 
-    # 主路径：必须同时满足六级关键词 + 学习意图
+    # 必须同时满足六级关键词 + 学习意图
     if has_cet and has_study:
         return True
 
-    # 弱意图兜底路径：文本包含"六级"+"做/要/想/学/背靠"等弱意图且不与其他路由冲突
-    # 解决 STT 严重错误时"真体券→真题"纠错后仍不匹配 has_study 的情况
-    weak_intent = any(kw in t for kw in [
-        "背靠",  # "背靠六级" → 独立检测（纠错前原文可能就有）
-        "被靠", "贝靠",
-    ])
-    if has_cet and weak_intent:
-        return True
-
-    # 长度兜底：文本很短（≤6字符）且包含"六级"或"cet6" → 大概率是要备考
-    # 避免"播放六级听力"等误触发（这类文本通常含"播放""听"等动作词）
+    # 长度兜底：文本很短（≤6字符）且包含"六级" → 大概率是要备考
     if has_cet and len(t) <= 6 and not any(kw in t for kw in ["播放", "听", "唱", "放"]):
         return True
 
-    return has_cet and has_study
+    return False
 
 
 # ═══════════════════════════════════════

@@ -237,3 +237,20 @@ def correct(text: str) -> str:
         logger.info(f"STT 纠错: '{original[:60]}' → '{result[:60]}'")
 
     return result
+
+
+def is_low_quality_stt(text: str) -> bool:
+    """检测低质量 STT 文本，避免被存入记忆。"""
+    if not text or not text.strip():
+        return True
+    t = text.strip()
+    if len(t) < 3:
+        return True
+    # 纯重复字符（如"嗯嗯嗯""好好好"）
+    if len(t) >= 3 and len(set(t)) <= 2:
+        return True
+    # 纯英文乱码
+    import re as _re
+    if _re.match(r'^[a-zA-Z\s.,!?;:\'\"\-]+$', t) and len(t) > 10:
+        return True
+    return False

@@ -24,6 +24,27 @@ export default function WakeWordEnrollment({ wakeWord, onComplete, onCancel }: W
 
   const TOTAL_SAMPLES = 3;
 
+  // ★ 带重试的模型加载：CDN 可能间歇性断连，最多重试 3 次，指数退避
+  async function retryFetch<T>(fn: () => Promise<T>, label: string, maxRetries = 3): Promise<T> {
+    let lastErr: any;
+    for (let i = 0; i <= maxRetries; i++) {
+      try {
+        if (i > 0) {
+          const delay = Math.min(1000 * Math.pow(2, i - 1), 8000);
+          console.log(`[注册] ${label} 重试 ${i}/${maxRetries}，等待 ${delay}ms...`);
+          await new Promise(r => setTimeout(r, delay));
+        }
+        return await fn();
+      } catch (err: any) {
+        lastErr = err;
+        if (i < maxRetries) {
+          console.warn(`[注册] ${label} 失败 (${err.message})，准备重试...`);
+        }
+      }
+    }
+    throw lastErr;
+  }
+
   const recordSample = useCallback(async () => {
     try {
       setStep('recording');
@@ -38,10 +59,13 @@ export default function WakeWordEnrollment({ wakeWord, onComplete, onCancel }: W
       setSampleCount(count);
       setStep('idle');
 
-      // 录满 3 次 → 自动生成
+      // 录满 3 次 → 自动生成（带重试，CDN 可能间歇断连）
       if (count >= TOTAL_SAMPLES) {
         setStep('generating');
-        const ref = await sessionRef.current.generateRef();
+        const ref = await retryFetch(
+          () => sessionRef.current.generateRef(),
+          'generateRef'
+        );
 
         const { Storage } = await import('mellon');
         Storage.saveWord(ref, 'mellon-xiaozhi-refs');
