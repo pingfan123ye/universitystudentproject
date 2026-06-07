@@ -34,7 +34,7 @@ interface ChatPanelProps {
   onCet6Download?: (paperId: string) => void;
 }
 
-const WAKE_WORD = '小爱同学';
+const WAKE_WORD = '小智小智';
 
 export default function ChatPanel({
   messages, pendingTask, pendingTts, onTtsPlayed, onTtsFinished, onTtsClear,
@@ -87,10 +87,13 @@ export default function ChatPanel({
     onRestoreMusic,
   });
 
-  // ── 唤醒词注册完成 → 自动启用语音助手 ──
+  // ── 唤醒词注册完成 → 延迟后自动启用语音助手（等麦克风释放）──
   const handleEnrollmentComplete = useCallback(() => {
     setShowEnrollment(false);
-    voiceActions.enable();
+    // ★ 延迟 500ms：确保 EnrollmentSession 完全释放麦克风后再启动 Detector
+    setTimeout(() => {
+      voiceActions.enable();
+    }, 500);
   }, [voiceActions]);
 
   const handleEnrollmentCancel = useCallback(() => {

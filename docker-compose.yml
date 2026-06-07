@@ -1,0 +1,22 @@
+version: '3.8'
+
+# 网易云音乐 API 服务
+# NeteaseCloudMusicApi: https://github.com/Binaryify/NeteaseCloudMusicApi
+# Docker 镜像: binaryify/netease_cloud_music_api
+# 端口: 3000
+
+services:
+  netease-api:
+    image: binaryify/netease_cloud_music_api
+    container_name: netease-api
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    # 清除代理环境变量（避免 Docker 中代理导致的请求失败）
+    environment:
+      - http_proxy=
+      - https_proxy=
+      - no_proxy=
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - NO_PROXY=

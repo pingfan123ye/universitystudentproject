@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 
 interface WakeWordEnrollmentProps {
   wakeWord: string;
@@ -11,6 +11,16 @@ export default function WakeWordEnrollment({ wakeWord, onComplete, onCancel }: W
   const [sampleCount, setSampleCount] = useState(0);
   const [error, setError] = useState('');
   const sessionRef = useRef<any>(null);
+
+  // ★ 组件卸载时清理 EnrollmentSession，释放麦克风
+  useEffect(() => {
+    return () => {
+      if (sessionRef.current) {
+        console.log('[注册] 组件卸载，释放 EnrollmentSession');
+        sessionRef.current = null;
+      }
+    };
+  }, []);
 
   const TOTAL_SAMPLES = 3;
 
@@ -34,14 +44,22 @@ export default function WakeWordEnrollment({ wakeWord, onComplete, onCancel }: W
         const ref = await sessionRef.current.generateRef();
 
         const { Storage } = await import('mellon');
-        Storage.saveWord(ref, 'mellon-xiaoai-refs');
+        Storage.saveWord(ref, 'mellon-xiaozhi-refs');
 
         setStep('done');
         setTimeout(() => onComplete(), 800);
       }
     } catch (err: any) {
       console.error('[注册] 录制失败:', err);
-      setError(err.message || '录制失败，请重试');
+      const msg = err.message || '录制失败，请重试';
+      // ★ 识别 CDN/网络错误，给用户更明确的提示
+      if (msg.includes('fetch') || msg.includes('Network') || msg.includes('Failed to')) {
+        setError('网络连接失败，Mellon 模型下载可能被阻断（jsdelivr/huggingface CDN）。请检查网络或使用代理后重试。');
+      } else if (msg.includes('microphone') || msg.includes('permission') || msg.includes('NotAllowed')) {
+        setError('麦克风权限被拒绝，请在浏览器设置中允许麦克风访问后重试。');
+      } else {
+        setError(msg);
+      }
       setStep('error');
     }
   }, [wakeWord, onComplete]);

@@ -1,6 +1,6 @@
 """
-音乐服务 —— 本地歌单 + Jamendo + Pixabay + 网易云（元数据参考）
-Jamendo 提供 60万+ CC 授权独立音乐，有真实可播放 MP3 URL。
+音乐服务 —— 本地歌单 + 网易云(NeteaseCloudMusicApi) + Jamendo + Pixabay
+网易云通过本地 Docker NeteaseCloudMusicApi 提供真实可播放 MP3 URL。
 """
 import asyncio
 import logging
@@ -94,6 +94,43 @@ async def _search_jamendo(keyword: str, limit: int = 5) -> list[dict]:
         return []
 
 
+async def _search_netease(keyword: str, limit: int = 10) -> list[dict]:
+    """
+    网易云音乐搜索（通过本地 Docker NeteaseCloudMusicApi）。
+    返回标准化 SongInfo 列表，失败时返回空列表（不抛异常）。
+    """
+    if not keyword or not keyword.strip():
+        return []
+
+    try:
+        from services.netease_cloud_api import get_netease_api
+        api = get_netease_api()
+        if not await api.check_available():
+            logger.info("网易云 API 不可用，跳过")
+            return []
+        return await api.search_songs(keyword, limit)
+    except ImportError:
+        logger.warning("netease_cloud_api 模块未加载")
+        return []
+    except Exception as e:
+        logger.warning(f"网易云搜索异常: {keyword} - {e}")
+        return []
+
+
+async def get_netease_play_url(song_id: str) -> str:
+    """获取网易云歌曲的可播放 URL（实时获取，不缓存）"""
+    try:
+        from services.netease_cloud_api import get_netease_api
+        api = get_netease_api()
+        if not await api.check_available():
+            return ""
+        info = await api.get_play_url(song_id)
+        return info.get("url", "")
+    except Exception as e:
+        logger.warning(f"获取网易云播放 URL 失败: {song_id} - {e}")
+        return ""
+
+
 async def search_songs(keyword: str, sources: list[str] | None = None) -> list[dict]:
     """
     搜索歌曲。优先级：本地歌单 → 在线元数据搜索。
@@ -133,12 +170,26 @@ async def search_songs(keyword: str, sources: list[str] | None = None) -> list[d
             "local": True,
         }]
 
-    # 2. Jamendo（CC 授权，有真实可播放 MP3 URL）
+    # 2. 🆕 网易云音乐（主力在线源，支持中文流行歌曲）
+    netease_songs = await _search_netease(keyword)
+    if netease_songs:
+        # 为第一首歌获取可播放 URL
+        first = netease_songs[0]
+        raw_id = first["song_id"].replace("netease_", "")
+        play_url = await get_netease_play_url(raw_id)
+        if play_url:
+            first["download_url"] = play_url
+            logger.info(f"网易云命中（可播放）: {first['song_name']} - {first['singers']}")
+            return netease_songs
+        else:
+            logger.info(f"网易云搜到但无播放链接: {first['song_name']} - {first['singers']}，回退下一级")
+
+    # 3. Jamendo（CC 授权，有真实可播放 MP3 URL）
     jamendo_songs = await _search_jamendo(keyword)
     if jamendo_songs:
         return jamendo_songs
 
-    # 3. 在线搜索（仅搜索元数据，无 playable URL）
+    # 4. 在线搜索（网易云 163 元数据，仅作参考）
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -221,6 +272,12 @@ class MusicService:
 
     async def search_songs(self, keyword: str, sources: list[str] | None = None) -> list[dict]:
         return await search_songs(keyword, sources)
+
+    async def search_netease(self, keyword: str, limit: int = 10) -> list[dict]:
+        return await _search_netease(keyword, limit)
+
+    async def get_netease_play_url(self, song_id: str) -> str:
+        return await get_netease_play_url(song_id)
 
     async def get_play_url(self, song_id: str, source: str, download_url: str = "", ext: str = "mp3") -> dict:
         return await get_play_url(song_id, source, download_url, ext)

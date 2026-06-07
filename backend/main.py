@@ -13,6 +13,19 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 
+# ── 加载 .env 环境变量（不依赖 python-dotenv） ──
+_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.isfile(_ENV_FILE):
+    with open(_ENV_FILE, "r", encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _key, _, _val = _line.partition("=")
+            _key, _val = _key.strip(), _val.strip()
+            if _key and _key not in os.environ:
+                os.environ[_key] = _val
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
@@ -259,19 +272,57 @@ def _mood_to_english(query: str) -> str:
     return ""
 
 
+async def _batch_fetch_netease_urls(songs: list[dict], count: int = 5) -> list[dict]:
+    """为网易云搜索结果中的前 N 首歌并发获取可播放 URL。
+    只修改有 download_url 为空的歌曲，已有 URL 的跳过。"""
+    from services.netease_cloud_api import get_netease_api
+
+    api = get_netease_api()
+    if not await api.check_available():
+        return songs
+
+    targets = []
+    for s in songs:
+        raw_id = s.get("song_id", "").replace("netease_", "")
+        if raw_id and s.get("source") == "netease" and not s.get("download_url"):
+            targets.append((s, raw_id))
+        if len(targets) >= count:
+            break
+
+    if not targets:
+        return songs
+
+    # 并发获取 URL
+    async def _fetch(song, raw_id):
+        try:
+            info = await api.get_play_url(raw_id)
+            if info.get("url"):
+                song["download_url"] = info["url"]
+        except Exception:
+            pass
+
+    await asyncio.gather(*[_fetch(s, rid) for s, rid in targets])
+    fetched = sum(1 for s, _ in targets if s.get("download_url"))
+    if fetched:
+        logger.info(f"网易云批量获取 URL: {fetched}/{len(targets)} 首")
+    return songs
+
+
 async def _announce_and_play(ws, song: dict, queue_songs: list[dict] | None = None):
     """发送播放指令 + TTS 语音播报歌名。
-    当 queue_songs 提供时，将其打包为完整队列发给前端（当前歌曲排第一，其余随机），
-    这样前端有完整队列，切歌/上一首可以直接在队列中推进。"""
+    当 queue_songs 提供时，将其打包为完整队列发给前端（当前歌曲排第一，其余随机）。
+    队列中只保留有 download_url 的歌曲，确保前端切歌不会落到空 URL。"""
     name = song.get("song_name", "")
     singer = song.get("singers", "")
 
     # 构建歌曲队列（当前歌曲 + 其余歌曲随机排列）
     if queue_songs:
         import random as _random
-        # 用 song_id 去重，当前歌曲排第一，其余随机打乱
         current_id = song.get("song_id", "")
-        others = [s for s in queue_songs if s.get("song_id") != current_id]
+        # 只保留有有效 download_url 的歌曲（local 和已有 URL 的 netease）
+        others = [s for s in queue_songs
+                  if s.get("song_id") != current_id
+                  and (s.get("download_url") or s.get("source") == "local")]
         _random.shuffle(others)
         songs_payload = [song] + others
     else:
@@ -319,6 +370,7 @@ _MUSIC_REQUEST_PATTERNS = [
     # 播放类
     "播放", "放歌", "放音乐", "放点音乐", "放点歌", "放首歌", "放个歌", "放一首", "放个音乐",
     "来首歌", "来点音乐", "来点歌", "来首", "来一首", "来一曲", "来一段音乐",
+    "听",  # "听周杰伦的稻香" / "听听歌" — 中文最自然的音乐请求动词
     "听歌", "听音乐", "听首", "想听歌", "想听音乐", "想听",
     "播歌", "播音乐", "播点音乐", "播点歌", "播一首",
     "点歌", "点一首", "点首",
@@ -339,6 +391,11 @@ _MUSIC_REQUEST_PATTERNS = [
     "歌单", "收藏", "轻音乐",
 ]
 
+# "听"字的非音乐短语排除（听不懂、听不清、听说…）
+_MUSIC_TING_EXCLUSIONS = (
+    "听不懂", "听不清", "听不到", "听不见", "听说", "听起来",
+)
+
 
 def _user_requested_music(user_prompt: str) -> bool:
     """检查用户原文是否包含音乐播放/控制请求。
@@ -348,6 +405,11 @@ def _user_requested_music(user_prompt: str) -> bool:
         return False
     for kw in _MUSIC_REQUEST_PATTERNS:
         if kw in user_prompt:
+            # "听" 特判：排除非音乐短语（听不懂、听不清、听说…）
+            if kw == "听":
+                for excl in _MUSIC_TING_EXCLUSIONS:
+                    if excl in user_prompt:
+                        return False
             return True
     return False
 
@@ -572,7 +634,7 @@ async def _send_music_control(ws, music_action: dict):
             })
             return
 
-        # ── 四级搜索流水线 ──
+        # ── 五级搜索流水线（本地 → 网易云 → Jamendo → Pixabay → 163元数据） ──
         # 1. 本地歌单搜索（含 difflib 模糊匹配）
         local_hit = search_local(clean_query) if clean_query else None
         if local_hit:
@@ -581,7 +643,25 @@ async def _send_music_control(ws, music_action: dict):
             logger.info(f"本地命中: {local_hit['song_name']} - {local_hit['artist']} (队列 {len(all_local)} 首)")
             return
 
-        # 2. Jamendo API（CC 授权独立音乐，有真实可播放 MP3 URL）
+        # 2. 🆕 网易云音乐（主力在线源，支持中文流行歌曲播放）
+        from services.netease_cloud_api import get_netease_api
+        netease_api = get_netease_api()
+        if await netease_api.check_available():
+            netease_songs = await netease_api.search_songs(clean_query)
+            if netease_songs:
+                # 批量获取前 5 首的播放 URL（并发），确保队列可连续播放
+                netease_songs = await _batch_fetch_netease_urls(netease_songs, count=5)
+                first = netease_songs[0]
+                if first.get("download_url"):
+                    await _announce_and_play(ws, first, netease_songs)
+                    logger.info(f"网易云命中: {first['song_name']} - {first['singers']} (队列 {len(netease_songs)} 首)")
+                    return
+                else:
+                    logger.info(f"网易云搜到但无播放链接: {first['song_name']} - {first['singers']}，回退下一级")
+        else:
+            logger.info("网易云 API 不可用，跳过")
+
+        # 3. Jamendo API（CC 授权独立音乐，有真实可播放 MP3 URL）
         jamendo_songs = await _search_jamendo(clean_query)
         if jamendo_songs:
             first = jamendo_songs[0]
@@ -590,7 +670,7 @@ async def _send_music_control(ws, music_action: dict):
                 logger.info(f"Jamendo 命中: {first.get('song_name', '')} - {first.get('singers', '')}")
                 return
 
-        # 2a. 轻音乐/纯音乐/学习 mood 搜索 → Jamendo 用英文标签（中文曲库少）
+        # 3a. 轻音乐/纯音乐/学习 mood 搜索 → Jamendo 用英文标签（中文曲库少）
         eng_tags = _mood_to_english(clean_query)
         if eng_tags:
             logger.info(f"Mood 搜索: '{clean_query}' → Jamendo English tags: '{eng_tags}'")
@@ -602,7 +682,7 @@ async def _send_music_control(ws, music_action: dict):
                     logger.info(f"Jamendo mood 命中: {first.get('song_name', '')} - {first.get('singers', '')}")
                     return
 
-        # 3. Pixabay Music（免费可商用，有真实 MP3 URL）
+        # 4. Pixabay Music（免费可商用，有真实 MP3 URL）
         from services.pixabay_music import search_pixabay_music
         pixabay_songs = await search_pixabay_music(clean_query)
         if pixabay_songs:
@@ -612,7 +692,7 @@ async def _send_music_control(ws, music_action: dict):
                 logger.info(f"Pixabay 命中: {first.get('song_name', '')}")
                 return
 
-        # 4. 163 在线搜索（仅元数据，预览 URL 不可靠，仅作参考）
+        # 5. 163 在线搜索（仅元数据，无可靠播放 URL，仅作最后参考）
         ms = MusicService()
         songs = await ms.search_songs(clean_query)
         if songs:
@@ -624,7 +704,7 @@ async def _send_music_control(ws, music_action: dict):
                 return
             logger.info(f"163 结果无播放链接: {first.get('song_name', '')}")
 
-        # ── 5. 版权拦截：中文 query + 所有源都未命中 → 告知用户 ──
+        # ── 6. 版权拦截：中文 query + 所有源都未命中 → 告知用户 ──
         if _is_chinese_query(clean_query):
             # 如果是轻音乐/纯音乐/学习 mood 请求，放默认纯音乐代替报错
             if _mood_to_english(clean_query):
@@ -666,7 +746,7 @@ async def _send_music_control(ws, music_action: dict):
             })
 
     elif action == "play" and not query:
-        # 随机播放：优先本地歌单随机选一首 → Pixabay 随机 → 报错
+        # 随机播放：优先本地歌单 → 🆕网易云热门推荐 → Pixabay → 报错
         all_local = get_all_songs()
         if all_local:
             import random as _random
@@ -674,7 +754,21 @@ async def _send_music_control(ws, music_action: dict):
             await _announce_and_play(ws, _build_local_song(picked), [_build_local_song(s) for s in all_local])
             logger.info(f"随机播放本地: {picked['song_name']} - {picked['artist']}")
         else:
-            # 本地歌单为空，尝试 Pixabay 随机抓取
+            # 本地歌单为空，尝试网易云热门歌曲推荐
+            from services.netease_cloud_api import get_netease_api
+            netease_api = get_netease_api()
+            if await netease_api.check_available():
+                netease_songs = await netease_api.search_songs("热门歌曲", limit=10)
+                if netease_songs:
+                    netease_songs = await _batch_fetch_netease_urls(netease_songs, count=5)
+                    first = netease_songs[0]
+                    if first.get("download_url"):
+                        await _announce_and_play(ws, first, netease_songs)
+                        logger.info(f"随机播放网易云: {first['song_name']} - {first['singers']}")
+                        return
+                    else:
+                        logger.info("网易云随机播放无可用 URL，继续回退")
+            # 网易云不可用或无结果 → Pixabay 随机抓取
             from services.pixabay_music import search_pixabay_music
             pixabay_songs = await search_pixabay_music("relaxing music")
             if pixabay_songs:
@@ -683,7 +777,7 @@ async def _send_music_control(ws, music_action: dict):
                     await _announce_and_play(ws, first, pixabay_songs)
                     logger.info(f"随机播放 Pixabay: {first.get('song_name', '')}")
                     return
-            logger.info("随机播放失败：本地和 Pixabay 都无歌曲")
+            logger.info("随机播放失败：所有源都无可用歌曲")
             await ws.send_json({
                 "type": "chat_error",
                 "message": "本地歌单为空，在线曲库也未找到歌曲，请先添加音乐文件",
@@ -1392,6 +1486,28 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "cet6_close":
                 _cet6_sessions.pop(id(ws), None)
                 logger.info("CET-6 会话已清除")
+                continue
+
+            # ===== 🆕 网易云按需获取播放 URL（前端切歌时实时请求） =====
+            if msg_type == "get_netease_url":
+                song_id = data.get("song_id", "")
+                if song_id:
+                    from services.netease_cloud_api import get_netease_api
+                    api = get_netease_api()
+                    if await api.check_available():
+                        info = await api.get_play_url(song_id)
+                        url = info.get("url", "")
+                        await ws.send_json({
+                            "type": "netease_song_url",
+                            "song_id": song_id,
+                            "url": url,
+                        })
+                    else:
+                        await ws.send_json({
+                            "type": "netease_song_url",
+                            "song_id": song_id,
+                            "url": "",
+                        })
                 continue
 
             # ===== B-3: 完整音频一次转写 =====

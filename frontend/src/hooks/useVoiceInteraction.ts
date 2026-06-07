@@ -30,19 +30,22 @@ export interface VoiceInteractionActions {
 }
 
 // ── 常量 ──
-const STORAGE_KEY = 'mellon-xiaoai-refs';
-const MAX_RECORD_SECONDS = 30;        // 最长录音秒数
-const MIN_RECORDING_BEFORE_AUTO_STOP_MS = 4000;  // 前4秒不触发自动停止
-const WAKE_CONFIDENCE_THRESHOLD = 0.7;   // 唤醒词最低置信度（防止误唤醒）
+const STORAGE_KEY = 'mellon-xiaozhi-refs';
+const MAX_RECORD_SECONDS = 15;        // 最长录音秒数
+const WAKE_CONFIDENCE_THRESHOLD = 0.55;  // 唤醒词最低置信度（用户声纹 sim≈0.66~0.68，留 0.1 余量防误触发）
 const WAKE_COOLDOWN_MS = 2000;           // 两次唤醒最小间隔（防止连触发）
 
 // AnalyserNode 自适应静音检测参数
+// autoGainControl=true 时 AGC 会放大静音底噪、压低语音增益，导致语音/底噪对比度大幅降低。
+// 因此使用双阈值滞后（hysteresis）：语音触发阈值较低，静音判定阈值更低。
 const LEVEL_CHECK_INTERVAL_MS = 250;    // 电平检测间隔
-const NOISE_WINDOW_SAMPLES = 12;        // 噪声基线窗口 = 12 × 250ms = 3 秒
-const SPEECH_RATIO = 3.0;               // 语音阈值 = 噪声基线 × 3
-const SPEECH_THRESHOLD_MIN = 0.03;      // 语音阈值最低值（安静环境下）
-const MIN_SPEECH_DURATION_MS = 500;     // 最少连续语音时长（避免短噪声触发）
-const SILENCE_TIMEOUT_MS = 2500;        // 连续静音超时 → 自动停止（容忍自然停顿）
+const NOISE_WINDOW_SAMPLES = 16;        // 噪声基线窗口 = 16 × 250ms = 4 秒
+const SPEECH_RATIO = 2.5;               // 语音触发：RMS > 噪声基线 × 2.5（AGC 下约 1.5~3 倍）
+const SPEECH_THRESHOLD_MIN = 0.004;     // 语音触发最低绝对值（用户语音 RMS ~0.005）
+const SILENCE_RATIO = 1.8;              // 静音判定：RMS < 噪声基线 × 1.8（滞后，避免 AGC 底噪阻止静音检测）
+const SILENCE_THRESHOLD_MIN = 0.002;    // 静音判定最低绝对值（与语音阈值保持比例）
+const MIN_SPEECH_DURATION_MS = 400;     // 最少连续语音时长
+const SILENCE_TIMEOUT_MS = 2000;        // 连续静音超时 → 自动停止
 
 // ── WebM → WAV/PCM 16kHz base64 ──
 // reuseCtx: 可选，复用已有的 AudioContext 进行解码，避免创建过多实例
@@ -116,6 +119,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
   const recChunksRef = useRef<Blob[]>([]);
   const recStreamRef = useRef<MediaStream | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);  // Mellon 心跳监控
   const audioCtxRef = useRef<AudioContext | null>(null);
   const levelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const enabledRef = useRef(false);
@@ -152,13 +156,20 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
     setAudioLevel(0);
   }, []);
 
-  // ── 页面隐藏/切换标签时自动暂停 ──
+  // ── 页面隐藏/切换标签时自动暂停/恢复 ──
   useEffect(() => {
     const onVisibility = () => {
       if (document.hidden && detectorRef.current?.listening) {
         detectorRef.current.stop().catch(() => { });
-      } else if (!document.hidden && enabledRef.current && phaseRef.current === 'waiting_for_wake') {
-        detectorRef.current?.start().catch(() => { });
+      } else if (!document.hidden && enabledRef.current) {
+        // 切回页面时，只要非录音中/空闲，都尝试重启 Mellon
+        const ph = phaseRef.current;
+        if (ph !== 'recording' && ph !== 'idle') {
+          detectorRef.current?.start().catch(() => { });
+          if (ph !== 'waiting_for_wake') {
+            setPhase('waiting_for_wake');
+          }
+        }
       }
     };
     document.addEventListener('visibilitychange', onVisibility);
@@ -184,9 +195,9 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: false,
+          echoCancellation: false,   // ★ 关闭 AEC：录音流上 AEC 过度衰减人声(峰值/9)，导致 STT 音频不可用
           noiseSuppression: true,
-          autoGainControl: false,
+          autoGainControl: true,    // 唤醒词 Mellon 和 STT 都需要足够信号
         },
       });
       recStreamRef.current = stream;
@@ -198,25 +209,29 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
       audioCtxRef.current = audioCtx;
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
+      analyser.fftSize = 1024;  // 21ms 窗口（48kHz），RMS 更稳定
       analyser.smoothingTimeConstant = 0.3;
       source.connect(analyser);
       // 不 connect 到 destination — 避免回声
-      const timeData = new Uint8Array(analyser.fftSize);
+      const timeData = new Float32Array(analyser.fftSize);  // ★ 32-bit 浮点精度，低振幅准确
 
-      // ── 自适应噪声基线 + 静音检测状态机 ──
+      // ── 自适应噪声基线 + 双阈值滞后静音检测 ──
+      // 关键：AGC 环境下语音/底噪比仅 1.5~3 倍，单阈值无法同时满足"灵敏触发"和"准确静音"
+      // 方案：语音触发用较高阈值（SPEECH_RATIO），静音判定用较低阈值（SILENCE_RATIO）
       const noiseWindow: number[] = [];       // 滑动窗口 RMS 历史
       let speechDuration = 0;                 // 连续语音累计
       let silenceDuration = 0;                // 连续静音累计
       let hasSpeech = false;                  // 是否已确认检测到语音
+      let sampleCount = 0;                    // ★ 诊断：采样计数
+      const LOG_SAMPLES = 20;                 // ★ 诊断：前 20 次采样详细日志
 
       levelTimerRef.current = setInterval(() => {
-        analyser.getByteTimeDomainData(timeData);
+        sampleCount++;
+        analyser.getFloatTimeDomainData(timeData);  // ★ 32-bit 浮点：值已在 [-1,1]，无需归一化
         // 计算 RMS
         let sum = 0;
         for (let i = 0; i < timeData.length; i++) {
-          const normalized = (timeData[i] - 128) / 128;
-          sum += normalized * normalized;
+          sum += timeData[i] * timeData[i];
         }
         const rms = Math.sqrt(sum / timeData.length);
 
@@ -224,41 +239,62 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         noiseWindow.push(rms);
         if (noiseWindow.length > NOISE_WINDOW_SAMPLES) noiseWindow.shift();
 
-        // 自适应语音阈值：max(噪声基线 × 3, 最低 0.03)
+        // 噪声基线 = 窗口内最小值（稳定环境 3 秒找底噪）
         const noiseFloor = noiseWindow.length > 0
           ? noiseWindow.reduce((a, b) => Math.min(a, b), Infinity)
           : 0.01;
-        const speechThreshold = Math.max(noiseFloor * SPEECH_RATIO, SPEECH_THRESHOLD_MIN);
 
-        // 更新 UI 电平条（rms 映射到 0-1）
+        // ★ 双阈值：语音触发阈值 > 静音判定阈值（滞后）
+        const speechThreshold = Math.max(noiseFloor * SPEECH_RATIO, SPEECH_THRESHOLD_MIN);
+        const silenceThreshold = Math.max(noiseFloor * SILENCE_RATIO, SILENCE_THRESHOLD_MIN);
+
+        // 更新 UI 电平条
         setAudioLevel(Math.min(rms / 0.2, 1));
 
-        // 状态机：语音检测 + 静音计时
-        if (rms > speechThreshold) {
-          speechDuration += LEVEL_CHECK_INTERVAL_MS;
-          silenceDuration = 0;
-          if (speechDuration >= MIN_SPEECH_DURATION_MS) {
-            hasSpeech = true;
-          }
-        } else {
-          speechDuration = 0;
-          if (hasSpeech) {
-            silenceDuration += LEVEL_CHECK_INTERVAL_MS;
-          }
+        // ★ 诊断日志：前 N 次采样详细输出，便于调参
+        if (sampleCount <= LOG_SAMPLES) {
+          console.log(
+            `[静音检测 #${sampleCount}] rms=${rms.toFixed(5)} ` +
+            `noiseFloor=${noiseFloor.toFixed(5)} ` +
+            `speechThr=${speechThreshold.toFixed(5)} ` +
+            `silenceThr=${silenceThreshold.toFixed(5)} ` +
+            `hasSpeech=${hasSpeech} speechDur=${speechDuration}ms silenceDur=${silenceDuration}ms`
+          );
         }
 
-        // 确认语音后，连续静音超 2.5 秒 + 录音超过 4 秒最小保护时间 → 自动停止
-        if (hasSpeech && silenceDuration >= SILENCE_TIMEOUT_MS) {
-          const recordingElapsed = Date.now() - startTime;
-          if (recordingElapsed < MIN_RECORDING_BEFORE_AUTO_STOP_MS) {
-            // 仍在最小录音保护时间内，不触发自动停止
-            return;
+        // ★ 滞后状态机
+        if (!hasSpeech) {
+          // 状态 A：等待语音触发 → 使用较高阈值
+          if (rms > speechThreshold) {
+            speechDuration += LEVEL_CHECK_INTERVAL_MS;
+            silenceDuration = 0;
+            if (speechDuration >= MIN_SPEECH_DURATION_MS) {
+              hasSpeech = true;
+              silenceDuration = 0;
+              console.log(`[静音检测] ✅ 语音确认 (rms=${rms.toFixed(5)} > speechThr=${speechThreshold.toFixed(5)}, 累计${speechDuration}ms)`);
+            }
+          } else {
+            speechDuration = Math.max(0, speechDuration - LEVEL_CHECK_INTERVAL_MS);  // 逐渐衰减，容忍短暂波动
           }
-          const r = recRef.current;
-          if (r && r.state === 'recording') {
-            console.log(`[静音检测] noiseFloor=${noiseFloor.toFixed(4)} thr=${speechThreshold.toFixed(4)} rms=${rms.toFixed(4)} silence=${silenceDuration}ms → 自动停止`);
-            autoStoppedRef.current = true;
-            r.stop();  // → 触发下方的 rec.onstop
+        } else {
+          // 状态 B：已确认语音 → 使用较低阈值检测静音
+          if (rms < silenceThreshold) {
+            silenceDuration += LEVEL_CHECK_INTERVAL_MS;
+            if (silenceDuration >= SILENCE_TIMEOUT_MS) {
+              const r = recRef.current;
+              if (r && r.state === 'recording') {
+                console.log(
+                  `[静音检测] 🛑 自动停止 ` +
+                  `rms=${rms.toFixed(5)} < silenceThr=${silenceThreshold.toFixed(5)} ` +
+                  `noiseFloor=${noiseFloor.toFixed(5)} silence=${silenceDuration}ms`
+                );
+                autoStoppedRef.current = true;
+                r.stop();
+              }
+            }
+          } else {
+            // 还有语音 → 重置静音计时
+            silenceDuration = 0;
           }
         }
       }, LEVEL_CHECK_INTERVAL_MS);
@@ -354,18 +390,8 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         onAudioFinal();
 
         // 7. 立即恢复唤醒词监听（不等 TTS 播完）
-        // 录音结束就重启 Mellon，这样用户在 AI 语音播报期间也能用唤醒词打断
         if (enabledRef.current) {
-          try {
-            if (detectorRef.current && !detectorRef.current.listening) {
-              await detectorRef.current.start();
-              setPhase('waiting_for_wake');
-              console.log('[唤醒词] 录音结束，已恢复监听（不等 TTS）');
-            }
-          } catch (err: any) {
-            console.error('[唤醒词] 恢复监听失败:', err);
-            // 静默失败，不影响录音流程
-          }
+          await restartDetector();
         }
       };
 
@@ -376,16 +402,9 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
     } catch (err: any) {
       console.error('[录音] startRecording 失败:', err.message);
       setError(err.message || '麦克风访问失败');
-      // 恢复 Mellon 唤醒词监听：startRecording 前已停止 Mellon，失败必须重启
-      if (enabledRef.current && detectorRef.current && !detectorRef.current.listening) {
-        try {
-          await detectorRef.current.start();
-          setPhase('waiting_for_wake');
-          console.log('[唤醒词] startRecording 失败，已恢复监听');
-        } catch (e: any) {
-          console.error('[唤醒词] 恢复监听也失败:', e.message);
-          setPhase('idle');
-        }
+      // ★ 恢复唤醒词监听（startRecording 前已停止 Mellon）
+      if (enabledRef.current) {
+        restartDetector();
       } else {
         setPhase('idle');
       }
@@ -435,77 +454,173 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
   // Mellon 唤醒词逻辑
   // ═══════════════════════════════════════
 
+  /**
+   * 简单唤醒词恢复：先尝试 detector.start()，失败则重建
+   * 普通 async 函数，不是 useCallback，通过闭包访问 initMellon
+   */
+  const restartDetector = async () => {
+    if (!enabledRef.current) return;
+    try {
+      if (detectorRef.current && !detectorRef.current.listening) {
+        await detectorRef.current.start();
+        console.log('[唤醒词] 恢复监听完成, listening=' + detectorRef.current.listening);
+      } else if (!detectorRef.current) {
+        console.warn('[唤醒词] 检测器为空，重新初始化');
+        await initMellon();
+      }
+      if (detectorRef.current?.listening) {
+        setPhase('waiting_for_wake');
+      }
+    } catch (err: any) {
+      console.error('[唤醒词] 恢复监听失败:', err.message);
+      // 重试一次
+      try {
+        console.warn('[唤醒词] 重试初始化...');
+        await initMellon();
+      } catch (e2: any) {
+        console.error('[唤醒词] 重试也失败:', e2.message);
+      }
+    }
+  };
+
   const initMellon = useCallback(async (): Promise<boolean> => {
     try {
+      // ★ 步骤 1：动态导入 mellon 模块
+      console.log('[唤醒词] 📦 步骤1: 动态导入 mellon ...');
       const { Detector, Storage } = await import('mellon');
+      console.log('[唤醒词] ✅ mellon 模块导入成功');
 
-      const savedRefs = Storage.loadWords(STORAGE_KEY);
-      let refs = savedRefs || [];
+      // ★ 步骤 2：加载声纹
+      console.log('[唤醒词] 💾 步骤2: 加载声纹 (key=' + STORAGE_KEY + ') ...');
+      let savedRefs = Storage.loadWords(STORAGE_KEY);
+      let refs: any[] = savedRefs || [];
+
+      // 从旧键迁移
+      if (refs.length === 0) {
+        const oldRefs = Storage.loadWords('mellon-xiaoai-refs');
+        if (oldRefs && oldRefs.length > 0) {
+          console.log('[唤醒词] 从旧键迁移 %d 条声纹', oldRefs.length);
+          for (const r of oldRefs) {
+            try { Storage.saveWord(r, STORAGE_KEY); } catch { }
+          }
+          refs = Storage.loadWords(STORAGE_KEY) || [];
+        }
+      }
+
+      // ★ 打印每条声纹详情
+      console.log('[唤醒词] 声纹总数: %d', refs.length);
+      refs.forEach((r: any, i: number) => {
+        console.log(`[唤醒词]   声纹#${i+1}: word_name="${r.word_name}" embeddings=${r.embeddings?.length || 0}组`);
+      });
 
       if (refs.length === 0) {
+        console.warn('[唤醒词] ⚠️ 无声纹，需要先注册');
         setIsEnrolled(false);
         return false;
       }
 
       setIsEnrolled(true);
+      console.log('[唤醒词] ✅ 声纹加载成功');
 
+      // ★ 步骤 3：创建 Detector
+      console.log('[唤醒词] 🔧 步骤3: 创建 Detector, trigger="%s"', wakeWord);
       const detector = new Detector(
         [{
-          name: 'xiaoai',
+          name: 'xiaozhi',
           triggers: [{ name: wakeWord }],
           onMatch: async (triggerName: string, confidence: number) => {
-            console.log(`[唤醒词] 检测到 "${triggerName}" 置信度=${confidence.toFixed(2)}`);
+            console.log(`[唤醒词] 🎯🎯🎯 onMatch 触发! trigger="${triggerName}" confidence=${confidence.toFixed(3)}`);
 
-            // 置信度过滤：低于阈值视为噪声/误触发（如 TTS 回声）
             if (confidence < WAKE_CONFIDENCE_THRESHOLD) {
-              console.log(`[唤醒词] 置信度过低 (${confidence.toFixed(2)} < ${WAKE_CONFIDENCE_THRESHOLD})，忽略`);
+              console.log(`[唤醒词] 置信度过低 (${confidence.toFixed(3)} < ${WAKE_CONFIDENCE_THRESHOLD})，忽略`);
               return;
             }
 
-            // 冷却检查：防止短时间内连触发
             const now = Date.now();
             if (now - lastWakeTimeRef.current < WAKE_COOLDOWN_MS) {
-              console.log(`[唤醒词] 冷却中 (距上次 ${now - lastWakeTimeRef.current}ms < ${WAKE_COOLDOWN_MS}ms)，忽略`);
+              console.log(`[唤醒词] 冷却中 (${now - lastWakeTimeRef.current}ms)，忽略`);
               return;
             }
             lastWakeTimeRef.current = now;
+            console.log('[唤醒词] ✅✅✅ 唤醒词确认! 置信度=' + confidence.toFixed(3));
 
             if (detectorRef.current?.listening) {
               await detectorRef.current.stop();
             }
             onWakeDetected();
             setPhase('wake_detected');
-            // 延时 600ms 确保扬声器 TTS/音乐残响完全消散后再开始录音
-            // 300ms 不够：扬声器音频尾巴会被麦克风捕获，导致 STT 识别为噪声
             setTimeout(async () => {
               if (enabledRef.current) {
                 const ok = await startRecording();
-                if (ok) {
-                  console.log('[唤醒词] 自动开始录音');
-                }
+                if (ok) console.log('[唤醒词] 自动开始录音');
               }
             }, 600);
           },
         }],
         {
           refsStorageKey: STORAGE_KEY,
-          log: false,
+          log: true,
         }
       );
 
       detectorRef.current = detector;
+      console.log('[唤醒词] ✅ Detector 创建完成');
+
+      // ★ 步骤 4：加载模型 + 初始化
+      console.log('[唤醒词] 🧠 步骤4: detector.init() — 加载 ONNX 模型、WASM、声纹嵌入...');
+      const t0 = Date.now();
       await detector.init();
+      console.log('[唤醒词] ✅ detector.init() 完成 (%dms)', Date.now() - t0);
+
+      // ★ 步骤 5：启动麦克风监听
+      console.log('[唤醒词] 🎤 步骤5: detector.start() — 启动麦克风监听...');
+      const t1 = Date.now();
       await detector.start();
+      console.log('[唤醒词] ✅ detector.start() 完成 (%dms), listening=%s', Date.now() - t1, detector.listening);
+
+      if (!detector.listening) {
+        console.error('[唤醒词] ⚠️⚠️⚠️ detector.start() 返回但 listening=false！重新尝试...');
+        // 多等一会，有时后台初始化较慢
+        await new Promise(r => setTimeout(r, 1000));
+        if (!detector.listening) {
+          console.error('[唤醒词] ⚠️⚠️⚠️ 1s后仍 listening=false，尝试 restart...');
+          await detector.start();
+          console.log('[唤醒词] restart 后 listening=%s', detector.listening);
+        }
+      }
+
       setPhase('waiting_for_wake');
-      console.log('[唤醒词] Mellon 已启动，等待唤醒词:', wakeWord);
+      console.log('[唤醒词] 🟢🟢🟢 Mellon 已就绪，等待唤醒词 "%s" (listening=%s)', wakeWord, detector.listening);
       return true;
     } catch (err: any) {
-      console.error('[唤醒词] Mellon 初始化失败:', err);
-      setError(`唤醒引擎加载失败: ${err.message}`);
+      console.error('[唤醒词] ❌❌❌ 初始化异常:', err.message, err.stack);
+      const msg = err.message || '唤醒引擎加载失败';
+      if (msg.includes('fetch') || msg.includes('Network') || msg.includes('Failed to')) {
+        setError('唤醒引擎网络加载失败，CDN 可能被阻断');
+      } else if (msg.includes('microphone') || msg.includes('permission') || msg.includes('NotAllowed')) {
+        setError('麦克风权限被拒绝');
+      } else {
+        setError(`唤醒引擎加载失败: ${msg}`);
+      }
       setPhase('idle');
       return false;
     }
   }, [wakeWord, onWakeDetected, startRecording]);
+
+  // ── Mellon 心跳监控：每 8 秒检查，静默死亡自动恢复 ──
+  useEffect(() => {
+    heartbeatRef.current = setInterval(() => {
+      if (!enabledRef.current) return;
+      if (phaseRef.current !== 'waiting_for_wake') return;
+      if (!detectorRef.current || !detectorRef.current.listening) {
+        console.warn('[唤醒词心跳] listening=%s，触发自愈', detectorRef.current?.listening ?? 'null');
+        restartDetector();
+      }
+    }, 8000);
+    return () => {
+      if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
+    };
+  }, []);
 
   // ═══════════════════════════════════════
   // 公开操作
@@ -516,13 +631,26 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
     setError('');
     setPhase('initializing');
 
-    const ok = await initMellon();
+    let ok = await initMellon();
     if (!ok) {
       const { Storage } = await import('mellon');
       const savedRefs = Storage.loadWords(STORAGE_KEY);
       if (savedRefs.length === 0) {
+        // 无声纹 → 回到 idle，提示用户注册
         setPhase('idle');
+        return;
       }
+      // ★ 声纹存在但 initMellon 失败（CDN/麦克风），延迟 1.5 秒后重试一次
+      console.warn('[唤醒词] 首次初始化失败（声纹存在），1.5 秒后重试...');
+      setError('唤醒引擎加载中，正在重试...');
+      await new Promise(r => setTimeout(r, 1500));
+      ok = await initMellon();
+    }
+    if (!ok) {
+      // 重试仍失败
+      setPhase('idle');
+      setError('唤醒引擎启动失败，请检查网络后手动重试');
+      console.error('[唤醒词] enable() 重试后仍失败');
     }
   }, [initMellon]);
 
@@ -535,22 +663,11 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
   const resumeWakeListening = useCallback(async () => {
     if (!enabledRef.current) return;
     setPhase('processing');
+    // 清理录音流（如果有残留）
     if (recStreamRef.current) { recStreamRef.current.getTracks().forEach(t => t.stop()); recStreamRef.current = null; }
-    if (detectorRef.current) {
-      try {
-        if (!detectorRef.current.listening) {
-          await detectorRef.current.start();
-        }
-        setPhase('waiting_for_wake');
-        console.log('[唤醒词] 恢复监听');
-      } catch (err: any) {
-        console.error('[唤醒词] 恢复监听失败:', err);
-        await initMellon();
-      }
-    } else {
-      await initMellon();
-    }
-  }, [initMellon, cleanup]);
+    // ★ 统一恢复入口
+    restartDetector();
+  }, []);  // restartDetector 是普通函数，通过闭包访问 initMellon
 
   const startManualRecord = useCallback(async () => {
     const ok = await startRecording();

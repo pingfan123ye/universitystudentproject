@@ -213,6 +213,22 @@ export function useMusicPlayer() {
     if (!audio || index < 0 || index >= q.length) return;
 
     const song = q[index];
+
+    // 网易云歌曲无 URL → 跳过，尝试下一首（后端已预取前5首，这里是安全兜底）
+    if (!song.download_url && song.source === 'netease') {
+      console.warn(`[音乐播放] 网易云歌曲无 URL，跳过: "${song.song_name}"`);
+      if (index < q.length - 1) {
+        setTimeout(() => {
+          const fn = playIndexRef.current;
+          if (fn) fn(index + 1);
+        }, 0);
+      } else {
+        setError('队列中的歌曲暂无播放链接');
+        setPlayerState('idle');
+      }
+      return;
+    }
+
     setCurrentIndex(index);
     setCurrentSong(song);
 
