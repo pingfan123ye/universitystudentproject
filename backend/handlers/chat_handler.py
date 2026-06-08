@@ -15,7 +15,7 @@ _last_gen_started_at: float = 0.0
 
 from services.llm_service import generate_stream, parse_actions, _strip_actions_tags, strip_search_tags
 from services.music_service import send_music_control, _user_requested_music
-from services.cache_engine import get_cache
+from services.cache_engine import get_cache, is_low_quality_reply
 
 
 async def call_llm(
@@ -333,13 +333,16 @@ async def call_llm(
 
         asyncio.create_task(_extract_and_notify())
 
-    # ── 8. 缓存学习（跳过噪音输入，防止虚假唤醒污染缓存）──
+    # ── 8. 缓存学习（跳过噪音输入 + 低质量回复，防止模板/困惑回复污染缓存）──
     if route_path == "llm" and full_reply.strip():
         _is_noise = (
             len(prompt.strip()) < 5
             and not any('一' <= c <= '鿿' for c in prompt)
         )
-        if not _is_noise:
+        _low_quality = is_low_quality_reply(full_reply.strip())
+        if _low_quality:
+            logger.info(f"LLM 计数: 跳过低质量回复缓存: {full_reply.strip()[:50]}...")
+        if not _is_noise and not _low_quality:
             count, reached = cache.increment_and_check(prompt)
             logger.info(f"LLM 计数: {prompt[:30]}... -> {count}/3")
             if reached:
@@ -350,5 +353,5 @@ async def call_llm(
                     "text": prompt[:50],
                     "message": "我记住了这个对话习惯，下次可以直接回答",
                 })
-        else:
+        elif _is_noise:
             logger.info(f"LLM 计数: 跳过噪音输入缓存: {prompt[:30]}...")

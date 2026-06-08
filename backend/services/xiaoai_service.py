@@ -52,20 +52,20 @@ def execute(
         music_part = music_replies.get(action, "好的")
         reply = f"{reply}；{music_part}" if reply else music_part
 
-    # ---- 3. 场景 ----
-    if not handled and any(kw in (matched_key + text) for kw in ["晚安", "离家", "回家", "起床"]):
+    # ---- 3. 场景（仅完整场景名匹配，避免"7点起床"误触发） ----
+    if not handled and any(kw in (matched_key + text) for kw in ["晚安", "离家模式", "回家模式", "起床模式"]):
         scene_map = {
             "晚安": [("bedroom_light", "off"), ("living_light", "off"), ("living_curtain", "close")],
-            "离家": [("bedroom_light", "off"), ("living_light", "off"), ("kitchen_light", "off"),
+            "离家模式": [("bedroom_light", "off"), ("living_light", "off"), ("kitchen_light", "off"),
                      ("ac", "off"), ("water_heater", "off"), ("living_curtain", "close")],
-            "回家": [("living_light", "on"), ("living_curtain", "open"), ("ac", "on")],
-            "起床": [("bedroom_light", "on"), ("living_curtain", "open")],
+            "回家模式": [("living_light", "on"), ("living_curtain", "open"), ("ac", "on")],
+            "起床模式": [("bedroom_light", "on"), ("living_curtain", "open")],
         }
         for sname, actions in scene_map.items():
             if sname in text or sname in matched_key:
                 for device_id, operation in actions:
                     results.append(virtual_home.execute(device_id, operation))
-                reply = f"好的，已启用{sname}模式"
+                reply = f"好的，已启用{sname}"
                 handled = True
                 break
 

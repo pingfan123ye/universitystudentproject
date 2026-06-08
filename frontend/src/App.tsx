@@ -26,6 +26,7 @@ export default function App() {
     cet6SearchResults, sendCet6Download,
     resetConversation,
     alertStatus,
+    engineMode, sendEngineMode,
   } = useWebSocket();
 
   const {
@@ -134,7 +135,8 @@ export default function App() {
   return (
     <div className="flex flex-col h-screen" style={{ background: 'var(--bg-root)', color: 'var(--text-primary)' }}>
       <StatusBar status={status} lastPath={lastPath} alertStatus={alertStatus}
-  alertsEnabled={true} onToggleAlerts={toggleSuppressAlerts} />
+  alertsEnabled={true} onToggleAlerts={toggleSuppressAlerts}
+  engineMode={engineMode} onSetEngineMode={sendEngineMode} />
 
       {/* 桌面：主区域 + 侧栏并排；手机：侧栏作为覆盖层 */}
       <div className="flex flex-1 overflow-hidden relative">

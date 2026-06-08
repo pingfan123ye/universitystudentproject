@@ -1,5 +1,6 @@
 {
   "default_mode": "local_only",
+  "user_mode": "auto",
   "timeout_seconds": 30,
   "force_cloud_keywords": [
     "搜索",

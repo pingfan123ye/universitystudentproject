@@ -17,6 +17,8 @@ interface StatusBarProps {
   alertsEnabled?: boolean;
   onToggleAlerts?: (enabled: boolean) => void;
   alertStatus?: AlertStatusData;
+  engineMode?: 'auto' | 'local' | 'cloud';
+  onSetEngineMode?: (mode: 'auto' | 'local' | 'cloud') => void;
 }
 
 const statusMap: Record<ConnectionStatus, { label: string; cls: string }> = {
@@ -33,7 +35,7 @@ const pathBadge: Record<string, { text: string; cls: string }> = {
   unknown: { text: '--', cls: 'bg-gray-100 text-gray-500' },
 };
 
-export default function StatusBar({ status, modelName = 'qwen3:8b', lastPath = 'unknown', alertsEnabled = true, onToggleAlerts, alertStatus }: StatusBarProps) {
+export default function StatusBar({ status, modelName = 'qwen3:8b', lastPath = 'unknown', alertsEnabled = true, onToggleAlerts, alertStatus, engineMode = 'auto', onSetEngineMode }: StatusBarProps) {
   const s = statusMap[status];
   const p = pathBadge[lastPath] || pathBadge.unknown;
   const { theme, toggle } = useTheme();
@@ -66,6 +68,22 @@ export default function StatusBar({ status, modelName = 'qwen3:8b', lastPath = '
       <span style={{ color: 'var(--border-strong)' }}>|</span>
       <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${alertCls}`}>{alertLabel}</span>
       <div className="flex-1" />
+      {/* ★ 引擎模式切换：auto → cloud → local → auto */}
+      {onSetEngineMode && (
+        <button
+          onClick={() => {
+            const next: Record<string, 'auto' | 'local' | 'cloud'> = { auto: 'cloud', cloud: 'local', local: 'auto' };
+            onSetEngineMode(next[engineMode] || 'auto');
+          }}
+          className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-bold hover:opacity-80 transition-opacity tracking-wide"
+          style={{
+            color: engineMode === 'cloud' ? '#f59e0b' : engineMode === 'local' ? '#10b981' : 'var(--accent)',
+          }}
+          title={engineMode === 'cloud' ? 'DeepSeek 云端' : engineMode === 'local' ? 'qwen3 本地' : '自动调度'}
+        >
+          {engineMode === 'cloud' ? '☁️ 云端' : engineMode === 'local' ? '💻 本地' : '⚡ 自动'}
+        </button>
+      )}
       {onToggleAlerts && (
         <button onClick={() => onToggleAlerts(!alertsEnabled)} className="flex items-center gap-1 px-2 py-1 rounded hover:opacity-80 transition-opacity" style={{ color: alertsEnabled ? 'var(--accent)' : 'var(--text-muted)' }} title={alertsEnabled ? '关闭提醒' : '开启提醒'}>
           {alertsEnabled ? <FiBell size={14} /> : <FiBellOff size={14} />}

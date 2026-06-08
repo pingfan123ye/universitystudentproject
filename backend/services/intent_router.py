@@ -150,7 +150,8 @@ def _is_music_play_intent(text: str) -> bool:
 
 
 XIAOAI_QUERY = ["时间", "几点"]
-XIAOAI_UTILITY = ["闹钟", "提醒", "倒计时", "计时"]
+# 注意："提醒"/"闹钟"等不在 xiaoai 处理范围，走 LLM 自然回复
+XIAOAI_UTILITY = ["倒计时", "计时"]
 
 
 def _extract_music_query(text: str) -> str:

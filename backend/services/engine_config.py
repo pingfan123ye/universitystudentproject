@@ -21,6 +21,12 @@ DEFAULT_CONFIG = {
     # cloud_only:  强制云端
     "default_mode": "local_first",
 
+    # 用户手动选择的引擎模式（前端可控，优先级高于 default_mode）
+    # auto: 按 default_mode 自动调度
+    # local: 强制本地
+    # cloud: 强制云端（不可用时降级本地）
+    "user_mode": "auto",
+
     # 本地模型超时（秒），超时后自动切换到云端
     # qwen3:8b 在 CPU 上处理 ~400 token 系统提示词需 6-10s，设 20s 留有缓冲
     "timeout_seconds": 20,
@@ -100,14 +106,25 @@ class EngineConfig:
         """
         根据输入文本和配置，决定实际使用的调度模式。
         Returns: 'local' | 'cloud'
+
+        优先级：user_mode > default_mode > 关键词检测
         """
+        user_mode = self._config.get("user_mode", "auto")
+
+        # ── 用户手动强制 ──
+        if user_mode == "local":
+            return "local"
+        if user_mode == "cloud":
+            return "cloud"
+
+        # ── auto 模式：按 default_mode 规则 ──
         mode = self._config["default_mode"]
         if mode == "local_only":
             return "local"
         if mode == "cloud_only":
             return "cloud"
 
-        # 检查强制本地关键词
+        # 检查强制本地关键词（隐私保护优先级最高）
         for kw in self._config["force_local_keywords"]:
             if kw in text:
                 logger.info(f"隐私关键词匹配「{kw}」→ 强制本地")

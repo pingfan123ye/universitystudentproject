@@ -20,6 +20,59 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOCAL_MODEL = "qwen3:8b"
 
 
+def _is_complex_query(text: str) -> bool:
+    """判断是否为复杂自然语言查询（需要云端大模型处理）。
+
+    设计原则：省钱。本地 qwen3:8b 能处理的绝不走云端。
+    只有「明显复杂」的对话才触发云端路由。
+    """
+    if not text:
+        return False
+
+    # ── 第一层：简单指令直接拒绝 ──
+    # 纯设备/音乐/问候指令 → 本地足够
+    simple_prefix = [
+        r'^(打开|关闭|开|关|调|切换|播放|暂停|下一首|上一首)',
+        r'^(放|听|来|播|唱).{0,8}(歌|音乐|曲|首)',
+        r'^(你好|嗨|嘿|喂|在吗|谢谢|再见|晚安|早安|早上好|晚上好)',
+        r'^(好的|可以|行|OK|嗯|哦|对|是的|没错)',
+        r'^(今天|明天|现在).{0,4}(几|什么|多少)',
+    ]
+    for pat in simple_prefix:
+        if re.match(pat, text):
+            return False
+
+    # ── 第二层：复杂度评分（≥3 才走云端）──
+    score = 0
+
+    # A. 长文本（>20 中文字符）
+    cn_chars = sum(1 for c in text if '一' <= c <= '鿿')
+    if cn_chars >= 18:
+        score += 1
+
+    # B. 情绪/心理关键词（需要共情深度 → 直接 +2，触发云端）
+    emotion_kw = ['焦虑', '难过', '伤心', '抑郁', '紧张', '害怕', '失眠', '压力大',
+                  '不开心', '烦躁', '崩溃', '想哭', '孤独', '迷茫', '困惑',
+                  '好累', '好困', '好烦', '失恋', '分手']
+    if any(kw in text for kw in emotion_kw):
+        score += 2
+
+    # C. 开放式建议/规划请求（不含裸"计划"，避免"做个计划"误触发）
+    advice_kw = ['建议', '推荐', '怎么', '为什么', '如何', '怎么办',
+                 '帮我规划', '帮我制定', '帮我设计', '定制', '安排', '帮我想',
+                 '帮我做', '帮我写', '帮我安排']
+    if any(kw in text for kw in advice_kw):
+        score += 1
+
+    # D. 学习/考试场景
+    study_kw = ['备考', '真题', '六级', 'CET', '学习计划', '复习', '考试',
+                '做题', '模拟卷', '试卷']
+    if any(kw in text for kw in study_kw):
+        score += 1
+
+    return score >= 2
+
+
 def _build_cet6_paper_summary() -> str:
     """构建本地 CET-6 试卷摘要，注入 SYSTEM_PROMPT 让 LLM 知道可用的试卷"""
     try:
@@ -504,12 +557,27 @@ async def generate_stream(
     use_cloud = False
     cloud_model = config.get("cloud_model")
     cloud_available = deepseek_provider.is_available()
+    user_mode = config.get("user_mode", "auto")
 
-    if prefer_cloud and cloud_available:
+    if not cloud_available:
+        use_cloud = False
+    elif user_mode == "cloud":
+        # 用户手动强制云端
         use_cloud = True
-    else:
-        mode = config.resolve_mode(prompt)
-        use_cloud = (mode == "cloud") and cloud_available
+        logger.info("双引擎 → 用户强制云端模式")
+    elif user_mode == "local":
+        # 用户手动强制本地
+        use_cloud = False
+    elif prefer_cloud:
+        # 调用方要求优先云端（info_query 等）
+        use_cloud = True
+    elif config.resolve_mode(prompt) == "cloud":
+        # 关键词触发云端（新闻/天气/股票等）
+        use_cloud = True
+    elif _is_complex_query(prompt):
+        # 智能检测：复杂自然语言查询走云端以获得更好回复质量
+        use_cloud = True
+        logger.info(f"双引擎 → 智能检测复杂查询，路由云端: {prompt[:40]}...")
 
     # ── 云端路径 ──
     if use_cloud:

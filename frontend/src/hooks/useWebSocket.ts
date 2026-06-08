@@ -69,6 +69,7 @@ export function useWebSocket() {
     query?: string;
   }>({ status: '' });
   const [alertStatus, setAlertStatus] = useState<{ running: boolean; suppressed: boolean; has_schedule: boolean; history: any[] }>({ running: false, suppressed: false, has_schedule: false, history: [] });
+  const [engineMode, setEngineMode] = useState<'auto' | 'local' | 'cloud'>('auto');
   const [cet6Paper, setCet6Paper] = useState<Cet6Paper | null>(null);
   const [cet6Answers, setCet6Answers] = useState<{ pdf_url: string } | null>(null);
   const [cet6SearchResults, setCet6SearchResults] = useState<Cet6SearchResult[]>([]);
@@ -97,6 +98,8 @@ export function useWebSocket() {
 
     ws.onopen = () => {
       setStatus('connected');
+      // 请求当前引擎模式
+      ws.send(JSON.stringify({ type: 'get_engine_mode' }));
       // 恢复上次会话的历史消息
       const persisted = loadPersistedMessages();
       if (persisted.length > 0) {
@@ -267,6 +270,13 @@ export function useWebSocket() {
             has_schedule: data.has_schedule || false,
             history: data.history || [],
           });
+          return;
+        }
+
+        if (data.type === 'engine_mode' || data.type === 'engine_mode_changed') {
+          if (data.mode && ['auto', 'local', 'cloud'].includes(data.mode)) {
+            setEngineMode(data.mode);
+          }
           return;
         }
 
@@ -606,6 +616,11 @@ export function useWebSocket() {
     safeSend({ type: 'toggle_suppress_alerts', suppressed });
   }, [safeSend]);
 
+  const sendEngineMode = useCallback((mode: 'auto' | 'local' | 'cloud') => {
+    safeSend({ type: 'set_engine_mode', mode });
+    setEngineMode(mode);  // 乐观更新
+  }, [safeSend]);
+
   // B-3: 发送完整音频（录音结束后一次发送）
   const sendCompleteAudio = useCallback((audioBase64: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -696,5 +711,6 @@ export function useWebSocket() {
     cet6SearchResults, sendCet6Download,
     sendCompleteAudio, sendVerifyWake, sendCancel, sendCet6Close, resetConversation,
     alertStatus,
+    engineMode, sendEngineMode,
   };
 }

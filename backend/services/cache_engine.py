@@ -31,6 +31,45 @@ def normalize(text: str) -> str:
     return result
 
 
+# ── 回复质量检查（防止模板/困惑回复被缓存）──
+
+LOW_QUALITY_REPLY_PATTERNS = [
+    # 困惑反问（LLM 没理解用户意图）
+    r'你是指.*吗',
+    r'需要我帮你.*吗',
+    r'或者.*放松',
+    # 过于模板化
+    r'好的，已启用.*模式',
+    r'好的，已.*模式',
+    # 极短泛化回复
+    r'^(好的|收到|明白了|知道了|嗯嗯|哦哦)[。！]?$',
+    # 表示不知道/不确定
+    r'不太清楚',
+    r'我不确定',
+    r'抱歉.*不清楚',
+]
+
+_LOW_QUALITY_RE = re.compile('|'.join(LOW_QUALITY_REPLY_PATTERNS))
+
+
+def is_low_quality_reply(text: str) -> bool:
+    """检测 LLM 回复是否为低质量（模板/困惑/无效），不应缓存"""
+    if not text or not text.strip():
+        return True
+    t = text.strip()
+    # 极短回复（< 8 字符，去除 emoji 后）
+    cleaned = re.sub(r'[^一-鿿\w]', '', t)
+    if len(cleaned) < 6:
+        return True
+    # 匹配低质量模式
+    if _LOW_QUALITY_RE.search(t):
+        return True
+    # 纯操作确认（无信息量）
+    if t.startswith('好的，已') and len(t) < 20:
+        return True
+    return False
+
+
 def _make_key(text: str) -> str:
     """生成缓存键（标准化文本的 MD5 哈希）"""
     norm = normalize(text)

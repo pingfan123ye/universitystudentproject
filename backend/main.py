@@ -652,6 +652,19 @@ async def websocket_endpoint(ws: WebSocket):
                 await handle_reset_config(ws)
                 continue
 
+            if msg_type == "set_engine_mode":
+                mode = data.get("mode", "auto")
+                if mode in ("auto", "local", "cloud"):
+                    get_config().set("user_mode", mode)
+                    logger.info(f"引擎模式切换: {mode}")
+                    await ws.send_json({"type": "engine_mode_changed", "mode": mode})
+                continue
+
+            if msg_type == "get_engine_mode":
+                mode = get_config().get("user_mode", "auto")
+                await ws.send_json({"type": "engine_mode", "mode": mode})
+                continue
+
             if msg_type == "verify_wake":
                 # ★ 唤醒词验证：Mellon 已做声纹匹配，此处只需确认有真实人声（非环境噪声）
                 #   录制的是唤醒词触发后 2.5 秒音频 → 不检查"小智"（已过时序窗口）
