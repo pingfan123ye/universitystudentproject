@@ -322,6 +322,8 @@ def _detect_mixed(text: str) -> RouteDecision | None:
 
 def _detect_cet6(text: str) -> bool:
     t = text.lower()
+    # 内联 STT 纠错（捕获未被全局 CORRECTIONS 覆盖的边界情况）
+    t = t.replace("真体", "真题")
     has_cet = any(kw in t for kw in ["六级", "cet6", "cet-6", "英语六级", "四六级"])
     has_study = any(kw in t for kw in [
         "备考", "复习", "学习", "真题", "做题", "练习", "考试",

@@ -182,7 +182,8 @@ export type VoicePhase =
   | 'verifying'         // ★ 声纹匹配后 STT 二次验证中（用户可见等待状态）
   | 'wake_detected'     // 唤醒成功
   | 'recording'         // 录音中
-  | 'processing';       // 处理中（发送后端）
+  | 'processing'       // 处理中（发送后端）
+  | 'listening_after_reply';  // ★ 回复后倾听窗口（连续对话，无需唤醒词）
 
 export interface VoiceInteractionState {
   phase: VoicePhase;

@@ -340,6 +340,19 @@ async def lifespan(app: FastAPI):
     logger.info("正在检查 Ollama 模型...")
     if await check_model_available():
         logger.info(f"模型 {DEFAULT_MODEL} 已就绪")
+        # ★ 预热：发送微型请求让 Ollama 提前加载模型到 GPU/内存
+        try:
+            import ollama
+            logger.info(f"预热本地模型 {DEFAULT_MODEL}（防止首 token 超时）...")
+            await asyncio.to_thread(
+                ollama.chat,
+                model=DEFAULT_MODEL,
+                messages=[{"role": "user", "content": "hi"}],
+                options={"num_predict": 1, "temperature": 0},
+            )
+            logger.info(f"模型 {DEFAULT_MODEL} 预热完成 ✓")
+        except Exception as e:
+            logger.warning(f"模型预热失败（不影响使用）: {e}")
     else:
         logger.warning(f"模型 {DEFAULT_MODEL} 未找到")
     logger.info(f"Reasonix CLI 可用: {is_reasonix_available()}")
@@ -792,7 +805,9 @@ async def websocket_endpoint(ws: WebSocket):
                     "ok", "OK", "okay", "go", "yes",
                 }
                 _clean = re.sub(r'[\s,，。！？、；：""''《》!?;:\'()　]+', '', text)
-                if _clean in APPROVAL_WORDS:
+                # ★ 前缀匹配：允许"允许执行""开始吧"等变体通过
+                _matched = any(_clean.startswith(w) for w in APPROVAL_WORDS)
+                if _matched:
                     pm = get_pending_manager()
                     task = pm.pop_next()
                     if task:

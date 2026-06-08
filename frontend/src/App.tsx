@@ -141,7 +141,7 @@ export default function App() {
         <div className={`flex-1 min-w-0 transition-all duration-300 ${isMobile && sidebarOpen ? 'hidden' : 'flex flex-col'}`}
           style={!isMobile ? { borderRight: '1px solid var(--border)' } : {}}>
           <ChatPanel messages={messages} pendingTask={pendingTask ? { task: pendingTask } : null} onSend={sendMessage} onClear={clearMessages}
-            pendingTts={pendingTts} onTtsPlayed={() => setPendingTts(null)}
+            pendingTts={pendingTts}
             onTtsFinished={handleTtsFinished} onTtsClear={handleTtsClear}
             pendingTtsFallback={pendingTtsFallback} onTtsFallbackConsumed={() => setPendingTtsFallback('')}
             onSendCompleteAudio={(b64: string) => sendCompleteAudio(b64)} onVerifyWake={sendVerifyWake} onCancel={() => sendCancel()}

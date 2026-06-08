@@ -70,6 +70,7 @@ export default function ChatPanel({
       onDuckMusic?.();
       // 打断 TTS：停止当前播报 + 清空整个待播队列
       stopTts();
+      _ttsClearedRef.current = true;  // ★ 标记为打断清空，防止后续启动连续倾听
       onTtsClear?.();
       onTtsFallbackConsumed?.();
       // 取消正在进行的 LLM 生成（后端流式输出 + 前端流式消息）
@@ -89,6 +90,15 @@ export default function ChatPanel({
     onDuckMusic,
     onRestoreMusic,
     onVerifyWake,
+    // ★ 连续对话智能打断 — 用户说话时停止 TTS
+    onInterruptTts: () => {
+      console.log('[语音助手] 🛑 连续对话打断 TTS');
+      stopTts();
+      _ttsClearedRef.current = true;  // ★ 标记为打断清空，防止后续启动连续倾听
+      onTtsClear?.();
+      onTtsFallbackConsumed?.();
+      onCancel?.();
+    },
   });
 
   // ★ 二级 Ducking：音乐播放时 Light Duck 减少歌词干扰唤醒词检测
@@ -101,23 +111,41 @@ export default function ChatPanel({
     // recording/verifying 阶段由 onWakeDetected 回调中的 onDuckMusic?.() 触发 Deep Duck，此处不干预
   }, [isMusicPlaying, voiceState.phase]);
 
-  // ★ TTS 播放时暂停 PCM 缓冲 + 设置 Mellon 失聪期，防止扬声器播报被麦克风拾取触发自唤醒
+  // ★ TTS 播放时暂停 PCM 缓冲 + 停止连续倾听 + 设置 Mellon 失聪期
+  // ★ 全部句子播完后才启动连续倾听（不等每句播完，避免反复启停）
+  const _ttsClearedRef = useRef(false);  // 区分自然播完 vs 唤醒词打断清空
   const ttsResumeTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  const ttsListenTimerRef = useRef<ReturnType<typeof setTimeout>>();
+
   useEffect(() => {
     if (pendingTts) {
-      // TTS 队列有内容 → 立即暂停 PCM 缓冲（Mellon 保持运行以支持打断）
+      // TTS 队列有新内容 → 重置清除标记
+      _ttsClearedRef.current = false;
       clearTimeout(ttsResumeTimerRef.current);
+      clearTimeout(ttsListenTimerRef.current);
       voiceActions.pauseAudioBuffer();
-      // ★ B1: 设置 Mellon 失聪期（每句话续期 3s，防止 TTS 回声触发唤醒）
-      //   用户仍可在句间大声喊唤醒词打断（3s 窗口短，句间会续期）
-      voiceActions.setDeafUntil(Date.now() + 3000);
+      // ★ 停止连续倾听：防止 TTS 扬声器回声被 AnalyserNode 误判为用户语音
+      voiceActions.stopContinuousListening();
+      // ★ C4: 设置 Mellon 失聪期（每句话续期 5s，防止 TTS 回声触发唤醒）
+      voiceActions.setDeafUntil(Date.now() + 5000);
     } else {
-      // TTS 队列清空 → 延迟恢复（等音频拖尾消散 + 防止句间抖动）
+      // TTS 队列清空 → 延迟恢复 PCM + 启动连续倾听（仅自然播完，唤醒打断跳过）
       ttsResumeTimerRef.current = setTimeout(() => {
         voiceActions.resumeAudioBuffer();
       }, 800);
+      if (!_ttsClearedRef.current) {
+        // ★ 全部 TTS 句子播完后延迟 500ms 启动连续倾听
+        ttsListenTimerRef.current = setTimeout(() => {
+          voiceActions.startContinuousListening(6000);
+        }, 500);
+      } else {
+        console.log('[TTS] 队列被唤醒词打断清空，跳过连续倾听启动');
+      }
     }
-    return () => clearTimeout(ttsResumeTimerRef.current);
+    return () => {
+      clearTimeout(ttsResumeTimerRef.current);
+      clearTimeout(ttsListenTimerRef.current);
+    };
   }, [pendingTts]);
 
   // ── 唤醒词注册完成 → 延迟后自动启用语音助手（等麦克风释放）──
@@ -172,7 +200,7 @@ export default function ChatPanel({
   useEffect(() => {
     if (voiceState.phase === 'recording' || voiceState.phase === 'wake_detected') {
       setMicActive(true);
-    } else if (voiceState.phase === 'verifying' || voiceState.phase === 'processing' || voiceState.phase === 'waiting_for_wake' || voiceState.phase === 'idle') {
+    } else if (voiceState.phase === 'verifying' || voiceState.phase === 'processing' || voiceState.phase === 'waiting_for_wake' || voiceState.phase === 'idle' || voiceState.phase === 'listening_after_reply') {
       setMicActive(false);
     }
   }, [voiceState.phase]);
@@ -189,8 +217,7 @@ export default function ChatPanel({
   useEffect(() => {
     if (pendingTts && pendingTts.audio) {
       speak(pendingTts.text, pendingTts.audio, () => {
-        // TTS 播完 → 恢复唤醒词监听 + 播队列下一个
-        voiceActions.resumeWakeListening();
+        // ★ 连续倾听由 pendingTts→null（队列全空）统一触发，不在此逐句启动
         onTtsFinished?.();
       });
       onTtsPlayed?.();
@@ -202,7 +229,7 @@ export default function ChatPanel({
   useEffect(() => {
     if (pendingTtsFallback) {
       speak(pendingTtsFallback, undefined, () => {
-        voiceActions.resumeWakeListening();
+        // ★ 连续倾听由 pendingTts→null（队列全空）统一触发
         onTtsFinished?.();
       });
       onTtsFallbackConsumed?.();
@@ -240,6 +267,7 @@ export default function ChatPanel({
       case 'wake_detected': return '🟢 我在听';
       case 'recording': return '🔴 录音中';
       case 'processing': return '⏳ 思考中';
+      case 'listening_after_reply': return '👂 倾听中';
       default: return '🤖 语音助手';
     }
   })();
@@ -261,6 +289,7 @@ export default function ChatPanel({
       voiceState.phase === 'wake_detected' ? '#22c55e' :
       voiceState.phase === 'recording' ? '#dc2626' :
       voiceState.phase === 'processing' ? '#f59e0b' :
+      voiceState.phase === 'listening_after_reply' ? '#8b5cf6' :
       'var(--bg-input)',
     animation: voiceState.phase === 'waiting_for_wake' ? 'pulse 2s ease-in-out infinite' :
                 voiceState.phase === 'verifying' ? 'pulse 0.6s ease-in-out infinite' :
@@ -410,6 +439,52 @@ export default function ChatPanel({
 
       {/* ── 底部输入栏 ── */}
       <div className="p-4 border-t" style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}>
+
+        {/* ★ 语音状态栏（独立一行，不挤按钮区） */}
+        {voiceState.phase !== 'idle' && (
+          <div className="flex items-center justify-center gap-2 mb-2 max-w-3xl mx-auto">
+            {voiceState.phase !== 'initializing' && voiceState.lastConfidence > 0 && (
+              <span
+                title={`唤醒模式: ${voiceState.wakeMode === 'direct' ? '直接模式（秒醒）' : 'STT验证模式'}，匹配置信度: ${(voiceState.lastConfidence * 100).toFixed(0)}%`}
+                style={{
+                  fontSize: '11px', padding: '3px 8px', borderRadius: '6px',
+                  background: voiceState.wakeMode === 'direct' ? 'rgba(34,197,94,0.12)' : 'rgba(59,130,246,0.10)',
+                  color: voiceState.wakeMode === 'direct' ? '#22c55e' : '#3b82f6',
+                  fontWeight: 600, whiteSpace: 'nowrap', cursor: 'help',
+                }}
+              >
+                {voiceState.wakeMode === 'direct' ? '⚡' : '🔍'} {(voiceState.lastConfidence * 100).toFixed(0)}%
+              </span>
+            )}
+            <span style={{
+              fontSize: '11px', padding: '3px 8px', borderRadius: '6px',
+              background: 'rgba(255,255,255,0.05)', color: 'var(--text-secondary)',
+              whiteSpace: 'nowrap', display: 'inline-flex', alignItems: 'center', gap: '5px',
+            }}>
+              <span style={{
+                display: 'inline-block', width: '7px', height: '7px', borderRadius: '50%',
+                background:
+                  voiceState.phase === 'waiting_for_wake' ? '#22c55e' :
+                  voiceState.phase === 'initializing' ? '#f59e0b' :
+                  voiceState.phase === 'verifying' ? '#3b82f6' :
+                  voiceState.phase === 'recording' ? '#dc2626' :
+                  voiceState.phase === 'processing' ? '#f59e0b' :
+                  voiceState.error ? '#ef4444' : '#6b7280',
+                animation: voiceState.phase === 'waiting_for_wake' ? 'none' : 'pulse 1.2s ease-in-out infinite',
+              }} />
+              {{
+                'initializing': '加载中',
+                'waiting_for_wake': '待命中',
+                'verifying': '验证中',
+                'wake_detected': '已唤醒',
+                'recording': '录音中',
+                'processing': '思考中',
+                'listening_after_reply': `倾听中... ${voiceState.recordingTime < 6 ? (6 - voiceState.recordingTime) + 's' : ''}`,
+              }[voiceState.phase] || voiceState.phase}
+            </span>
+          </div>
+        )}
+
         <div className="flex items-end gap-2 max-w-3xl mx-auto">
           {/* 重置对话 */}
           {onResetConversation && (
@@ -438,26 +513,6 @@ export default function ChatPanel({
           >
             {voiceBtnLabel}
           </button>
-          {/* ★ 置信度指示器：显示 Mellon 匹配分数和当前模式 */}
-          {voiceState.phase !== 'idle' && voiceState.phase !== 'initializing' && voiceState.lastConfidence > 0 && (
-            <span
-              title={`唤醒模式: ${voiceState.wakeMode === 'direct' ? '直接模式（秒醒）' : 'STT验证模式'}，最近匹配置信度: ${(voiceState.lastConfidence * 100).toFixed(0)}%`}
-              style={{
-                fontSize: '9px',
-                padding: '2px 6px',
-                borderRadius: '4px',
-                background: voiceState.wakeMode === 'direct'
-                  ? 'rgba(34,197,94,0.15)'
-                  : 'rgba(59,130,246,0.12)',
-                color: voiceState.wakeMode === 'direct' ? '#22c55e' : '#3b82f6',
-                fontWeight: 600,
-                whiteSpace: 'nowrap',
-                cursor: 'help',
-              }}
-            >
-              {voiceState.wakeMode === 'direct' ? '⚡' : '🔍'} {(voiceState.lastConfidence * 100).toFixed(0)}%
-            </span>
-          )}
           {/* 输入框 */}
           <div className="flex-1">
             <textarea

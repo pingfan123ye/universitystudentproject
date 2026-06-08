@@ -11,6 +11,7 @@ export interface VoiceInteractionOptions {
   onError: (error: string) => void;
   onDuckMusic?: () => void;
   onRestoreMusic?: () => void;
+  onInterruptTts?: () => void;   // ★ 连续对话中用户说话时打断 TTS
 }
 
 export interface VoiceInteractionState {
@@ -30,13 +31,16 @@ export interface VoiceInteractionActions {
   pauseAudioBuffer: () => void;       // ★ TTS 播放时暂停 PCM 缓冲，防止自触发
   resumeAudioBuffer: () => Promise<void>;  // ★ TTS 播完后恢复 PCM 缓冲
   setDeafUntil: (timestamp: number) => void;  // ★ TTS 播放时设置失聪期，Mellon 触发后直接忽略
+  startContinuousListening: (timeoutMs?: number) => Promise<void>;  // ★ 连续对话：TTS 播完后进入倾听窗口
+  stopContinuousListening: () => void;  // ★ 连续对话：TTS 开始时停止倾听（防止扬声器回声）
 }
 
 // ── 常量 ──
 const STORAGE_KEY = 'mellon-xiaozhi-refs';
 const MAX_RECORD_SECONDS = 12;        // 最长录音秒数
-const WAKE_CONFIDENCE_THRESHOLD = 0.55;  // ★ 唤醒词最低置信度（大幅降低：由 STT 验证兜底过滤环境噪声）
-const WAKE_COOLDOWN_MS = 5000;           // 假触发冷却（5 秒内不再触发，防止环境噪声连触发）
+const WAKE_CONFIDENCE_THRESHOLD = 0.65;  // ★ 唤醒词最低置信度（STT 验证兜底过滤环境噪声）
+const WAKE_COOLDOWN_MS = 5000;           // 假触发基础冷却（5 秒内不再触发，防止环境噪声连触发）
+const WAKE_COOLDOWN_MAX_MS = 30000;       // 渐进式冷却上限（连续假触发后最长 30 秒冷却）
 const STT_VERIFY_RECORD_MS = 2500;       // STT 验证录音时长（毫秒）: 覆盖用户说唤醒词+指令的开头
 const CONSECUTIVE_FOR_DIRECT = 3;        // 连续 STT 验证通过次数 → 切换到直接模式（跳过 STT）
 const DIRECT_MODE_FALSE_LIMIT = 2;       // 直接模式下连续假触发次数 → 退回 STT 验证模式
@@ -52,12 +56,35 @@ const SPEECH_THRESHOLD_MIN = 0.004;     // 语音触发最低绝对值（用户�
 const SILENCE_RATIO = 2.5;              // 静音判定：RMS < 噪声基线 × 2.5（兜底策略，主策略为峰值衰减检测）
 const SILENCE_THRESHOLD_MIN = 0.002;    // 静音判定最低绝对值（与语音阈值保持比例）
 const MIN_SPEECH_DURATION_MS = 300;     // 最少连续语音时长
-const SILENCE_TIMEOUT_MS = 1500;        // 连续静音超时 → 自动停止
+const SILENCE_TIMEOUT_MS = 2500;        // 连续静音超时 → 自动停止（给说话犹豫留足时间）
 const PEAK_DECAY_RATIO = 0.20;           // 峰值衰减检测：RMS < 语音峰值 × 20% → 疑似停止（AGC 环境下主策略）
-const QUICK_STOP_RATIO = 0.10;          // 快速停止：RMS < 语音峰值 × 10% → 确认时间缩短至 800ms
-const QUICK_STOP_TIMEOUT_MS = 800;      // 快速停止的静音确认时间
+const QUICK_STOP_RATIO = 0.10;          // 快速停止：RMS < 语音峰值 × 10% → 确认时间缩短至 1200ms
+const QUICK_STOP_TIMEOUT_MS = 1200;      // 快速停止的静音确认时间（人犹豫时也会降到极低能量）
 const PEAK_WINDOW_SAMPLES = 8;          // 语音峰值追踪窗口 = 8 × 250ms = 2 秒
 const NO_SPEECH_TIMEOUT_MS = 3000;      // 无语音超时：3 秒未检测到语音 → 自动停止（防止幽灵唤醒浪费录音）
+
+// ★ 连续对话参数
+const CONTINUOUS_TIMEOUT_MS = 6000;       // 连续倾听窗口 6 秒
+const CONTINUOUS_SPEECH_RATIO = 3.5;      // 更保守的语音触发阈值（减少环境噪音误触发）
+const CONTINUOUS_MIN_SPEECH_MS = 400;     // 更长的最短语音确认
+const MAX_CONTINUOUS_ROUNDS = 3;          // 最多连续 3 轮，之后回到等待唤醒
+
+// ★ 唤醒成功提示音（200ms 正弦波 880Hz，短促叮声）
+function playWakeChime() {
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = 880;
+    osc.type = 'sine';
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.2);
+  } catch { /* 静默失败，不影响主流程 */ }
+}
 
 // ── WebM → WAV/PCM 16kHz base64 ──
 // reuseCtx: 可选，复用已有的 AudioContext 进行解码，避免创建过多实例
@@ -155,7 +182,7 @@ function pcmToWavBase64(pcm: Float32Array, sampleRate: number): string {
 }
 
 export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceInteractionState, VoiceInteractionActions] {
-  const { wakeWord, onWakeDetected, onAudioChunk, onAudioComplete, onAudioFinal, onError, onDuckMusic, onRestoreMusic } = opts;
+  const { wakeWord, onWakeDetected, onAudioChunk, onAudioComplete, onAudioFinal, onError, onDuckMusic, onRestoreMusic, onInterruptTts } = opts;
 
   const [phase, setPhase] = useState<VoicePhase>('idle');
   const [recordingTime, setRecordingTime] = useState(0);
@@ -194,6 +221,8 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
   const consecutiveSttPassesRef = useRef(0);
   // ★ 直接模式下假触发计数（连续假触发 → 退回 stt_verify 模式）
   const directModeFalseCountRef = useRef(0);
+  // ★ 连续假触发计数（用于渐进式冷却：每次假触发延长冷却时间）
+  const consecutiveFalseRef = useRef(0);
   // ★ PCM 循环缓冲：在 Mellon 监听期间持续录制原始 PCM，确保唤醒词触发时
   //   缓冲中已有 4 秒历史音频（包含唤醒词本身），彻底解决"post-trigger 录音
   //   只捕获沉默"的问题。ScriptProcessor → Float32 循环数组 → 直接 WAV 编码
@@ -204,8 +233,28 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
   const bufferAudioCtxRef = useRef<AudioContext | null>(null);
   const bufferProcessorRef = useRef<ScriptProcessorNode | null>(null);
 
+  // ★ 连续对话模式
+  const _continuousModeRef = useRef(false);    // 是否在连续倾听模式（影响 rec.onstop 行为）
+  const _continuousRoundRef = useRef(0);       // 当前连续对话轮数
+  const startRecordingRef = useRef<() => Promise<boolean>>(async () => false);  // ★ 打破 TDZ 循环依赖
+
   // 同步 state → ref
   useEffect(() => { phaseRef.current = phase; }, [phase]);
+
+  // ★ 连续对话辅助 refs（必须在 cleanup 之前定义，避免 TDZ 错误）
+  const _continuousTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const _continuousCheckTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);  // ★ BUG-2 修复：语音检测定时器
+  const _continuousStreamRef = useRef<MediaStream | null>(null);
+  const _continuousCtxRef = useRef<AudioContext | null>(null);
+  const _continuousFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);  // ★ BUG-4 修复：兜底恢复 Mellon 定时器
+
+  const stopContinuousListening = useCallback(() => {
+    if (_continuousTimerRef.current) { clearInterval(_continuousTimerRef.current); _continuousTimerRef.current = null; }
+    if (_continuousCheckTimerRef.current) { clearInterval(_continuousCheckTimerRef.current); _continuousCheckTimerRef.current = null; }
+    if (_continuousFallbackTimerRef.current) { clearTimeout(_continuousFallbackTimerRef.current); _continuousFallbackTimerRef.current = null; }
+    if (_continuousStreamRef.current) { _continuousStreamRef.current.getTracks().forEach(t => t.stop()); _continuousStreamRef.current = null; }
+    if (_continuousCtxRef.current) { _continuousCtxRef.current.close().catch(() => {}); _continuousCtxRef.current = null; }
+  }, []);
 
   // ── 清理所有资源 ──
   const cleanup = useCallback(() => {
@@ -246,10 +295,15 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
     // ★ 重置自适应模式追踪
     consecutiveSttPassesRef.current = 0;
     directModeFalseCountRef.current = 0;
+    consecutiveFalseRef.current = 0;  // ★ 重置渐进式冷却
+    // ★ 重置连续对话
+    _continuousModeRef.current = false;
+    _continuousRoundRef.current = 0;
+    stopContinuousListening();
     setRecordingTime(0);
     setAudioLevel(0);
     setLastConfidence(0);
-  }, []);
+  }, [stopContinuousListening]);
 
   // ═══════════════════════════════════════
   // ★ PCM 循环缓冲：在 Mellon 监听期间持续录制 4 秒原始音频
@@ -340,6 +394,12 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
 
   const resumeAudioBuffer = useCallback(async () => {
     if (!bufferPausedRef.current) return;  // 未暂停，无需操作
+    // ★ BUG-3 修复：连续对话模式下不恢复 PCM 缓冲（连续倾听 AnalyserNode 已占用麦克风）
+    if (_continuousModeRef.current) {
+      bufferPausedRef.current = false;
+      console.log('[PCM缓冲] ⏭️ 连续对话模式，跳过 PCM 恢复（避免与连续倾听冲突）');
+      return;
+    }
     bufferPausedRef.current = false;
     await startAudioBuffer();
     await new Promise(r => setTimeout(r, 500));  // 积累 500ms 音频
@@ -351,6 +411,149 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
     wakeDeafUntilRef.current = Math.max(wakeDeafUntilRef.current, timestamp);
     console.log(`[唤醒词] 🔇 失聪期已设置: ${((timestamp - Date.now()) / 1000).toFixed(1)}s`);
   }, []);
+
+  // ═══════════════════════════════════════
+  // ★ 连续对话：TTS 播完 → 轻量 AnalyserNode 监听语音 → 检测到语音转交 startRecording
+  //   不复用 MediaRecorder，仅做语音触发检测，降低资源占用
+  // ═══════════════════════════════════════
+
+  const startContinuousListening = useCallback(async (timeoutMs: number = CONTINUOUS_TIMEOUT_MS) => {
+    if (!enabledRef.current) return;
+
+    // 达到最大轮数 → 退出连续模式，回到待唤醒
+    if (_continuousRoundRef.current >= MAX_CONTINUOUS_ROUNDS) {
+      _continuousModeRef.current = false;
+      _continuousRoundRef.current = 0;
+      console.log(`[连续对话] 已达最大轮数 ${MAX_CONTINUOUS_ROUNDS}，回到待唤醒`);
+      await restartDetector();
+      return;
+    }
+
+    // ★ BUG-5 修复：轮数递增在此处（连续倾听成功启动后才算一轮用完，
+    //   而非在 rec.onstop 中提前递增）
+    // ★ BUG-4 修复：取消兜底定时器（TTS 已正常播完，不需要兜底恢复）
+    if (_continuousFallbackTimerRef.current) {
+      clearTimeout(_continuousFallbackTimerRef.current);
+      _continuousFallbackTimerRef.current = null;
+    }
+
+    try {
+      // 清理上一次的连续监听（如果有残留）
+      stopContinuousListening();
+      // 确保 PCM 缓冲已停止（Mellon 已停，不需要缓冲）
+      stopAudioBuffer();
+
+      _continuousRoundRef.current += 1;
+      console.log(`[连续对话] 第${_continuousRoundRef.current}/${MAX_CONTINUOUS_ROUNDS}轮倾听开始`);
+      _continuousModeRef.current = true;
+      setPhase('listening_after_reply');
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true },
+      });
+      _continuousStreamRef.current = stream;
+
+      const audioCtx = new AudioContext();
+      _continuousCtxRef.current = audioCtx;
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.3;
+      source.connect(analyser);
+      const timeData = new Float32Array(analyser.fftSize);
+
+      const startTime = Date.now();
+      let speechDuration = 0;
+      let noiseWindow: number[] = [];
+      setRecordingTime(0);
+
+      // 倒计时更新
+      const countdownTimer = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        setRecordingTime(elapsed);
+      }, 200);
+      _continuousTimerRef.current = countdownTimer;
+
+      const checkTimer = setInterval(() => {
+        const elapsed = Date.now() - startTime;
+
+        // 超时 → 回到待唤醒
+        if (elapsed >= timeoutMs) {
+          clearInterval(countdownTimer);
+          clearInterval(checkTimer);
+          _continuousCheckTimerRef.current = null;
+          source.disconnect();
+          audioCtx.close().catch(() => {});
+          stream.getTracks().forEach(t => t.stop());
+          _continuousStreamRef.current = null;
+          _continuousCtxRef.current = null;
+          _continuousTimerRef.current = null;
+
+          setRecordingTime(0);
+          _continuousModeRef.current = false;
+          _continuousRoundRef.current = 0;
+          console.log(`[连续对话] ⏰ ${timeoutMs / 1000}s 超时无语音，回到待唤醒`);
+          restartDetector();
+          return;
+        }
+
+        // RMS 计算
+        analyser.getFloatTimeDomainData(timeData);
+        let sum = 0;
+        for (let i = 0; i < timeData.length; i++) sum += timeData[i] * timeData[i];
+        const rms = Math.sqrt(sum / timeData.length);
+
+        // 噪声基线（始终累积）
+        noiseWindow.push(rms);
+        if (noiseWindow.length > NOISE_WINDOW_SAMPLES) noiseWindow.shift();
+
+        // ★ C3: 前 1000ms 只积累噪声基线，不触发语音检测（等房间回声消散 + 噪声基线稳定）
+        const CONTINUOUS_WARMUP_MS = 1000;
+        if (elapsed < CONTINUOUS_WARMUP_MS) {
+          setRecordingTime(0);  // 预热期不计时
+          return;
+        }
+        const noiseFloor = noiseWindow.length > 0
+          ? noiseWindow.reduce((a, b) => Math.min(a, b), Infinity)
+          : 0.01;
+
+        const speechThreshold = Math.max(noiseFloor * CONTINUOUS_SPEECH_RATIO, SPEECH_THRESHOLD_MIN);
+
+        if (rms > speechThreshold) {
+          speechDuration += LEVEL_CHECK_INTERVAL_MS;
+          if (speechDuration >= CONTINUOUS_MIN_SPEECH_MS) {
+            // 检测到语音 → 清理连续监听 → 转交 startRecording
+            clearInterval(countdownTimer);
+            clearInterval(checkTimer);
+            _continuousCheckTimerRef.current = null;
+            source.disconnect();
+            audioCtx.close().catch(() => {});
+            stream.getTracks().forEach(t => t.stop());
+            _continuousStreamRef.current = null;
+            _continuousCtxRef.current = null;
+            _continuousTimerRef.current = null;
+
+            setRecordingTime(0);
+            console.log(`[连续对话] 🎤 检测到语音 (rms=${rms.toFixed(5)} > ${speechThreshold.toFixed(5)}, ${speechDuration}ms)，开始录音`);
+            // ★ 5.5: 智能打断 — 如果有 TTS 正在播放，先打断
+            onInterruptTts?.();
+            // _continuousModeRef 保持 true，startRecording 的 onstop 会据此决定后续行为
+            startRecordingRef.current();
+          }
+        } else {
+          speechDuration = Math.max(0, speechDuration - LEVEL_CHECK_INTERVAL_MS);
+        }
+      }, LEVEL_CHECK_INTERVAL_MS);
+      _continuousCheckTimerRef.current = checkTimer;
+
+    } catch (err: any) {
+      console.error('[连续对话] 启动失败:', err.message);
+      _continuousModeRef.current = false;
+      _continuousRoundRef.current = 0;
+      stopContinuousListening();
+      await restartDetector();
+    }
+  }, [stopContinuousListening, stopAudioBuffer, onInterruptTts]);  // startRecording 通过 startRecordingRef 访问（避免 TDZ）
 
   // ── 页面隐藏/切换标签时自动暂停/恢复 ──
   useEffect(() => {
@@ -650,10 +853,31 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         }
         onAudioFinal();
 
-        // 7. 恢复唤醒词监听（设置短暂失聪期防止 TTS 反馈触发误唤醒）
+        // 7. 根据模式恢复：连续对话 → 复活 Mellon + 等待 TTS / 正常模式 → 重启 Mellon
         if (enabledRef.current) {
-          wakeDeafUntilRef.current = Date.now() + 1500;  // 1.5 秒失聪期
-          await restartDetector();
+          if (_continuousModeRef.current && _continuousRoundRef.current < MAX_CONTINUOUS_ROUNDS) {
+            // ★ C1 修复：复活 Mellon（录音开始时被 stopRecording 停止了）。
+            //   Mellon 运行期间 TTS 播报时可通过唤醒词打断（setDeafUntil 防止 TTS 回声误触发）。
+            //   连续倾听由 TTS 播完回调（ChatPanel.tsx）统一启动。
+            console.log(`[连续对话] 第${_continuousRoundRef.current}/${MAX_CONTINUOUS_ROUNDS}轮录音完成，复活 Mellon + 等待 TTS...`);
+            await restartDetector();
+            // 兜底定时器：如果 10 秒内无 TTS 到达（LLM 超时/失败），退出连续模式
+            const fallback = setTimeout(() => {
+              if (enabledRef.current && _continuousModeRef.current) {
+                console.warn('[连续对话] ⚠️ 录音后 10s 无 TTS 到达，自动恢复 Mellon');
+                _continuousModeRef.current = false;
+                _continuousRoundRef.current = 0;
+                restartDetector();
+              }
+            }, 10000);
+            _continuousFallbackTimerRef.current = fallback;
+          } else {
+            // 正常模式 / 连续轮数耗尽 → 回到等待唤醒
+            _continuousModeRef.current = false;
+            _continuousRoundRef.current = 0;
+            wakeDeafUntilRef.current = Date.now() + 1500;  // 1.5 秒失聪期
+            await restartDetector();
+          }
         }
       };
 
@@ -673,6 +897,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
       return false;
     }
   }, [onDuckMusic, onAudioChunk, onAudioComplete, onAudioFinal, onRestoreMusic]);
+  startRecordingRef.current = startRecording;  // ★ 同步到 ref（供 startContinuousListening 使用，避免 TDZ）
 
   const stopRecording = useCallback(async (): Promise<string | null> => {
     // 如果 auto-stop 已经触发 → rec 已 inactive，onstop 已处理完毕
@@ -822,6 +1047,17 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         ? merged.slice(totalLen - maxSamples)
         : merged;
 
+      // ★ 能量预检：RMS 过低（纯噪声/静音）直接拒绝，不浪费后端 STT 请求
+      let pcmSum = 0;
+      for (let i = 0; i < trimmed.length; i++) pcmSum += trimmed[i] * trimmed[i];
+      const pcmRms = Math.sqrt(pcmSum / trimmed.length);
+      const PCM_RMS_MIN = 0.006;  // 低于此值视为纯噪声（正常语音 RMS ~0.01-0.05，环境噪声 ~0.003-0.005）
+      if (pcmRms < PCM_RMS_MIN) {
+        console.log(`[唤醒词验证] ⚡ PCM能量过低 (RMS=${pcmRms.toFixed(5)} < ${PCM_RMS_MIN})，直接拒绝（跳过STT）`);
+        return false;
+      }
+      console.log(`[唤醒词验证] PCM能量正常 RMS=${pcmRms.toFixed(5)}`);
+
       const b64 = pcmToWavBase64(trimmed, 16000);
       const audioLen = (trimmed.length / 16000).toFixed(1);
       console.log(`[唤醒词验证] PCM缓冲: ${chunks.length} chunks, ${trimmed.length} samples (${audioLen}s), WAV ${b64.length} chars`);
@@ -836,7 +1072,9 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
   }, [opts.onVerifyWake]);
 
   // ═══════════════════════════════════════
-  // ★ 假触发处理：5 秒冷却 + 自适应模式退回
+  // ★ 假触发处理：渐进式冷却 + 自适应模式退回
+  //   环境噪声连触发 → 每次假触发冷却翻倍（5s→10s→20s→30s上限）
+  //   成功唤醒后重置为基准 5s
   // ═══════════════════════════════════════
   const handleFalsePositive = useCallback(() => {
     if (wakeModeRef.current === 'direct') {
@@ -849,10 +1087,15 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         console.log('[唤醒词] ⚠️ 直接模式连续假触发，退回 STT 验证模式');
       }
     }
-    // 固定 5 秒冷却
-    wakeDeafUntilRef.current = Date.now() + WAKE_COOLDOWN_MS;
+    // ★ 渐进式冷却：每次假触发冷却翻倍，防止环境噪声反复跳转
+    consecutiveFalseRef.current += 1;
+    const cooldownMs = Math.min(
+      WAKE_COOLDOWN_MS * Math.pow(2, consecutiveFalseRef.current - 1),
+      WAKE_COOLDOWN_MAX_MS
+    );
+    wakeDeafUntilRef.current = Date.now() + cooldownMs;
     verifyingRef.current = false;
-    console.log(`[唤醒词] ❌ 假触发，${WAKE_COOLDOWN_MS / 1000}秒冷却后恢复监听`);
+    console.log(`[唤醒词] ❌ 假触发 #${consecutiveFalseRef.current}，渐进冷却 ${(cooldownMs / 1000).toFixed(0)}秒`);
     // 冷却后恢复 PCM 缓冲 + Mellon 监听
     setTimeout(async () => {
       if (enabledRef.current && phaseRef.current !== 'recording') {
@@ -860,7 +1103,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         await new Promise(r => setTimeout(r, 500));
         await restartDetector();
       }
-    }, WAKE_COOLDOWN_MS);
+    }, cooldownMs);
   }, []);
 
   const initMellon = useCallback(async (): Promise<boolean> => {
@@ -952,8 +1195,10 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
             if (wakeModeRef.current === 'direct') {
               // ⚡ 直接模式：即时唤醒，无 STT 延迟
               console.log('[唤醒词] ⚡ 直接模式，立即唤醒');
+              consecutiveFalseRef.current = 0;  // ★ 重置渐进式冷却
               lastWakeTimeRef.current = now;
               verifyingRef.current = true;
+              playWakeChime();
               // ★ 停止 PCM 缓冲（startRecording 中也会做，但提前停止减少冲突）
               stopAudioBuffer();
               onWakeDetected();
@@ -979,12 +1224,14 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
               const passed = await verifyWakeWord();
 
               if (passed) {
-                // ✅ STT 验证通过 → 真实人声
+                // ✅ STT 验证通过 → 真实人声，重置渐进冷却
                 console.log('[唤醒词验证] ✅ STT 验证通过，唤醒！');
+                consecutiveFalseRef.current = 0;  // ★ 重置渐进式冷却
                 consecutiveSttPassesRef.current += 1;
                 directModeFalseCountRef.current = 0;
                 lastWakeTimeRef.current = Date.now();
                 verifyingRef.current = false;
+                playWakeChime();
 
                 // ★ 自适应升级：连续 N 次 STT 通过 → 切换到直接模式
                 if (consecutiveSttPassesRef.current >= CONSECUTIVE_FOR_DIRECT) {
@@ -1182,7 +1429,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
   // ═══════════════════════════════════════
 
   const state: VoiceInteractionState = { phase, recordingTime, audioLevel, error, isEnrolled, lastConfidence, wakeMode };
-  const actions: VoiceInteractionActions = { enable, disable, resumeWakeListening, startManualRecord, stopManualRecord, pauseAudioBuffer, resumeAudioBuffer, setDeafUntil };
+  const actions: VoiceInteractionActions = { enable, disable, resumeWakeListening, startManualRecord, stopManualRecord, pauseAudioBuffer, resumeAudioBuffer, setDeafUntil, startContinuousListening, stopContinuousListening };
 
   return [state, actions];
 }

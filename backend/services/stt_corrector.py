@@ -88,6 +88,7 @@ CORRECTIONS: dict[str, str] = {
     "背考": "备考",
     "被烤": "备考",
     "备烤": "备考",
+    "真体": "真题",
     "六集": "六级",
     "六极": "六级",
 
@@ -160,7 +161,23 @@ def is_low_quality_stt(text: str) -> bool:
     # 纯重复字符
     if len(t) >= 3 and len(set(t)) <= 2:
         return True
-    # 纯英文乱码
-    if re.match(r'^[a-zA-Z\s.,!?;:\'\"\-]+$', t) and len(t) > 10:
+    # 纯英文乱码（任何长度的纯英文/数字/标点文本都不应被记忆）
+    if re.match(r'^[a-zA-Z0-9\s.,!?;:\'\"\-]+$', t):
+        return True
+    # 中文字符检测
+    chinese_chars = sum(1 for c in t if '一' <= c <= '鿿')
+    # 无中文字符 → 低质量（非中文对话）
+    if chinese_chars == 0:
+        return True
+    # 中文占比过低（<30%）→ 噪声文本
+    if len(t) >= 6 and chinese_chars / len(t) < 0.3:
+        return True
+    # 中文字符不足（碎片文本/噪声）
+    if len(t) < 8 and chinese_chars < 3:
+        return True
+    if len(t) < 5 and chinese_chars < 2:
+        return True
+    # 单句英文单词（如 "hello", "ok thanks"）→ 不记忆
+    if len(t) < 20 and chinese_chars == 0:
         return True
     return False
