@@ -517,29 +517,30 @@ async def send_music_control(ws, music_action: dict, tts_callback=None):
             asyncio.create_task(tts_callback(ws, "好的", "music"))
         return
 
-    # ── 歌单播放 ──
+    # ── 歌单播放（仅 action=play 时生效，pause/stop 不触发）──
     playlist_name = music_action.get("playlist", "")
-    if not playlist_name and not query:
-        try:
-            all_playlists = list_playlists()
-            if all_playlists:
-                playlist_name = list(all_playlists.keys())[0]
-                logger.info(f"无歌单/无搜索 → 默认歌单: '{playlist_name}'")
-        except Exception:
-            pass
-    if not playlist_name and query:
-        try:
-            all_playlists = list_playlists()
-            q_lower = query.strip().lower()
-            for pname in all_playlists:
-                if q_lower == pname.lower() or pname.lower() in q_lower:
-                    playlist_name = pname
-                    logger.info(f"歌单自动匹配: query='{query}' → playlist='{playlist_name}'")
-                    break
-        except Exception:
-            pass
+    if action == "play":
+        if not playlist_name and not query:
+            try:
+                all_playlists = list_playlists()
+                if all_playlists:
+                    playlist_name = list(all_playlists.keys())[0]
+                    logger.info(f"无歌单/无搜索 → 默认歌单: '{playlist_name}'")
+            except Exception:
+                pass
+        if not playlist_name and query:
+            try:
+                all_playlists = list_playlists()
+                q_lower = query.strip().lower()
+                for pname in all_playlists:
+                    if q_lower == pname.lower() or pname.lower() in q_lower:
+                        playlist_name = pname
+                        logger.info(f"歌单自动匹配: query='{query}' → playlist='{playlist_name}'")
+                        break
+            except Exception:
+                pass
 
-    if playlist_name:
+    if action == "play" and playlist_name:
         songs = get_playlist(playlist_name)
         if songs:
             import random as _random
