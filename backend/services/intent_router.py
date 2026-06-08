@@ -323,14 +323,19 @@ def _detect_mixed(text: str) -> RouteDecision | None:
 def _detect_cet6(text: str) -> bool:
     t = text.lower()
     # 内联 STT 纠错（捕获未被全局 CORRECTIONS 覆盖的边界情况）
-    t = t.replace("真体", "真题")
+    t = t.replace("真体", "真题").replace("真旗", "真题").replace("六旗", "六级")
     has_cet = any(kw in t for kw in ["六级", "cet6", "cet-6", "英语六级", "四六级"])
     has_study = any(kw in t for kw in [
         "备考", "复习", "学习", "真题", "做题", "练习", "考试",
-        "模拟", "刷题", "卷子", "做卷", "测试",
+        "模拟", "刷题", "卷子", "做卷", "测试", "做",
         "听力", "口语", "阅读", "写作", "翻译", "完形",
         "背单词", "做卷子",
     ])
+
+    # 组合正则：捕获"想/要/来/给 + 做/弄/搞/刷 + ... + 六级/cet6/真题"
+    composite_re = re.compile(r'(?:想|要|来|给)(?:做|弄|搞|刷).*(?:六级|cet6|真题)')
+    if composite_re.search(t):
+        return True
 
     # 音乐命令过滤：避免"播放六级听力"被误路由到 cet6
     music_start = any(t.startswith(kw) for kw in ["播放", "听", "唱", "放", "来首", "来一"])

@@ -149,6 +149,7 @@ class ContextEngine:
         self._alert_callback: Callable | None = None
         self._suppressed = False
         self._last_alert_times: dict[str, float] = {}
+        self._alert_history: list[dict] = []  # 最近 20 条提醒
 
     def set_alert_callback(self, callback: Callable):
         """设置提醒推送回调，接收 alert dict"""
@@ -185,6 +186,9 @@ class ContextEngine:
                     continue
                 self._last_alert_times[rule_id] = time.time()
                 result["timestamp"] = time.time()
+                self._alert_history.insert(0, result)
+                if len(self._alert_history) > 20:
+                    self._alert_history = self._alert_history[:20]
                 logger.info(f"情境引擎触发: {rule_id} — {result['reason']}")
                 await self._alert_callback(result)
 
@@ -195,6 +199,9 @@ class ContextEngine:
             if time.time() - last >= 900:
                 self._last_alert_times["night_reminder"] = time.time()
                 night_result["timestamp"] = time.time()
+                self._alert_history.insert(0, night_result)
+                if len(self._alert_history) > 20:
+                    self._alert_history = self._alert_history[:20]
                 logger.info(f"情境引擎触发: night_reminder — {night_result['reason']}")
                 await self._alert_callback(night_result)
 
@@ -230,6 +237,26 @@ class ContextEngine:
     def set_suppressed(self, val: bool):
         self._suppressed = val
         logger.info(f"主动提醒{'已关闭' if val else '已开启'}")
+
+    def get_status(self) -> dict:
+        """返回引擎状态（供 WebSocket 推送到前端）"""
+        has_schedule = False
+        try:
+            memories = self._get_memory().get_all()
+            for m in memories:
+                val = m.get("value", "")
+                import re
+                if re.search(r'\d{1,2}[:：点]', val):
+                    has_schedule = True
+                    break
+        except Exception:
+            pass
+        return {
+            "running": self._running,
+            "suppressed": self._suppressed,
+            "has_schedule": has_schedule,
+            "history": self._alert_history[:5],  # 最近 5 条
+        }
 
 
 # 全局单例

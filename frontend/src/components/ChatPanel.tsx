@@ -59,6 +59,13 @@ export default function ChatPanel({
   // ═══════════════════════════════════════
   const { isSupported: ttsSupported, speaking, autoSpeak, toggleAutoSpeak, speak, stop: stopTts } = useTTS({ lang: 'zh-CN', rate: 1.1 });
 
+  // ★ 追踪是否有活跃 LLM 流（用于唤醒/打断时决定是否发送 cancel）
+  const _hasActiveLlmRef = useRef(false);
+  useEffect(() => {
+    const lastMsg = messages[messages.length - 1];
+    _hasActiveLlmRef.current = !!(lastMsg?.role === 'ai' && lastMsg.isStreaming);
+  }, [messages]);
+
   // ═══════════════════════════════════════
   // 语音交互状态机（唤醒词 + 录音）
   // ═══════════════════════════════════════
@@ -73,8 +80,11 @@ export default function ChatPanel({
       _ttsClearedRef.current = true;  // ★ 标记为打断清空，防止后续启动连续倾听
       onTtsClear?.();
       onTtsFallbackConsumed?.();
-      // 取消正在进行的 LLM 生成（后端流式输出 + 前端流式消息）
-      onCancel?.();
+      // ★ 仅在活跃 LLM 流时发送 cancel（新鲜唤醒无 LLM 运行，避免不必要的取消信号）
+      if (_hasActiveLlmRef.current) {
+        console.log('[语音助手] 检测到活跃 LLM 流，发送 cancel');
+        onCancel?.();
+      }
     },
     // B-3: 录音结束后发送完整音频
     onAudioComplete: (b64: string) => {
@@ -97,7 +107,9 @@ export default function ChatPanel({
       _ttsClearedRef.current = true;  // ★ 标记为打断清空，防止后续启动连续倾听
       onTtsClear?.();
       onTtsFallbackConsumed?.();
-      onCancel?.();
+      if (_hasActiveLlmRef.current) {
+        onCancel?.();
+      }
     },
   });
 

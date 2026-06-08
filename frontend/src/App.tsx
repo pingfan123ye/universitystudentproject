@@ -25,6 +25,7 @@ export default function App() {
     cet6Paper, setCet6Paper, cet6Answers, setCet6Answers,
     cet6SearchResults, sendCet6Download,
     resetConversation,
+    alertStatus,
   } = useWebSocket();
 
   const {
@@ -132,7 +133,7 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen" style={{ background: 'var(--bg-root)', color: 'var(--text-primary)' }}>
-      <StatusBar status={status} lastPath={lastPath}
+      <StatusBar status={status} lastPath={lastPath} alertStatus={alertStatus}
   alertsEnabled={true} onToggleAlerts={toggleSuppressAlerts} />
 
       {/* 桌面：主区域 + 侧栏并排；手机：侧栏作为覆盖层 */}

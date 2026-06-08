@@ -83,6 +83,10 @@ function playWakeChime() {
     gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2);
     osc.start();
     osc.stop(ctx.currentTime + 0.2);
+    // ★ 振荡器结束后关闭 AudioContext，防止泄漏
+    osc.onended = () => {
+      ctx.close().catch(() => {});
+    };
   } catch { /* 静默失败，不影响主流程 */ }
 }
 
@@ -583,6 +587,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
   // ═══════════════════════════════════════
 
   const startRecording = useCallback(async (): Promise<boolean> => {
+    const _t0 = Date.now();
     try {
       // ★ 如果已被外部取消（disable/cleanup 在 setTimeout 间隙触发），不再启动
       if (cancelledRef.current) {
@@ -597,13 +602,32 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
       // ★ 标记录音中：防止 onMatch 在录音期间误触发 cancel
       recordingRef.current = true;
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,   // ★ 关闭 AEC：录音流上 AEC 过度衰减人声(峰值/9)，导致 STT 音频不可用
-          noiseSuppression: true,
-          autoGainControl: true,    // 唤醒词 Mellon 和 STT 都需要足够信号
-        },
-      });
+      // ★ 重试机制：首次获取失败后等 400ms 重试一次（应对 PCM 缓冲释放延迟）
+      let stream: MediaStream | null = null;
+      let lastErr: any;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          console.log(`[录音] 📡 请求麦克风... (attempt ${attempt + 1}/2)`);
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: false,   // ★ 关闭 AEC：录音流上 AEC 过度衰减人声(峰值/9)，导致 STT 音频不可用
+              noiseSuppression: true,
+              autoGainControl: true,    // 唤醒词 Mellon 和 STT 都需要足够信号
+            },
+          });
+          break;  // 成功，跳出重试循环
+        } catch (err: any) {
+          lastErr = err;
+          if (attempt === 0) {
+            console.warn(`[录音] ⚠️ 首次获取麦克风失败: ${err.message}，400ms 后重试...`);
+            await new Promise(r => setTimeout(r, 400));
+          }
+        }
+      }
+      if (!stream) {
+        throw lastErr || new Error('获取麦克风失败（重试已耗尽）');
+      }
+      console.log(`[录音] ✅ 麦克风已获取 (耗时 ${Date.now() - _t0}ms, attempts=${stream ? 'ok' : 'fail'})`);
       recStreamRef.current = stream;
       autoStoppedRef.current = false;
       cancelledRef.current = false;  // ★ 确认启动成功后才清除取消标志（防止覆盖 disable() 的取消）
@@ -704,10 +728,13 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
             if (noSpeechDuration >= NO_SPEECH_TIMEOUT_MS) {
               const r = recRef.current;
               if (r && r.state === 'recording') {
+                const elapsedSinceStart = Date.now() - startTime;
                 console.log(
                   `[静音检测] 🛑 无语音超时停止 ` +
-                  `rms=${rms.toFixed(5)} < speechThr=${speechThreshold.toFixed(5)} ` +
-                  `noSpeech=${noSpeechDuration}ms (阈值${NO_SPEECH_TIMEOUT_MS}ms)`
+                  `rms=${rms.toFixed(5)} speechThr=${speechThreshold.toFixed(5)} ` +
+                  `noiseFloor=${noiseFloor.toFixed(5)} speechPeak=${speechPeak.toFixed(5)} ` +
+                  `noSpeech=${noSpeechDuration}ms elapsed=${elapsedSinceStart}ms ` +
+                  `samples=${sampleCount} (阈值${NO_SPEECH_TIMEOUT_MS}ms)`
                 );
                 autoStoppedRef.current = true;
                 r.stop();
@@ -734,10 +761,12 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
               const r = recRef.current;
               if (r && r.state === 'recording') {
                 const trigger = isQuickStop ? '快速停止' : (isSilenceByPeakDecay ? '峰值衰减' : '噪声基线');
+                const elapsedSinceStart = Date.now() - startTime;
                 console.log(
                   `[静音检测] 🛑 自动停止(${trigger}) ` +
                   `rms=${rms.toFixed(5)} peakDecayThr=${peakDecayThreshold.toFixed(5)} ` +
-                  `silenceThr=${silenceThreshold.toFixed(5)} silence=${silenceDuration}ms`
+                  `silenceThr=${silenceThreshold.toFixed(5)} noiseFloor=${noiseFloor.toFixed(5)} ` +
+                  `silence=${silenceDuration}ms elapsed=${elapsedSinceStart}ms samples=${sampleCount}`
                 );
                 autoStoppedRef.current = true;
                 r.stop();
@@ -793,6 +822,20 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
         if (e.data.size > 0) {
           recChunksRef.current.push(e.data);
         }
+      };
+
+      // ★ onerror：MediaRecorder 异常（如音频设备冲突、编码器故障）
+      rec.onerror = (e: Event) => {
+        const err = (e as any)?.error || e;
+        const errName = (err as any)?.name || 'Unknown';
+        const errMsg = (err as any)?.message || '';
+        console.error(`[录音] ❌ MediaRecorder 错误: ${errName} ${errMsg}`, err);
+        setError(`录音失败: ${errName}`);
+      };
+
+      // ★ onstart：诊断日志 — 确认录音已实际开始
+      rec.onstart = () => {
+        console.log(`[录音] ▶️ MediaRecorder 已启动 state=${rec.state}`);
       };
 
       // ═══════════════════════════════════════
@@ -1209,7 +1252,7 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
                   const ok = await startRecording();
                   if (ok) console.log('[唤醒词] 直接模式自动开始录音');
                 }
-              }, 200);
+              }, 500);  // ★ 500ms 等待麦克风释放（原 200ms 不够，Windows 释放音频设备有延迟）
               return;
             }
 
@@ -1242,13 +1285,13 @@ export function useVoiceInteraction(opts: VoiceInteractionOptions): [VoiceIntera
 
                 onWakeDetected();
                 setPhase('wake_detected');
-                // ★ PCM 缓冲已释放麦克风，200ms 足够清理
+                // ★ PCM 缓冲已释放麦克风，500ms 确保 Windows 浏览器完全释放音频设备
                 setTimeout(async () => {
                   if (enabledRef.current && phaseRef.current === 'wake_detected') {
                     const ok = await startRecording();
                     if (ok) console.log('[唤醒词] STT验证通过，自动开始录音');
                   }
-                }, 200);
+                }, 500);
               } else {
                 // ❌ STT 验证拒绝 → 假触发（需重建 PCM 缓冲 + 重启 Mellon）
                 handleFalsePositive();

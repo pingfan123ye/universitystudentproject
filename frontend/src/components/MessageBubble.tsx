@@ -28,7 +28,7 @@ const modelLabel: Record<string, string> = {
   'deepseek:deepseek-v4-pro': 'DeepSeek',
   'ollama:qwen2.5:7b': 'Qwen',
   'ollama:qwen2.5:14b': 'Qwen',
-  'ollama:qwen3:8b': 'Qwen3',
+  'ollama:qwen3:8b': 'qwen3:8b',
   xiaoai: '小智', reasonix: 'Reasonix', cache: '缓存',
 };
 const modelColor: Record<string, string> = {

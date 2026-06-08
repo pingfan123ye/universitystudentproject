@@ -68,6 +68,7 @@ export function useWebSocket() {
     message?: string;
     query?: string;
   }>({ status: '' });
+  const [alertStatus, setAlertStatus] = useState<{ running: boolean; suppressed: boolean; has_schedule: boolean; history: any[] }>({ running: false, suppressed: false, has_schedule: false, history: [] });
   const [cet6Paper, setCet6Paper] = useState<Cet6Paper | null>(null);
   const [cet6Answers, setCet6Answers] = useState<{ pdf_url: string } | null>(null);
   const [cet6SearchResults, setCet6SearchResults] = useState<Cet6SearchResult[]>([]);
@@ -256,6 +257,16 @@ export function useWebSocket() {
               timestamp: Date.now(),
             },
           ]);
+          return;
+        }
+
+        if (data.type === 'alert_status') {
+          setAlertStatus({
+            running: data.running || false,
+            suppressed: data.suppressed || false,
+            has_schedule: data.has_schedule || false,
+            history: data.history || [],
+          });
           return;
         }
 
@@ -684,5 +695,6 @@ export function useWebSocket() {
     cet6Paper, setCet6Paper, cet6Answers, setCet6Answers,
     cet6SearchResults, sendCet6Download,
     sendCompleteAudio, sendVerifyWake, sendCancel, sendCet6Close, resetConversation,
+    alertStatus,
   };
 }

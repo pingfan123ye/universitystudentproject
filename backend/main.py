@@ -356,6 +356,11 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning(f"模型 {DEFAULT_MODEL} 未找到")
     logger.info(f"Reasonix CLI 可用: {is_reasonix_available()}")
+    deepseek_ok = await check_deepseek_available()
+    if deepseek_ok:
+        logger.info("DeepSeek 云端 API 可用 ✓（搜索/查询将路由到云端）")
+    else:
+        logger.warning("DeepSeek 云端 API 不可用（请检查 .env 中的 DEEPSEEK_API_KEY）")
     logger.info("预加载 SenseVoice STT 模型（后台下载）...")
     from services.sensevoice_stt import preload_model
     await preload_model()
@@ -513,6 +518,13 @@ async def websocket_endpoint(ws: WebSocket):
     )
     ce.set_alert_callback(_on_alert)
     await ce.start(interval_seconds=30)
+
+    # 推送提醒引擎初始状态
+    try:
+        alert_status = ce.get_status()
+        await ws.send_json({"type": "alert_status", **alert_status})
+    except Exception:
+        pass
 
     # 对话历史（按路径隔离）
     conversation_histories: dict[str, list[dict]] = {
