@@ -11,8 +11,8 @@ import sys
 # 切到 backend 目录
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-HOST = "0.0.0.0"
-PORT = 8002
+# 从统一配置读取端口
+from config import BACKEND_PORT as PORT, BACKEND_HOST as HOST
 
 # 1. 先用 SO_REUSEADDR 绑定端口（Windows 允许绕过 TIME_WAIT）
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

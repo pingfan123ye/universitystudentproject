@@ -20,7 +20,7 @@ export default function App() {
     timeState, setTime, setTimeSpeed, toggleTimePause, toggleTimeSim, toggleSuppressAlerts,
     sendMessage, clearMessages, fetchCacheList, deleteCache,
     fetchMemoryList, deleteMemory, clearMemories,
-    sendCompleteAudio, sendCancel, sendCet6Close, transcriptionText, ttsFallbackText,
+    sendCompleteAudio, sendVerifyWake, sendCancel, sendCet6Close, transcriptionText, ttsFallbackText,
     musicSearchStatus,
     cet6Paper, setCet6Paper, cet6Answers, setCet6Answers,
     cet6SearchResults, sendCet6Download,
@@ -47,7 +47,7 @@ export default function App() {
   // ═══════════════════════════════════════
   // TTS 队列：防止音乐/CET-6 播报打断 LLM 回复
   // ═══════════════════════════════════════
-  const ttsQueueRef = useRef<{ text: string; audio: string }[]>([]);
+  const ttsQueueRef = useRef<{ text: string; audio: string; seq: number }[]>([]);
   const ttsPlayingRef = useRef(false);
   const [pendingTts, setPendingTts] = useState<{ text: string; audio: string } | null>(null);
 
@@ -61,10 +61,20 @@ export default function App() {
     }
   }, []);
 
-  // 新 TTS 音频到达 → 入队，空闲则立即播放
+  // 新 TTS 音频到达 → 按 seq 顺序入队，空闲则立即播放
   useEffect(() => {
     if (ttsAudio?.audio) {
-      ttsQueueRef.current.push({ text: ttsAudio.text, audio: ttsAudio.audio });
+      const item = { text: ttsAudio.text, audio: ttsAudio.audio, seq: ttsAudio.seq ?? 0 };
+      // 按 seq 顺序插入（保持队列始终有序）
+      const queue = ttsQueueRef.current;
+      let insertAt = queue.length;
+      for (let i = 0; i < queue.length; i++) {
+        if (item.seq < queue[i].seq) {
+          insertAt = i;
+          break;
+        }
+      }
+      queue.splice(insertAt, 0, item);
       if (!ttsPlayingRef.current) {
         playNextTts();
       }
@@ -134,9 +144,10 @@ export default function App() {
             pendingTts={pendingTts} onTtsPlayed={() => setPendingTts(null)}
             onTtsFinished={handleTtsFinished} onTtsClear={handleTtsClear}
             pendingTtsFallback={pendingTtsFallback} onTtsFallbackConsumed={() => setPendingTtsFallback('')}
-            onSendCompleteAudio={(b64: string) => sendCompleteAudio(b64)} onCancel={() => sendCancel()}
+            onSendCompleteAudio={(b64: string) => sendCompleteAudio(b64)} onVerifyWake={sendVerifyWake} onCancel={() => sendCancel()}
             streamText={transcriptionText}
             onDuckMusic={duckForRecording} onRestoreMusic={restoreVolumeAfterRecording}
+            isMusicPlaying={playerState === 'playing'}
             isMobile={isMobile} onToggleSidebar={() => setSidebarOpen(true)}
             onResetConversation={resetConversation}
             cet6Paper={cet6Paper} cet6Answers={cet6Answers}

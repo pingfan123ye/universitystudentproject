@@ -129,3 +129,28 @@ class TestExtractMusicQuery:
 
     def test_empty(self):
         assert _extract_music_query("") == ""
+
+
+class TestMixedIntent:
+    """混合意图检测（v0.3.0）"""
+
+    def test_mixed_device_and_llm(self):
+        d = classify("打开灯然后帮我查一下明天天气")
+        assert d.path == "mixed"
+        assert len(d.sub_tasks) == 2
+
+    def test_not_mixed_without_connector(self):
+        d = classify("打开灯查天气")
+        # 没有连接词 → 可能走 xiaoai 或 llm，但不应走 mixed
+        assert d.path != "mixed"
+
+    def test_sensevoice_accuracy(self):
+        """SenseVoice 提升准确率后，不再需要大量 STT 误识别补偿"""
+        # 正确识别的音乐命令应直接路由到 xiaoai
+        d = classify("播放周杰伦的晴天")
+        assert d.path == "xiaoai"
+        assert d.music_action is not None
+        # 正确识别的设备命令
+        d2 = classify("关闭卧室灯")
+        assert d2.path == "xiaoai"
+        assert len(d2.device_actions) >= 1

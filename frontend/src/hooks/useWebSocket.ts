@@ -77,6 +77,8 @@ export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const currentAiMsgRef = useRef<string>('');
+  // 唤醒词验证 Promise resolve（用于 sendVerifyWake → onmessage 异步响应）
+  const wakeVerifyResolveRef = useRef<((ok: boolean) => void) | null>(null);
   // Refs 用于在 connect 闭包中获取最新的函数引用
   const fetchMemoryListRef = useRef<() => void>(() => {});
   const fetchCacheListRef = useRef<() => void>(() => {});
@@ -157,8 +159,15 @@ export function useWebSocket() {
           setTranscriptionText(data.text || '');
           // 只在最终结果时自动发送（final=true），中间结果仅更新输入框预览
           if (data.final && data.text?.trim() && wsRef.current?.readyState === WebSocket.OPEN) {
-            setTranscriptionText('');  // 立即清空输入框，避免旧文字残留
             const text = data.text.trim();
+            // ★ 过滤噪声：最短 2 个字符 + 非纯标点/语气词（单字噪声如"嗯""啊"直接丢弃）
+            const isNoise = /^[，。！？、；：""''（）\s]+$/.test(text) || /^[嗯啊哦呃哎唉嘿喂哟]$/.test(text);
+            if (text.length < 2 || isNoise) {
+              console.log(`[STT] 🚫 噪声过滤: "${text}" (len=${text.length})`);
+              setTranscriptionText('');
+              return;
+            }
+            setTranscriptionText('');  // 立即清空输入框，避免旧文字残留
             // 添加用户消息到列表
             setMessages((prev) => [...prev, {
               id: nextId(), role: 'user' as const, content: text, timestamp: Date.now(),
@@ -280,7 +289,7 @@ export function useWebSocket() {
         }
 
         if (data.type === 'tts_audio' && data.audio) {
-          setTtsAudio({ audio: data.audio, text: data.text || '', path: data.path || '' });
+          setTtsAudio({ audio: data.audio, text: data.text || '', path: data.path || '', seq: data.seq ?? 0 });
           return;
         }
 
@@ -321,6 +330,30 @@ export function useWebSocket() {
 
         if (data.type === 'cet6_search_results') {
           setCet6SearchResults(data.results || []);
+          return;
+        }
+
+        // ── 唤醒词验证响应 ──
+        if (data.type === 'wake_verified') {
+          if (wakeVerifyResolveRef.current) {
+            wakeVerifyResolveRef.current(true);
+            wakeVerifyResolveRef.current = null;
+          }
+          return;
+        }
+
+        if (data.type === 'wake_rejected') {
+          if (wakeVerifyResolveRef.current) {
+            wakeVerifyResolveRef.current(false);
+            wakeVerifyResolveRef.current = null;
+          }
+          // ★ 诊断日志：显示 STT 实际转写内容
+          const sttText = data.text || '';
+          if (sttText) {
+            console.log(`[唤醒词验证] 📝 STT 转写: "${sttText}"`);
+          } else {
+            console.log('[唤醒词验证] 📝 STT 转写: (空/静音)');
+          }
           return;
         }
 
@@ -569,6 +602,31 @@ export function useWebSocket() {
     }
   }, []);
 
+  // ★ 唤醒词二次验证：发送 2 秒验证音频到后端 STT 检查是否含"小智"
+  const sendVerifyWake = useCallback((audioBase64: string): Promise<boolean> => {
+    return new Promise((resolve) => {
+      // 清除旧的 pending resolve（防止前一次超时残留）
+      if (wakeVerifyResolveRef.current) {
+        wakeVerifyResolveRef.current(false);
+        wakeVerifyResolveRef.current = null;
+      }
+      wakeVerifyResolveRef.current = resolve;
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'verify_wake', audio: audioBase64 }));
+      } else {
+        wakeVerifyResolveRef.current = null;
+        resolve(false);
+      }
+      // 超时保护：3 秒后自动拒绝（防止 Promise 永远 pending）
+      setTimeout(() => {
+        if (wakeVerifyResolveRef.current === resolve) {
+          wakeVerifyResolveRef.current = null;
+          resolve(false);
+        }
+      }, 3000);
+    });
+  }, []);
+
   // 唤醒词打断：取消正在进行的 LLM 流式生成
   const sendCancel = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -625,6 +683,6 @@ export function useWebSocket() {
     musicSearchStatus,
     cet6Paper, setCet6Paper, cet6Answers, setCet6Answers,
     cet6SearchResults, sendCet6Download,
-    sendCompleteAudio, sendCancel, sendCet6Close, resetConversation,
+    sendCompleteAudio, sendVerifyWake, sendCancel, sendCet6Close, resetConversation,
   };
 }

@@ -1,5 +1,8 @@
 """
-意图路由分发器 —— 五类路由 + 混合意图拆分
+意图路由分发器 —— 五类路由 + 混合意图拆分 (v0.3.0 精简版)
+
+SenseVoice-Small 中文准确率 ~4-6% CER（vs Whisper ~10-15%），
+大量 STT 误识别补偿词条已不再需要。
 
 路由路径:
   reasonix  → 编程/工作助手
@@ -35,18 +38,16 @@ FORCE_LLM_PREFIX = [
 
 
 def _check_force_llm(text: str) -> bool:
-    """用户明确要求直接走大模型"""
     for p in FORCE_LLM_PREFIX:
         if p.search(text):
             return True
-    # 一些模糊表达也当作强制走大模型
     if text.startswith("你") and ("觉得" in text or "认为" in text or "建议" in text or "推荐" in text):
         return True
     return False
 
 
 # ═══════════════════════════════════════
-# Reasonix 检测（工作助手 / 克劳德 / 贾维斯）
+# Reasonix 检测
 # ═══════════════════════════════════════
 REASONIX_START = [
     (re.compile(r'^(工作助手|编程助手)'), '工作助手'),
@@ -101,99 +102,67 @@ DEVICE_MAP = {
     "风扇": "fan", "电视": "tv",
 }
 
+# ── 音乐动作关键词（精简版，SenseVoice 准确率提升后不再需要大量冗余词条）──
 MUSIC_ACTIONS = {
     "play":  ["播放音乐", "播放歌曲", "放歌", "放音乐", "放点音乐", "放个音乐",
-              "来首歌", "唱歌", "唱首歌", "听歌", "放一首", "播一首", "播音乐", "播歌",
-              "放背景音乐", "播放背景音乐", "播放轻音乐", "来点音乐", "来首",
-              "放轻松音乐", "放点歌", "放首歌", "来点歌", "播点音乐", "播点歌",
-              "来段音乐", "想听音乐", "想听歌", "放个歌", "给我放", "给我唱",
-              "来点背景音乐", "放些音乐", "放些歌", "播一下音乐", "播一下歌",
-              # 简化匹配：具体歌曲名引用
-              "播放", "我想听", "想听", "我要听", "给我放", "放一个", "放个",
-              "唱一个", "点歌", "点一首", "来一个", "来一曲", "来一首",
-              # 繁體中文（Whisper 可能输出繁体）
-              "聽歌", "聽音樂", "想聽", "我想聽", "我要聽", "來首歌", "唱首歌",
-              "放音樂", "放個音樂", "放點音樂", "來點音樂", "播音樂", "播歌",
-              "播放音樂", "播放歌曲", "點歌", "點一首", "來一曲", "給我放", "給我唱",
-              # 随机/泛化请求
-              "随便来一首", "随便来一个", "随便来个", "随便放", "随便播", "随便放一首",
-              "随机播放", "随机来", "随机来一首", "随意来一首", "随意放",
-              "随便什么", "都可以", "什么都行", "什么都可", "来点随机的", "来点随便的",
-              # 短关键词：匹配 "放点不吵的学习歌" / "来点轻音乐" 等自然语言（作为 play 意图入口）
-              "放点", "放些", "来点", "播点", "来些", "播些", "放个",
-              "想听点", "想聽點", "想听些", "想聽些", "来首", "來首"],
+              "来首歌", "唱歌", "听歌", "放一首", "播一首", "播音乐", "播歌",
+              "来点音乐", "来首", "放点歌", "放首歌", "来点歌", "播点音乐", "播点歌",
+              "想听音乐", "想听歌", "给我放", "给我唱", "放些音乐", "放些歌",
+              "播放", "我想听", "想听", "我要听", "点歌", "点一首", "来一首",
+              "随便来一首", "随便来一个", "随便放", "随机播放", "随意来一首",
+              "放点", "放些", "来点", "播点", "放个", "来首"],
     "pause": ["暂停音乐", "暂停播放", "暂停", "停止播放", "停止音乐",
               "关掉音乐", "关闭音乐", "关音乐", "停掉音乐", "别放了", "别唱了",
-              "停了音乐", "把音乐关了", "把音乐关掉", "关背景音乐", "别播了", "别放了",
-              # 繁體中文
-              "暫停音樂", "暫停播放", "暫停", "關掉音樂", "關閉音樂", "關音樂",
-              "停掉音樂", "別放了", "別唱了", "把音樂關了", "把音樂關掉", "別播了"],
-    "next":  ["下一首", "下一首歌", "下一曲", "换一首", "切歌", "切割", "换首歌", "换个歌", "切一首",
-              # 繁體中文
-              "下一首", "下一首歌", "下一曲", "換一首", "切歌", "切割", "換首歌", "換個歌", "切一首"],
+              "别播了", "别放了"],
+    "next":  ["下一首", "下一首歌", "下一曲", "换一首", "切歌", "换首歌", "换个歌", "切一首"],
     "prev":  ["上一首", "上一曲"],
-    "resume": ["继续播放", "继续", "恢复播放",
-               # 繁體中文
-               "繼續播放", "繼續", "恢復播放"],
-    "stop": ["停了", "停止", "关掉音乐", "关闭音乐",
-             # 繁體中文
-             "停了", "關掉音樂", "關閉音樂"],
+    "resume": ["继续播放", "继续", "恢复播放"],
+    "stop": ["停了", "停止", "关掉音乐", "关闭音乐"],
 }
 
 VOLUME_KEYWORDS = ["音量", "大声", "小声", "静音", "声音"]
 
 SCENE_KEYWORDS = ["离家模式", "回家模式", "晚安", "起床模式", "观影模式", "阅读模式"]
 
-# 严格的音乐播放意图正则：必须包含 动作词 + 歌名/描述
-# "你喜欢音乐吗"、"听歌识曲" → 不匹配；"播放夜空中最亮的星" → 匹配
+# ── 严格音乐播放意图正则（精简版）──
 MUSIC_PLAY_PATTERNS = [
-    re.compile(r"(播放|放|来一首|我想听|我要听|点一首|给我放|给我播|我让你听|我让你放|让你听|让你放)\s*[一-龥a-zA-Z0-9]+"),
-    # 繁体变体
-    re.compile(r"(來一首|我想聽|我要聽|點一首|給我放|給我播|我讓你聽|我讓你放|讓你聽|讓你放)\s*[一-龥a-zA-Z0-9]+"),
+    re.compile(r"(播放|放|来一首|我想听|我要听|点一首|给我放|给你放)\s*[一-龥a-zA-Z0-9]+"),
     re.compile(r"听\s*[一-龥a-zA-Z0-9]+\s*(这首歌|这首)"),
-    re.compile(r"聽\s*[一-龥a-zA-Z0-9]+\s*(這首歌|這首)"),
     re.compile(r"播\s*[一-龥a-zA-Z0-9]+"),
-    # 泛化音乐请求："想听歌""听音乐""来点音乐""放点歌" 等
-    re.compile(r"(想听|想聽|听|聽|来点|來點|放点|放點|播点|播點|来首|來首)\s*(歌|音乐|音樂|歌曲|什么歌|啥歌)"),
-    # 间隔式音乐请求："放点不吵的学习歌"、"来点轻松的轻音乐"、"放些安静的背景音乐"
-    re.compile(r"(放点|放些|来点|来些|播点|播些|想听点|想聽點).{0,15}(歌|音乐|音樂|歌曲|听的|聽的)"),
-    # "顺便放点...歌" / "再放点...音乐" —— 兼容器/修饰词在中间的请求
-    re.compile(r"(顺便|再|也|还|帮我|给我|帮忙)\s*(放点|放些|来点|播点).{0,15}(歌|音乐|音樂|歌曲)"),
-    re.compile(r"(有点|有點|好)\s*(想听|想聽)\s*(歌|音乐|音樂|歌曲)"),
-    # 随机/泛化请求："随便什么都可以""什么歌都行""随意来一首"
-    re.compile(r"(随便|隨便|随意|隨意|随机|隨機|任意).*(歌|音乐|音樂|歌曲|首|曲|什么|什麼|啥)"),
-    re.compile(r"(什么|什麼|啥).*(都可以|都行|也行|都OK|都ok|都可)"),
-    re.compile(r"(来|來|放|播|听|聽).*(随便|隨便|随意|隨意|随机|隨機)"),
+    # 泛化音乐请求
+    re.compile(r"(想听|听|来点|放点|播点|来首)\s*(歌|音乐|歌曲|什么歌|啥歌)"),
+    # 间隔式音乐请求："放点不吵的学习歌"
+    re.compile(r"(放点|放些|来点|来些|播点|播些|想听点).{0,15}(歌|音乐|歌曲|听的)"),
+    # 容器词 + 音乐关键词
+    re.compile(r"(顺便|再|也|还|帮我|给我|帮忙)\s*(放点|放些|来点|播点).{0,15}(歌|音乐|歌曲)"),
+    re.compile(r"(有点|好)\s*(想听)\s*(歌|音乐|歌曲)"),
+    # 随机/泛化请求
+    re.compile(r"(随便|随意|随机|任意).*(歌|音乐|歌曲|首|曲|什么|啥)"),
+    re.compile(r"(什么|啥).*(都可以|都行|也行|都可)"),
 ]
 
 
 def _is_music_play_intent(text: str) -> bool:
-    """只有同时包含动作词+歌名内容才算音乐播放意图"""
     for p in MUSIC_PLAY_PATTERNS:
         if p.search(text):
             return True
     return False
 
-# 设备可处理的基础查询
+
 XIAOAI_QUERY = ["时间", "几点"]
 XIAOAI_UTILITY = ["闹钟", "提醒", "倒计时", "计时"]
 
 
 def _extract_music_query(text: str) -> str:
-    """从自然语言中提取歌名+歌手关键词（统一委托到 music_service.clean_music_query）"""
     from services.music_service import clean_music_query
     return clean_music_query(text)
 
 
-
 def _detect_music_action_fallback(text: str) -> dict | None:
-    """
-    宽松匹配：当严格正则失败时，只要文本包含动作词+音乐词就认为要播音乐。
-    用于补偿 STT 误识别导致的音乐命令丢失。
-    """
+    """宽松匹配：严格正则失败但明显是音乐请求时的补偿"""
     play_hints = ["播放", "放首", "放一", "想听", "来一首", "来一",
-                  "放点", "放些", "来点", "播点", "播", "听", "聽"]
-    music_hints = ["歌", "音乐", "音樂", "曲", "背景", "轻音", "純音", "纯音"]
+                  "放点", "放些", "来点", "播点", "播", "听"]
+    music_hints = ["歌", "音乐", "曲", "背景", "轻音", "纯音"]
     has_play = any(p in text for p in play_hints)
     has_music = any(m in text for m in music_hints)
     if has_play and has_music:
@@ -224,7 +193,6 @@ def _detect_music_action(text: str) -> dict | None:
     if not action:
         for kw in MUSIC_ACTIONS["play"]:
             if kw in text:
-                # 播放意图需要严格匹配：动作词 + 歌名内容
                 if _is_music_play_intent(text):
                     action = "play"
                 break
@@ -238,12 +206,12 @@ def _detect_music_action(text: str) -> dict | None:
             if kw in text:
                 action = "prev"
                 break
-    # 纯音量调节不自动触发播放
+
     if not action and any(kw in text for kw in VOLUME_KEYWORDS):
         if _is_music_play_intent(text):
             action = "play"
 
-    # 宽松 fallback：严格匹配失败但明显是音乐请求
+    # 宽松 fallback
     if not action:
         fallback = _detect_music_action_fallback(text)
         if fallback:
@@ -287,40 +255,34 @@ def _detect_device_actions(text: str) -> list[dict]:
 # 信息查询检测
 # ═══════════════════════════════════════
 
-# 明确需要实时/外部信息的查询
 INFO_QUERY_KEYWORDS = [
     "天气", "新闻", "头条", "热搜", "股票", "汇率", "油价",
     "实时", "最新", "今天", "明天", "后天", "周末",
 ]
 
-# 百科/知识类询问句式
 INFO_QUERY_PATTERNS = [
-    re.compile(r'什么是|什么叫|什么是|啥是|何为'),          # 定义类
-    re.compile(r'怎么(?!样|么|办)'),                         # 方法类（排除"怎么样""怎么办"）
-    re.compile(r'如何(?!何)'),                               # 方法类
-    re.compile(r'为什么|为啥|怎么回事情'),                   # 原因类
-    re.compile(r'(?:请|帮我)?解释(?:一下)?'),                # 解释类
+    re.compile(r'什么是|什么叫|啥是|何为'),
+    re.compile(r'怎么(?!样|么|办)'),
+    re.compile(r'如何(?!何)'),
+    re.compile(r'为什么|为啥|怎么回事情'),
+    re.compile(r'(?:请|帮我)?解释(?:一下)?'),
     re.compile(r'(?:有|有哪|列举|列出|告诉我|请问).*(?:什么|哪些|怎么|如何)'),
-    re.compile(r'的区别|的差异|对比|比较'),                  # 比较类
+    re.compile(r'的区别|的差异|对比|比较'),
     re.compile(r'(?:推荐|介绍|说说).*(?:书|电影|音乐|APP|软件|工具|网站)'),
-    # 新增：常见问句
-    re.compile(r'你(?:是|叫).{0,6}(?:谁|什么)'),            # 你是谁/你叫什么
-    re.compile(r'你(?:知道|了解|认识|听说过)'),             # 你知道...吗
-    re.compile(r'(?:今年|现在|当前).*(?:几几年|哪年|哪一年|年份)'),  # 年份查询
-    re.compile(r'(?:几月|几号|哪月|哪天|星期几)'),           # 日期查询
-    re.compile(r'(?:在|位于|在).*(?:哪|哪里|什么地方)'),     # 位置查询
-    re.compile(r'是不是|有没有|会不会|能不能|可不可以'),     # 是否类
-    re.compile(r'.*吗\s*$'),                                 # 一般疑问句（以"吗"结尾）
+    re.compile(r'你(?:是|叫).{0,6}(?:谁|什么)'),
+    re.compile(r'你(?:知道|了解|认识|听说过)'),
+    re.compile(r'(?:今年|现在|当前).*(?:几几年|哪年|哪一年|年份)'),
+    re.compile(r'(?:几月|几号|哪月|哪天|星期几)'),
+    re.compile(r'(?:在|位于|在).*(?:哪|哪里|什么地方)'),
+    re.compile(r'是不是|有没有|会不会|能不能|可不可以'),
+    re.compile(r'.*吗\s*$'),
 ]
 
 
 def _is_info_query(text: str) -> bool:
-    """检测是否为信息查询（天气/新闻/百科/知识等）"""
-    # 先查关键词
     for kw in INFO_QUERY_KEYWORDS:
         if kw in text:
             return True
-    # 再查句式
     for p in INFO_QUERY_PATTERNS:
         if p.search(text):
             return True
@@ -332,47 +294,25 @@ def _is_info_query(text: str) -> bool:
 # ═══════════════════════════════════════
 
 def _detect_mixed(text: str) -> RouteDecision | None:
-    """
-    检测混合意图：既有设备操作，又有信息查询/创作需求。
-    例如："写首诗然后播放音乐" → 拆分
-         "打开灯帮我查一下明天天气" → 拆分
-    """
     device = _detect_device_actions(text)
     music = _detect_music_action(text)
     is_scene = any(kw in text for kw in SCENE_KEYWORDS)
     has_xiaoai = bool(device) or bool(music) or is_scene
 
-    # 双连接词（然后/并且/同时/还有） + 两类不同操作 → 混合
     has_connector = any(kw in text for kw in ["然后", "并且", "同时", "还有", "再", "也", "又"])
     is_info = _is_info_query(text)
     is_creative = any(kw in text for kw in ["写", "创作", "生成", "画", "编", "作曲"])
 
     if has_xiaoai and (is_info or is_creative) and has_connector:
-        # 拆分：设备部分 + 大模型部分
-        sub_tasks = []
-
-        # 设备子任务
-        xiaoai_task = {
-            "path": "xiaoai",
-            "device_actions": device,
-            "music_action": music,
-            "scene": any(kw in text for kw in SCENE_KEYWORDS),
-        }
-        sub_tasks.append(xiaoai_task)
-
-        # 大模型子任务（剩余的文本）
-        llm_task = {"path": "llm", "text": text}
-        sub_tasks.append(llm_task)
-
+        sub_tasks = [
+            {"path": "xiaoai", "device_actions": device, "music_action": music,
+             "scene": any(kw in text for kw in SCENE_KEYWORDS)},
+            {"path": "llm", "text": text},
+        ]
         return RouteDecision(
-            path="mixed",
-            confidence=0.8,
-            reason="混合意图: 设备+大模型",
-            sub_tasks=sub_tasks,
-            device_actions=device,
-            music_action=music,
+            path="mixed", confidence=0.8, reason="混合意图: 设备+大模型",
+            sub_tasks=sub_tasks, device_actions=device, music_action=music,
         )
-
     return None
 
 
@@ -380,21 +320,12 @@ def _detect_mixed(text: str) -> RouteDecision | None:
 # CET-6 备考检测
 # ═══════════════════════════════════════
 
-CET6_KEYWORDS = [
-    "六级", "CET6", "CET-6", "cet6", "cet-6", "英语六级", "四六级",
-    "备考", "背单词", "学英语", "英语学习",
-    "做真题", "做卷子", "刷题", "模拟考试", "模考",
-]
-
-
 def _detect_cet6(text: str) -> bool:
-    """检测是否涉及六级备考。STT 纠错已在调用前完成（stt_corrector.correct），此处只做关键词匹配。"""
     t = text.lower()
-    has_cet = any(kw in t for kw in ["六级", "cet6", "cet-6", "英语六级", "四六级",
-                                       "四六级考试", "英语考试"])
+    has_cet = any(kw in t for kw in ["六级", "cet6", "cet-6", "英语六级", "四六级"])
     has_study = any(kw in t for kw in [
         "备考", "复习", "学习", "真题", "做题", "练习", "考试",
-        "模拟", "模拟考", "刷题", "卷子", "做卷", "测试",
+        "模拟", "刷题", "卷子", "做卷", "测试",
         "听力", "口语", "阅读", "写作", "翻译", "完形",
         "背单词", "做卷子",
     ])
@@ -406,11 +337,9 @@ def _detect_cet6(text: str) -> bool:
     if has_cet and music_start and not strong_study:
         return False
 
-    # 必须同时满足六级关键词 + 学习意图
     if has_cet and has_study:
         return True
 
-    # 长度兜底：文本很短（≤6字符）且包含"六级" → 大概率是要备考
     if has_cet and len(t) <= 6 and not any(kw in t for kw in ["播放", "听", "唱", "放"]):
         return True
 
@@ -418,7 +347,7 @@ def _detect_cet6(text: str) -> bool:
 
 
 # ═══════════════════════════════════════
-# 设备检测（纯设备/音乐/场景）
+# 设备检测
 # ═══════════════════════════════════════
 
 def _check_xiaoai(text: str) -> RouteDecision | None:
@@ -428,15 +357,14 @@ def _check_xiaoai(text: str) -> RouteDecision | None:
     has_actionable = bool(device) or bool(music) or is_scene
 
     if has_actionable:
-        # 仅音乐意图 + 长文本 + 关键词不在开头 → 疑似对话中顺带提音乐
-        # 不拦截，留给 LLM 处理（LLM 应通过 [ACTIONS] 标签触发播放，兜底有启发式检测）
+        # 仅音乐意图 + 长文本 + 关键词不在开头 → 交给 LLM
         if music and not device and not is_scene and len(text) > 20:
             first_pos = min(
                 (text.find(kw) for kw in MUSIC_ACTIONS["play"] if kw in text),
                 default=-1,
             )
             if first_pos > 8:
-                return None  # 对话为主，音乐在句子后半段 → 交给 LLM
+                return None
 
         parts = []
         if device:
@@ -446,15 +374,11 @@ def _check_xiaoai(text: str) -> RouteDecision | None:
         if is_scene:
             parts.append("场景")
         return RouteDecision(
-            path="xiaoai",
-            confidence=0.9,
-            reason=" | ".join(parts),
+            path="xiaoai", confidence=0.9, reason=" | ".join(parts),
             matched_key=" | ".join(parts),
-            device_actions=device,
-            music_action=music,
+            device_actions=device, music_action=music,
         )
 
-    # 设备能回答的简单查询
     for kw in XIAOAI_QUERY:
         if kw in text:
             return RouteDecision(path="xiaoai", confidence=0.5, reason=f"查询: {kw}", matched_key="查询")
@@ -466,29 +390,27 @@ def _check_xiaoai(text: str) -> RouteDecision | None:
 
 
 # ═══════════════════════════════════════
-# 音乐串扰检测：识别从扬声器播放的歌曲歌词被麦克风误拾取
+# 音乐串扰检测（精简版）
 # ═══════════════════════════════════════
 
 MUSIC_BLEED_PATTERNS = [
-    re.compile(r'字幕\s*by', re.IGNORECASE),      # "字幕by索兰娅"
-    re.compile(r'by\s*[a-zA-Z一-鿿]+'),    # "by某某" 混中英文
-    re.compile(r'^[a-zA-Z\s]+$'),                   # 全英文（不太可能是中文语音指令）
-    re.compile(r'^(谢谢|謝謝|感謝|thank|thanks|thank you)\s*$', re.IGNORECASE),  # 纯感谢/结束语
-    re.compile(r'^呃[,，]?\s*$'),                    # 纯语气词
+    re.compile(r'字幕\s*by', re.IGNORECASE),
+    re.compile(r'^[a-zA-Z\s]+$'),                   # 全英文
+    re.compile(r'^(谢谢|謝謝|感謝|thank|thanks)\s*$', re.IGNORECASE),  # 感谢/结束语
+    # 短英文噪音（环境噪音被 SenseVoice 转写为 "I.", "The.", "am." 等）
+    re.compile(r'^[a-zA-Z]{1,4}\.?$'),              # 单英文单词 + 可选句号
+    re.compile(r'^[a-zA-Z\s]{1,10}\.?$'),           # 极短英文短语（< 10 字符纯 ASCII）
 ]
 
 
 def _is_music_bleed(text: str) -> bool:
-    """检测文本是否像是从播放中的音乐里误拾取的歌词/字幕"""
     for p in MUSIC_BLEED_PATTERNS:
         if p.search(text):
             return True
-    # 短文本 + 真正有重复字符（如"謝謝謝謝"、"好的好的"）
-    # 避免误杀正常短命令：晚安/开灯/关灯/切歌/暂停 等
+    # 短文本 + 重复字符
     if len(text) <= 6:
         chars = set(text)
         if len(chars) <= 2:
-            # 仅当有字符重复出现（非每个字符仅出现一次）才视为噪声
             if any(text.count(c) >= 2 for c in chars):
                 return True
     return False
@@ -500,53 +422,51 @@ def _is_music_bleed(text: str) -> bool:
 
 def classify(text: str) -> RouteDecision:
     """
-    五类路由主入口。
+    六类路由主入口。
 
     路由顺序:
-      0. 音乐串扰过滤 → noise（忽略）
+      0. 音乐串扰过滤 → noise
       1. 强制走大模型前缀 → llm (force_llm=True)
       2. Reasonix 编程任务 → reasonix
-      3. 混合意图（既有设备又有大模型需求）→ mixed
+      3. 混合意图 → mixed
       4. 设备可执行 → xiaoai
-      5. 信息查询（天气/百科等，进双引擎）→ info_query
-      6. 大模型兜底 → llm
+      5. CET-6 备考 → cet6
+      6. 信息查询 → info_query
+      7. 大模型兜底 → llm
     """
     text = text.strip()
     if not text:
         return RouteDecision(path="llm", confidence=0.5, reason="空文本", matched_key="默认")
 
-    # 0. 音乐串扰过滤：从扬声器误拾取的歌词/字幕 → 静默忽略
     if _is_music_bleed(text):
         return RouteDecision(path="noise", confidence=0.95, reason="疑似音乐串扰", matched_key="噪声过滤")
 
-    # 1. 强制走大模型
     if _check_force_llm(text):
         return RouteDecision(
             path="llm", confidence=0.9, reason="用户要求走大模型",
             matched_key="force_llm", force_llm=True,
         )
 
-    # 2. Reasonix
     d = _check_reasonix(text)
     if d:
         return d
 
-    # 3. 混合意图
     d = _detect_mixed(text)
     if d:
         return d
 
-    # 4. 设备（用户没要求走大模型）
     d = _check_xiaoai(text)
     if d:
         return d
 
-    # 6. 信息查询（进双引擎调度）
-    if _is_info_query(text):
+    if _detect_cet6(text):
         return RouteDecision(
-            path="info_query", confidence=0.7, reason="信息查询",
-            matched_key="信息查询",
+            path="cet6", confidence=0.85, reason="CET-6 备考", matched_key="cet6",
         )
 
-    # 6. 大模型兜底
+    if _is_info_query(text):
+        return RouteDecision(
+            path="info_query", confidence=0.7, reason="信息查询", matched_key="信息查询",
+        )
+
     return RouteDecision(path="llm", confidence=0.5, reason="大模型兜底", matched_key="默认")

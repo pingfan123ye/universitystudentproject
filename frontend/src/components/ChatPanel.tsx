@@ -21,11 +21,13 @@ interface ChatPanelProps {
   onSendCompleteAudio?: (base64: string) => void;
   onCancel?: () => void;  // 唤醒词打断：取消正在进行的 LLM 生成
   streamText?: string;
-  onDuckMusic?: () => void;
+  onDuckMusic?: (factor?: number) => void;
   onRestoreMusic?: () => void;
   isMobile?: boolean;
   onToggleSidebar?: () => void;
   onResetConversation?: () => void;
+  onVerifyWake?: (audioBase64: string) => Promise<boolean>;  // ★ STT 唤醒词二次验证
+  isMusicPlaying?: boolean;  // ★ 音乐是否正在播放（用于 Light Duck）
   // CET-6
   cet6Paper?: Cet6Paper | null;
   cet6Answers?: Record<string, string> | null;
@@ -42,7 +44,8 @@ export default function ChatPanel({
   onSend, onClear, onSendCompleteAudio, onCancel, streamText: propStreamText,
   onDuckMusic, onRestoreMusic, isMobile, onToggleSidebar, onResetConversation,
   cet6Paper, cet6Answers, onCet6Close,
-  cet6SearchResults, onCet6Download,
+  cet6SearchResults, onCet6Download, isMusicPlaying,
+  onVerifyWake,
 }: ChatPanelProps) {
   const [input, setInput] = useState('');
   const [micActive, setMicActive] = useState(false);
@@ -85,7 +88,37 @@ export default function ChatPanel({
     },
     onDuckMusic,
     onRestoreMusic,
+    onVerifyWake,
   });
+
+  // ★ 二级 Ducking：音乐播放时 Light Duck 减少歌词干扰唤醒词检测
+  useEffect(() => {
+    if (isMusicPlaying && voiceState.phase === 'waiting_for_wake') {
+      onDuckMusic?.(0.35);  // Light Duck: 35% 音量
+    } else if (!isMusicPlaying || voiceState.phase === 'idle') {
+      onRestoreMusic?.();    // 音乐停止 或 回到空闲 → 恢复音量
+    }
+    // recording/verifying 阶段由 onWakeDetected 回调中的 onDuckMusic?.() 触发 Deep Duck，此处不干预
+  }, [isMusicPlaying, voiceState.phase]);
+
+  // ★ TTS 播放时暂停 PCM 缓冲 + 设置 Mellon 失聪期，防止扬声器播报被麦克风拾取触发自唤醒
+  const ttsResumeTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  useEffect(() => {
+    if (pendingTts) {
+      // TTS 队列有内容 → 立即暂停 PCM 缓冲（Mellon 保持运行以支持打断）
+      clearTimeout(ttsResumeTimerRef.current);
+      voiceActions.pauseAudioBuffer();
+      // ★ B1: 设置 Mellon 失聪期（每句话续期 3s，防止 TTS 回声触发唤醒）
+      //   用户仍可在句间大声喊唤醒词打断（3s 窗口短，句间会续期）
+      voiceActions.setDeafUntil(Date.now() + 3000);
+    } else {
+      // TTS 队列清空 → 延迟恢复（等音频拖尾消散 + 防止句间抖动）
+      ttsResumeTimerRef.current = setTimeout(() => {
+        voiceActions.resumeAudioBuffer();
+      }, 800);
+    }
+    return () => clearTimeout(ttsResumeTimerRef.current);
+  }, [pendingTts]);
 
   // ── 唤醒词注册完成 → 延迟后自动启用语音助手（等麦克风释放）──
   const handleEnrollmentComplete = useCallback(() => {
@@ -139,7 +172,7 @@ export default function ChatPanel({
   useEffect(() => {
     if (voiceState.phase === 'recording' || voiceState.phase === 'wake_detected') {
       setMicActive(true);
-    } else if (voiceState.phase === 'processing' || voiceState.phase === 'waiting_for_wake' || voiceState.phase === 'idle') {
+    } else if (voiceState.phase === 'verifying' || voiceState.phase === 'processing' || voiceState.phase === 'waiting_for_wake' || voiceState.phase === 'idle') {
       setMicActive(false);
     }
   }, [voiceState.phase]);
@@ -203,6 +236,7 @@ export default function ChatPanel({
     switch (voiceState.phase) {
       case 'initializing': return '⏳ 加载中';
       case 'waiting_for_wake': return '🔊 待命中';
+      case 'verifying': return '🎯 确认中';
       case 'wake_detected': return '🟢 我在听';
       case 'recording': return '🔴 录音中';
       case 'processing': return '⏳ 思考中';
@@ -223,11 +257,13 @@ export default function ChatPanel({
     background:
       voiceState.phase === 'initializing' ? '#f59e0b' :
       voiceState.phase === 'waiting_for_wake' ? '#22c55e' :
+      voiceState.phase === 'verifying' ? '#3b82f6' :
       voiceState.phase === 'wake_detected' ? '#22c55e' :
       voiceState.phase === 'recording' ? '#dc2626' :
       voiceState.phase === 'processing' ? '#f59e0b' :
       'var(--bg-input)',
     animation: voiceState.phase === 'waiting_for_wake' ? 'pulse 2s ease-in-out infinite' :
+                voiceState.phase === 'verifying' ? 'pulse 0.6s ease-in-out infinite' :
                 voiceState.phase === 'recording' ? 'pulse 0.8s ease-in-out infinite' :
                 voiceState.phase === 'initializing' ? 'pulse 1s ease-in-out infinite' : 'none',
   };
@@ -295,6 +331,17 @@ export default function ChatPanel({
               background: 'rgba(34,197,94,0.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.2)',
             }}>
               🔊 说 "{WAKE_WORD}" 唤醒我
+            </span>
+          </div>
+        )}
+
+        {/* ★ 唤醒验证中提示：用户知道系统正在响应，不需要重复喊唤醒词 */}
+        {voiceState.phase === 'verifying' && (
+          <div className="flex justify-center my-2">
+            <span className="text-[11px] px-3 py-1 rounded-full animate-pulse" style={{
+              background: 'rgba(59,130,246,0.1)', color: '#3b82f6', border: '1px solid rgba(59,130,246,0.2)',
+            }}>
+              🎯 正在确认唤醒词...
             </span>
           </div>
         )}
@@ -391,6 +438,26 @@ export default function ChatPanel({
           >
             {voiceBtnLabel}
           </button>
+          {/* ★ 置信度指示器：显示 Mellon 匹配分数和当前模式 */}
+          {voiceState.phase !== 'idle' && voiceState.phase !== 'initializing' && voiceState.lastConfidence > 0 && (
+            <span
+              title={`唤醒模式: ${voiceState.wakeMode === 'direct' ? '直接模式（秒醒）' : 'STT验证模式'}，最近匹配置信度: ${(voiceState.lastConfidence * 100).toFixed(0)}%`}
+              style={{
+                fontSize: '9px',
+                padding: '2px 6px',
+                borderRadius: '4px',
+                background: voiceState.wakeMode === 'direct'
+                  ? 'rgba(34,197,94,0.15)'
+                  : 'rgba(59,130,246,0.12)',
+                color: voiceState.wakeMode === 'direct' ? '#22c55e' : '#3b82f6',
+                fontWeight: 600,
+                whiteSpace: 'nowrap',
+                cursor: 'help',
+              }}
+            >
+              {voiceState.wakeMode === 'direct' ? '⚡' : '🔍'} {(voiceState.lastConfidence * 100).toFixed(0)}%
+            </span>
+          )}
           {/* 输入框 */}
           <div className="flex-1">
             <textarea
@@ -423,25 +490,32 @@ export default function ChatPanel({
           <button onClick={handleSubmit} disabled={!input.trim()} className="accent-btn p-3"><FiSend size={18} /></button>
         </div>
 
-        {/* 录音状态栏 */}
-        {micActive && (
+        {/* 录音状态栏 / 验证状态栏 */}
+        {(micActive || voiceState.phase === 'verifying') && (
           <div className="mt-2 animate-fade-in">
             <div className="flex items-center gap-3 justify-center mb-1">
-              <span className="text-[11px] font-mono" style={{ color: 'var(--accent)' }}>
-                {String(Math.floor(voiceState.recordingTime / 60)).padStart(2, '0')}:{String(voiceState.recordingTime % 60).padStart(2, '0')}
-              </span>
-              <div className="flex-1 max-w-[120px] h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--bg-input)' }}>
-                <div className="h-full rounded-full transition-all duration-75" style={{
-                  width: `${Math.min(voiceState.audioLevel * 100, 100)}%`,
-                  background: voiceState.audioLevel > 0.2 ? 'var(--accent)' : 'var(--text-muted)',
-                }} />
-              </div>
-              <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                {voiceState.phase === 'wake_detected' ? '唤醒中...' : '录音中'}
-              </span>
+              {voiceState.phase === 'verifying' ? (
+                <span className="text-[11px]" style={{ color: '#3b82f6' }}>🎯 正在确认唤醒词...</span>
+              ) : (
+                <>
+                  <span className="text-[11px] font-mono" style={{ color: 'var(--accent)' }}>
+                    {String(Math.floor(voiceState.recordingTime / 60)).padStart(2, '0')}:{String(voiceState.recordingTime % 60).padStart(2, '0')}
+                  </span>
+                  <div className="flex-1 max-w-[120px] h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--bg-input)' }}>
+                    <div className="h-full rounded-full transition-all duration-75" style={{
+                      width: `${Math.min(voiceState.audioLevel * 100, 100)}%`,
+                      background: voiceState.audioLevel > 0.2 ? 'var(--accent)' : 'var(--text-muted)',
+                    }} />
+                  </div>
+                  <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                    {voiceState.phase === 'wake_detected' ? '唤醒中...' : '录音中'}
+                  </span>
+                </>
+              )}
             </div>
             <div className="text-center text-[11px]" style={{ color: 'var(--text-muted)' }}>
-              {voiceState.phase === 'wake_detected' ? '即将开始录音...' :
+              {voiceState.phase === 'verifying' ? '请稍候，马上就好' :
+               voiceState.phase === 'wake_detected' ? '即将开始录音...' :
                '说话后静音 2 秒自动停止'}
             </div>
           </div>

@@ -49,7 +49,7 @@ export interface WSResponse {
     | 'search_status' | 'music_search_status' | 'chat_error'
     | 'transcription_text' | 'stt_result' | 'tts_failed'
     | 'cet6_paper' | 'cet6_answers' | 'cet6_search_results'
-    | 'chat_attachment';
+    | 'chat_attachment' | 'wake_verified' | 'wake_rejected';
   text?: string;
   path?: RoutePath;
   reply?: string;
@@ -78,6 +78,7 @@ export interface WSResponse {
   message?: string;
   task?: string;
   audio?: string;
+  seq?: number;     // ★ TTS 句子序号，前端按序排队播放
   time?: TimeState;
   alert?: ProactiveAlert;
   suppressed?: boolean;
@@ -119,6 +120,7 @@ export interface TTSAudio {
   audio: string;   // base64 mp3
   text: string;    // fallback text
   path: string;
+  seq?: number;    // ★ 句子序号，前端按序排队播放
 }
 
 // ── 主动提醒 ──
@@ -177,6 +179,7 @@ export type VoicePhase =
   | 'idle'              // 未启用
   | 'initializing'      // 加载 Mellon 模型中
   | 'waiting_for_wake'  // 监听唤醒词
+  | 'verifying'         // ★ 声纹匹配后 STT 二次验证中（用户可见等待状态）
   | 'wake_detected'     // 唤醒成功
   | 'recording'         // 录音中
   | 'processing';       // 处理中（发送后端）
@@ -187,6 +190,8 @@ export interface VoiceInteractionState {
   audioLevel: number;      // 模拟电平（0-1）
   error: string;
   isEnrolled: boolean;     // 是否已完成唤醒词注册
+  lastConfidence: number;  // ★ 最近一次 Mellon 匹配置信度（0-1），用于 UI 诊断显示
+  wakeMode: 'stt_verify' | 'direct';  // ★ 当前唤醒模式
 }
 
 // ── CET-6 备考 ──

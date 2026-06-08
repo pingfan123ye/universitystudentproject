@@ -22,7 +22,8 @@ DEFAULT_CONFIG = {
     "default_mode": "local_first",
 
     # 本地模型超时（秒），超时后自动切换到云端
-    "timeout_seconds": 8,
+    # qwen3:8b 在 CPU 上处理 ~400 token 系统提示词需 6-10s，设 20s 留有缓冲
+    "timeout_seconds": 20,
 
     # 强制使用云端的触发词（含这些词的任务走云端）
     "force_cloud_keywords": [
@@ -40,7 +41,7 @@ DEFAULT_CONFIG = {
     "cloud_model": "deepseek-v4-flash",
 
     # 本地模型
-    "local_model": "qwen2.5:7b",
+    "local_model": "qwen3:8b",
 
     # 联网搜索
     "enable_search": True,

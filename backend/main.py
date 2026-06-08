@@ -1,6 +1,12 @@
 """
-智能音箱_无实物 —— 后端服务入口 (v0.2.0)
+智能音箱_无实物 —— 后端服务入口 (v0.3.0)
 FastAPI + WebSocket 实现 AI 语音交互中枢（三道路由分发）
+
+v0.3.0 变更:
+  - STT: SenseVoice-Small 替换 faster-whisper
+  - TTS: Kokoro TTS 离线主力 + Edge TTS 云端备选
+  - 架构: WebSocket handler 拆分至 handlers/ 包
+  - 安全: 硬编码 Key 迁移至环境变量、SSRF 修复、端口统一
 """
 import asyncio
 import base64
@@ -11,9 +17,13 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from contextlib import asynccontextmanager
 
-# ── 加载 .env 环境变量（不依赖 python-dotenv） ──
+# ── 统一配置 ──
+from config import BACKEND_PORT as PORT, BACKEND_HOST, ALLOWED_MUSIC_DOMAINS
+
+# ── 加载 .env 环境变量（不依赖 python-dotenv）──
 _ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 if os.path.isfile(_ENV_FILE):
     with open(_ENV_FILE, "r", encoding="utf-8") as _f:
@@ -57,13 +67,61 @@ from services.cet6_online import (
 )
 from models.virtual_home import VirtualHome, get_virtual_time
 
+# ── Handler 模块 ──
+from handlers.stt_handler import handle_audio_stream
+from handlers.cet6_handler import (
+    handle_cet6_online_search, handle_cet6_download_paper,
+    handle_cet6_close, handle_cet6_answers_in_chat, handle_cet6_download_in_chat,
+)
+import handlers.chat_handler as _chat_handler
+from handlers.control_handler import (
+    handle_service_status_request, handle_device_request, handle_time_request,
+    handle_set_time, handle_set_time_speed, handle_toggle_time_pause,
+    handle_toggle_time_simulation, handle_toggle_suppress_alerts,
+    handle_list_cache, handle_delete_cache, handle_list_memories,
+    handle_delete_memory, handle_clear_memories, handle_get_config,
+    handle_set_config, handle_reset_config,
+)
+
+# ── 日志 ──
+from config import LOG_DIR, LOG_MAX_BYTES, LOG_BACKUP_COUNT
+os.makedirs(LOG_DIR, exist_ok=True)
+from logging.handlers import RotatingFileHandler
+
+# ★ 先调用 basicConfig（添加 StreamHandler → 控制台输出）
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ★ 再追加 RotatingFileHandler（写入文件）
+_file_handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "app.log"),
+    maxBytes=LOG_MAX_BYTES,
+    backupCount=LOG_BACKUP_COUNT,
+    encoding="utf-8",
+)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+_file_handler.setLevel(logging.INFO)
+logging.getLogger().addHandler(_file_handler)
+
 logger = logging.getLogger(__name__)
 
+
+# ===== ⚠️ 关键诊断：验证 sherpa_onnx 是否可用 =====
+_STT_AVAILABLE = False
+try:
+    import sherpa_onnx
+    _STT_AVAILABLE = True
+    logger.info("✅ sherpa-onnx %s 可用 — STT 将正常工作", getattr(sherpa_onnx, '__version__', 'unknown'))
+except ImportError:
+    logger.critical("❌❌❌ sherpa-onnx 未安装！STT 将完全无法工作！")
+    logger.critical("❌❌❌ 请使用 venv Python 启动：.venv\\Scripts\\python -m uvicorn main:app")
+    print("\n" + "=" * 60)
+    print("  ⚠️  严重警告：sherpa-onnx 未安装！")
+    print("  STT 语音转写将无法工作，用户语音输入不会有任何回复。")
+    print("  请使用: .venv\\Scripts\\python -m uvicorn main:app --host 0.0.0.0 --port 8000")
+    print("=" * 60 + "\n")
+
+
 # ===== 强制清理旧进程 =====
-PORT = 8000
-
-
 def _kill_old_process():
     """杀掉占用目标端口的旧进程，确保新代码能启动"""
     try:
@@ -86,7 +144,6 @@ def _kill_old_process():
             else:
                 print(f"[启动] 端口 {PORT} 空闲")
         else:
-            # Linux/macOS: 使用 fuser/lsof
             result = subprocess.run(
                 ["lsof", "-ti", f":{PORT}"], capture_output=True, text=True, timeout=10
             )
@@ -107,17 +164,57 @@ def _kill_old_process():
 _kill_old_process()
 
 # ===== 流式 STT 累积缓冲区 =====
-_stt_buffer: str = ""  # 分段音频转写结果的累积字符串
+_stt_buffer: str = ""
+
+# ===== TTS 回声过滤：记录近期播报文本，防止扬声器→麦克风自触发唤醒 =====
+_recent_tts_texts: list[tuple[float, str]] = []  # (timestamp, normalized_text)
+_TTS_ECHO_TTL = 8.0  # 8 秒后过期
+_last_tts_time: float = 0  # ★ B2: 最近一次 TTS 播报时间戳，用于冷却期判断
+_TTS_WAKE_COOLDOWN = 3.0  # ★ B2: TTS 播报后 3 秒内拒绝唤醒验证
+
+def _record_tts_text(text: str):
+    """记录 TTS 播报文本，供唤醒验证时过滤回声"""
+    global _last_tts_time
+    if not text or len(text) < 3:
+        return
+    _last_tts_time = time.monotonic()  # ★ B2: 更新时间戳
+    _recent_tts_texts.append((time.monotonic(), text))
+    # 清理过期（>8s）
+    now = time.monotonic()
+    _recent_tts_texts[:] = [(t, txt) for t, txt in _recent_tts_texts if now - t < _TTS_ECHO_TTL]
+
+def _is_tts_echo(stt_text: str) -> bool:
+    """检查 STT 结果是否为近期 TTS 播报的回声"""
+    if not stt_text or len(stt_text) < 2:
+        return False
+    stt_norm = re.sub(r'[\s,，。！？、；：""''《》!?;:\'()　a-zA-Z]+', '', stt_text)
+    if len(stt_norm) < 2:
+        return False
+    now = time.monotonic()
+    for t, tts_text in _recent_tts_texts:
+        if now - t > _TTS_ECHO_TTL:
+            continue
+        tts_norm = re.sub(r'[\s,，。！？、；：""''《》!?;:\'()　a-zA-Z]+', '', tts_text)
+        if len(tts_norm) < 3:
+            continue
+        # 子串匹配（任一方向）
+        if stt_norm in tts_norm or tts_norm in stt_norm:
+            return True
+        # 字符重叠 > 60%
+        common = sum(1 for c in stt_norm if c in tts_norm)
+        if common / max(len(stt_norm), 1) > 0.6:
+            return True
+    return False
 
 # ===== 非阻塞 TTS 辅助 =====
-async def _maybe_tts(ws: WebSocket, reply: str, path: str):
+async def _maybe_tts(ws: WebSocket, reply: str, path: str, seq: int = 0):
     """非阻塞发送 TTS 音频，失败时通知前端降级 speechSynthesis"""
     if not reply or not reply.strip():
         return
-    # 清洗 Markdown 格式字符，避免 TTS 朗读星号/井号等
     reply = clean_for_tts(reply)
     if not reply:
         return
+    _record_tts_text(reply)  # ★ 记录 TTS 文本用于回声过滤
     try:
         audio_b64 = await text_to_speech_base64(reply)
         if audio_b64:
@@ -126,6 +223,7 @@ async def _maybe_tts(ws: WebSocket, reply: str, path: str):
                 "audio": audio_b64,
                 "text": reply[:120],
                 "path": path,
+                "seq": seq,
             })
         else:
             await ws.send_json({
@@ -141,14 +239,91 @@ async def _maybe_tts(ws: WebSocket, reply: str, path: str):
         })
 
 
+# ===== CET-6 路由直接执行 =====
+_CET6_YEAR_RE = re.compile(r'(20\d{2})\s*年')
+_CET6_MONTH_RE = re.compile(r'(\d{1,2})\s*月')
+_CET6_SET_RE = re.compile(r'第\s*([一二三123])\s*套')
+
+
+def _parse_cet6_intent(text: str) -> dict:
+    """从用户文本中解析 CET-6 操作意图，返回 action dict（供 handle_cet6_action 使用）"""
+    year_match = _CET6_YEAR_RE.search(text)
+    month_match = _CET6_MONTH_RE.search(text)
+    set_match = _CET6_SET_RE.search(text)
+
+    year = int(year_match.group(1)) if year_match else None
+    month = int(month_match.group(1)) if month_match else None
+    set_cn = set_match.group(1) if set_match else None
+    set_map = {"一": 1, "二": 2, "三": 3, "1": 1, "2": 2, "3": 3}
+    set_num = set_map.get(set_cn) if set_cn else None
+
+    # 确定 action 类型
+    t = text.lower()
+
+    # 做题 / 做真题 / 做卷子 → random_paper（有年份则精确匹配）
+    if any(kw in t for kw in ["做真题", "做题", "做卷子", "来一套", "刷题",
+                                "来一份", "给我真题", "给我试卷", "给套",
+                                "我要做", "我想做", "想做", "要做"]):
+        if year and month and set_num:
+            return {"action": "paper", "year": year, "month": month, "set": set_num}
+        elif year and month:
+            return {"action": "random_paper", "year": year, "month": month}
+        elif year:
+            return {"action": "random_paper", "year": year}
+        else:
+            return {"action": "random_paper"}
+
+    # 精确指定套题 → paper
+    if year and month and set_num:
+        return {"action": "paper", "year": year, "month": month, "set": set_num}
+
+    # 浏览题库
+    if any(kw in t for kw in ["浏览", "有哪些", "有什么", "题库", "看看", "都有"]):
+        return {"action": "browse"}
+
+    # 对答案
+    if any(kw in t for kw in ["对答案", "看答案", "核对答案", "答案"]):
+        return {"action": "answers"}
+
+    # 播放听力
+    if any(kw in t for kw in ["播放听力", "放听力", "听听力", "听力"]):
+        if not any(kw in t for kw in ["怎么练", "如何提高", "技巧", "方法"]):
+            return {"action": "listening"}
+
+    # 搜索真题
+    if any(kw in t for kw in ["搜索", "联网找", "找真题", "有没有"]):
+        action = {"action": "search"}
+        if year:
+            action["year"] = year
+        return action
+
+    # 默认：用户提到了六级相关 → 随机来一套
+    return {"action": "random_paper"}
+
+
+async def _handle_cet6_route(ws: WebSocket, text: str):
+    """CET-6 路由直接执行：解析用户意图 → 直接操作试卷/听力/答案"""
+    try:
+        action = _parse_cet6_intent(text)
+        session_id = id(ws)
+        logger.info(f"CET-6 路由直接执行: action={action.get('action')}, year={action.get('year')}, month={action.get('month')}")
+        await handle_cet6_action(ws, action, session_id, tts_callback=_maybe_tts)
+    except Exception as e:
+        logger.error(f"CET-6 路由执行失败: {e}")
+        await ws.send_json({
+            "type": "done", "path": "cet6",
+            "reply": "抱歉，试卷系统出了点问题，请再说一次试试",
+            "model": "cet6",
+        })
+
 
 # ═══════════════════════════════════════
 # 全局状态
 # ═══════════════════════════════════════
 virtual_home = VirtualHome()
-_pending_safety_cmd: str | None = None  # 待安全确认的命令
+_pending_safety_cmd: str | None = None
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 
 @asynccontextmanager
@@ -157,6 +332,7 @@ async def lifespan(app: FastAPI):
 ========================================
   智能音箱后端 v{APP_VERSION}
   三道路由: 设备 | 大模型 | Reasonix
+  STT: SenseVoice-Small | TTS: Kokoro+Edge
 ========================================
 """
     print(banner)
@@ -167,9 +343,12 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning(f"模型 {DEFAULT_MODEL} 未找到")
     logger.info(f"Reasonix CLI 可用: {is_reasonix_available()}")
-    logger.info("预加载 Whisper STT 模型（后台下载）...")
-    from services.whisper_stt import preload_model
+    logger.info("预加载 SenseVoice STT 模型（后台下载）...")
+    from services.sensevoice_stt import preload_model
     await preload_model()
+    logger.info("预加载 Kokoro TTS 模型（后台下载）...")
+    from services.qwen3_tts import preload_model as preload_tts
+    await preload_tts()
     logger.info("扫描 CET-6 试卷索引...")
     cet6_build_index()
     logger.info("预加载 CET-6 在线索引（后台）...")
@@ -178,7 +357,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="智能音箱_无实物 API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="智能音箱_无实物 API", version=APP_VERSION, lifespan=lifespan)
 
 
 @app.get("/health")
@@ -201,25 +380,22 @@ async def health_check():
     })
 
 
-# 音乐代理域名白名单（防止被用作开放代理/SSRF）
-_ALLOWED_MUSIC_DOMAINS = {
-    "music.126.net",
-    "jamendo.com",
-    "pixabay.com",
-    "audio-ssl.itunes.apple.com",
-    "localhost",
-    "127.0.0.1",
-}
-
-
+# ── 音乐代理（SSRF 安全：仅白名单域名）──
 @app.get("/api/proxy/music")
 async def proxy_music(url: str = Query(..., description="要代理的音乐URL")):
     """代理第三方音乐资源，解决跨域播放问题（仅允许白名单域名）"""
     from urllib.parse import urlparse
     hostname = urlparse(url).hostname or ""
-    if hostname not in _ALLOWED_MUSIC_DOMAINS and not any(
-        hostname.endswith("." + d) for d in _ALLOWED_MUSIC_DOMAINS
-    ):
+    # 安全检查：精确匹配 + 子域名匹配
+    allowed = False
+    if hostname in ALLOWED_MUSIC_DOMAINS:
+        allowed = True
+    else:
+        for d in ALLOWED_MUSIC_DOMAINS:
+            if hostname.endswith("." + d):
+                allowed = True
+                break
+    if not allowed:
         logger.warning(f"音乐代理域名被拒: {hostname} (url={url[:80]})")
         return JSONResponse({"error": "域名不在白名单中"}, status_code=403)
     try:
@@ -246,14 +422,12 @@ async def proxy_music(url: str = Query(..., description="要代理的音乐URL")
 # ── 歌单 API ──
 @app.get("/api/playlists")
 async def api_list_playlists():
-    """列出所有歌单及其歌曲数"""
     from playlist_service import list_playlists
     return {"playlists": list_playlists()}
 
 
 @app.get("/api/playlists/{name}")
 async def api_get_playlist(name: str):
-    """获取指定歌单的歌曲列表"""
     from playlist_service import get_playlist
     songs = get_playlist(name)
     return {"name": name, "songs": songs or []}
@@ -261,7 +435,6 @@ async def api_get_playlist(name: str):
 
 @app.post("/api/playlists/{name}/refresh")
 async def api_refresh_playlist(name: str):
-    """强制刷新歌单索引"""
     from playlist_service import refresh_playlists
     refresh_playlists()
     return {"ok": True}
@@ -270,7 +443,7 @@ async def api_refresh_playlist(name: str):
 @app.websocket("/api/ws")
 async def websocket_endpoint(ws: WebSocket):
     """
-    WebSocket 端点 —— 三道路由分发中枢
+    WebSocket 端点 —— 三道路由分发中枢 (v0.3.0)
 
     === 客户端 → 服务端（接收）===
     {"type": "chat", "text": "用户语音转写文本"}
@@ -289,70 +462,37 @@ async def websocket_endpoint(ws: WebSocket):
     {"type": "reset_conversation"}                    — 重置对话历史
     {"type": "cancel"}                                — 唤醒词打断 LLM 生成
     {"type": "stt_stream"} / "stt_audio" / "stt_end"  — 流式/分段音频
-
-    === 服务端 → 客户端（发送）===
-    {"type": "route", "path": "xiaoai|llm|reasonix|info_query|mixed|cet6|noise", "reason": "..."}
-    {"type": "token", "text": "..."}                  — LLM 流式 token
-    {"type": "done", "path": "...", "reply": "...", "model": "..."}  — 回复完成
-    {"type": "error", "error": "..."}                 — 错误
-    {"type": "device_state", "devices": [...]}        — 10个虚拟设备状态
-    {"type": "time_sync", "time": {...}}              — 虚拟时间同步
-    {"type": "stt_status", "whisper_ready": bool, "xunfei_configured": bool}
-    {"type": "music_control", "action": "play|pause|next|prev|stop", ...}  — 音乐播放控制
-    {"type": "music_search_status", "status": "searching|not_found|copyright_blocked"}
-    {"type": "tts_audio", "audio": "<base64>", "text": "..."}  — TTS 音频
-    {"type": "tts_failed", "text": "...", "reason": "..."}     — TTS 降级通知
-    {"type": "cet6_paper", "paper_id": "...", "pdf_url": "...", ...}  — 试卷下发
-    {"type": "cet6_search_results", "results": [...]}  — 试卷搜索结果
-    {"type": "cet6_answers", "pdf_url": "..."}  — 答案 PDF
-    {"type": "chat_attachment", "label": "...", "url": "..."}  — 聊天气泡附件
-    {"type": "chat_error", "message": "..."}  — 内联错误消息
-    {"type": "search_status", "status": "searching|done", "message": "..."}  — 联网搜索状态
-    {"type": "cache_learned", "text": "...", "message": "..."}  — 缓存学习通知
-    {"type": "memory_learned", "memories": [...]}  — 记忆提取通知
-    {"type": "service_status", "whisper_ready": bool, "netease_available": bool, ...}  — 服务状态
-    {"type": "proactive_alert", "alert": {...}}  — 情境引擎主动提醒
-    {"type": "safety_prompt", "cmd": "...", "risk": "high|medium|low", "prompt": "..."}  — 安全确认
-    {"type": "cancelled"}  — LLM 生成已被打断
-    {"type": "memory_list", "entries": [...]} / "cache_list", "entries": [...]
     """
     await ws.accept()
     global _stt_buffer
     logger.info("WebSocket 客户端已连接")
 
-    # 发送初始设备状态
+    # 初始状态推送
     await ws.send_json({
         "type": "device_state",
         "devices": virtual_home.get_all_states(),
     })
-    # 发送初始时间状态
     vt = get_virtual_time()
-    await ws.send_json({
-        "type": "time_sync",
-        "time": vt.to_dict(),
-    })
-    # 发送 STT 引擎状态（离线/在线）
+    await ws.send_json({"type": "time_sync", "time": vt.to_dict()})
+
     _stt = await stt_status()
     await ws.send_json({
         "type": "stt_status",
-        "whisper_ready": _stt["whisper_ready"],
+        "whisper_ready": _stt["local_ready"],
+        "local_ready": _stt["local_ready"],
+        "local_engine": _stt.get("local_engine", "none"),
         "xunfei_configured": _stt["xunfei_configured"],
         "primary_engine": _stt["primary_engine"],
     })
 
-    # 启动情境引擎
+    # 情境引擎
     async def _on_alert(alert: dict):
-        """情境引擎触发时推送主动提醒"""
         try:
-            await ws.send_json({
-                "type": "proactive_alert",
-                "alert": alert,
-            })
+            await ws.send_json({"type": "proactive_alert", "alert": alert})
             logger.info(f"主动提醒推送: {alert.get('reason', '')}")
         except Exception:
-            pass  # WebSocket 可能已断开
+            pass
 
-    # 初始化并启动情境引擎
     ce = get_context_engine(
         get_virtual_time=get_virtual_time,
         get_memory_engine=lambda: get_memory(),
@@ -361,24 +501,21 @@ async def websocket_endpoint(ws: WebSocket):
     ce.set_alert_callback(_on_alert)
     await ce.start(interval_seconds=30)
 
-    # 对话历史（跨轮记忆，最多保留最近 20 条消息 = 10 轮）
-    # 对话历史按路径隔离（避免 CET-6/音乐上下文污染日常对话）
+    # 对话历史（按路径隔离）
     conversation_histories: dict[str, list[dict]] = {
-        "llm": [],
-        "cet6": [],
-        "music": [],
+        "llm": [], "cet6": [], "music": [],
     }
 
     def _get_history(route_path: str) -> list[dict]:
-        """获取指定路径的对话历史（info_query/reasonix/mixed/xiaoai 共享 llm 历史）"""
         key = route_path if route_path in ("cet6", "music") else "llm"
         return conversation_histories[key]
 
-    # 安全确认命令（模块级变量声明）
     global _pending_safety_cmd
-
-    # 取消事件：唤醒词打断正在生成的 LLM 回复
     cancel_event = asyncio.Event()
+    _last_cancel_at: float = 0.0  # cancel 后的静默期起点
+    _cancel_cooldown_s = 4.0       # cancel 后 N 秒内拒绝 chat 消息（防止噪音 STT 触发 LLM）
+    _wake_just_verified = False    # ★ 刚通过唤醒验证 → skip 下一次 cancel 的静默期
+    from playlist_service import list_playlists
 
     try:
         while True:
@@ -391,107 +528,68 @@ async def websocket_endpoint(ws: WebSocket):
 
             msg_type = data.get("type", "")
 
+            # ═══════════════════════════════════
+            # 简单消息类型 → dispatch 到 handler
+            # ═══════════════════════════════════
+
             if msg_type == "ping":
                 await ws.send_json({"type": "pong"})
                 continue
 
             if msg_type == "get_devices":
-                await ws.send_json({
-                    "type": "device_state",
-                    "devices": virtual_home.get_all_states(),
-                })
+                await handle_device_request(ws, virtual_home)
                 continue
 
             if msg_type == "service_status_request":
-                stt_s = await stt_status()
-                from services.tts_service import is_available as tts_available
-                from services.netease_cloud_api import get_netease_api
-                netease_ok = await get_netease_api().check_available()
-                await ws.send_json({
-                    "type": "service_status",
-                    "whisper_ready": stt_s.get("whisper_ready", False),
-                    "xunfei_configured": stt_s.get("xunfei_configured", False),
-                    "netease_available": netease_ok,
-                    "ollama_available": await check_model_available(),
-                    "deepseek_available": await check_deepseek_available(),
-                    "tts_available": await tts_available(),
-                })
+                await handle_service_status_request(ws)
                 continue
 
             if msg_type == "list_cache":
-                entries = get_cache().get_all()
-                await ws.send_json({"type": "cache_list", "entries": entries})
+                await handle_list_cache(ws)
                 continue
 
             if msg_type == "delete_cache":
-                cache_id = data.get("id", "")
-                if cache_id:
-                    get_cache().delete(cache_id)
-                    await ws.send_json({"type": "cache_deleted", "id": cache_id})
+                await handle_delete_cache(ws, data)
                 continue
 
             if msg_type == "list_memories":
-                entries = get_memory().get_all()
-                await ws.send_json({"type": "memory_list", "entries": entries})
+                await handle_list_memories(ws)
                 continue
 
             if msg_type == "delete_memory":
-                mem_id = data.get("id", 0)
-                if mem_id:
-                    get_memory().delete(int(mem_id))
-                    await ws.send_json({"type": "memory_deleted", "id": mem_id})
+                await handle_delete_memory(ws, data)
                 continue
 
             if msg_type == "clear_memories":
-                get_memory().clear_all()
-                await ws.send_json({"type": "memory_cleared"})
+                await handle_clear_memories(ws)
                 continue
 
-            # ===== 时间控制 =====
+            # 时间控制
             if msg_type == "get_time":
-                vt = get_virtual_time()
-                await ws.send_json({"type": "time_sync", "time": vt.to_dict()})
+                await handle_time_request(ws)
                 continue
 
             if msg_type == "set_time":
-                vt = get_virtual_time()
-                hour = data.get("hour", 8)
-                minute = data.get("minute", 0)
-                vt.set_time(hour, minute)
-                await ws.send_json({"type": "time_sync", "time": vt.to_dict()})
+                await handle_set_time(ws, data)
                 continue
 
             if msg_type == "set_time_speed":
-                vt = get_virtual_time()
-                speed = data.get("speed", 1.0)
-                vt.set_speed(speed)
-                await ws.send_json({"type": "time_sync", "time": vt.to_dict()})
+                await handle_set_time_speed(ws, data)
                 continue
 
             if msg_type == "toggle_time_pause":
-                vt = get_virtual_time()
-                vt.toggle_pause()
-                await ws.send_json({"type": "time_sync", "time": vt.to_dict()})
+                await handle_toggle_time_pause(ws)
                 continue
 
             if msg_type == "toggle_time_simulation":
-                vt = get_virtual_time()
-                enabled = data.get("enabled", True)
-                vt.enable(enabled)
-                await ws.send_json({"type": "time_sync", "time": vt.to_dict()})
+                await handle_toggle_time_simulation(ws, data)
                 continue
 
-            # ===== 主动提醒控制 =====
             if msg_type == "toggle_suppress_alerts":
-                suppressed = data.get("suppressed", True)
-                ce.set_suppressed(suppressed)
-                await ws.send_json({
-                    "type": "alerts_suppressed",
-                    "suppressed": suppressed,
-                })
+                await handle_toggle_suppress_alerts(ws, data, ce)
                 continue
 
-            # ===== 安全确认回复 =====
+            # 安全确认回复
             if msg_type == "safety_reply":
                 accept = data.get("accept", False)
                 if accept and _pending_safety_cmd:
@@ -516,125 +614,125 @@ async def websocket_endpoint(ws: WebSocket):
                 _pending_safety_cmd = None
                 continue
 
-            # ===== 引擎配置管理 =====
+            # 引擎配置
             if msg_type == "get_config":
-                cfg = get_config()
-                await ws.send_json({"type": "engine_config", "config": cfg.to_dict()})
+                await handle_get_config(ws)
                 continue
 
             if msg_type == "set_config":
-                cfg = get_config()
-                key = data.get("key", "")
-                value = data.get("value")
-                if key and value is not None:
-                    cfg.set(key, value)
-                    await ws.send_json({"type": "engine_config", "config": cfg.to_dict(), "saved": True})
-                else:
-                    await ws.send_json({"type": "error", "error": "缺少 key 或 value"})
+                await handle_set_config(ws, data)
                 continue
 
             if msg_type == "reset_config":
-                cfg = get_config()
-                cfg._config = dict(cfg.DEFAULT_CONFIG)  # type: ignore
-                cfg.save()
-                await ws.send_json({"type": "engine_config", "config": cfg.to_dict(), "reset": True})
+                await handle_reset_config(ws)
+                continue
+
+            if msg_type == "verify_wake":
+                # ★ 唤醒词验证：Mellon 已做声纹匹配，此处只需确认有真实人声（非环境噪声）
+                #   录制的是唤醒词触发后 2.5 秒音频 → 不检查"小智"（已过时序窗口）
+                #   只检查是否包含有效中文语音 → 有 = 真人 → 通过；空/噪声 = 假触发 → 拒绝
+                audio_b64 = data.get("audio", "")
+                if audio_b64 and len(audio_b64) > 100:
+                    from services.stt_pipeline import transcribe as stt_transcribe
+                    verify_text = await stt_transcribe(audio_b64)
+                    logger.info(f"唤醒词验证 STT: {verify_text[:40] if verify_text else '(空)'}")
+                    # ★ 新策略：检测有效中文语音（≥2 个中文字符），而非匹配特定词
+                    if verify_text and verify_text.strip():
+                        # ★ B2: TTS 播报后冷却期内拒绝所有唤醒验证
+                        #   （前端 B1 失聪期是第一道防线，此处是后端兜底）
+                        _since_tts = time.monotonic() - _last_tts_time
+                        if _since_tts < _TTS_WAKE_COOLDOWN:
+                            logger.info(
+                                f"🔇 唤醒词验证拒绝 (TTS冷却期 {_since_tts:.1f}s < {_TTS_WAKE_COOLDOWN}s): "
+                                f"{verify_text[:40]}"
+                            )
+                            await ws.send_json({
+                                "type": "wake_rejected",
+                                "text": verify_text,
+                                "reason": "tts_cooldown",
+                            })
+                            continue
+                        # ★ 原有 TTS 回声过滤：文本匹配兜底（冷却期外的二次确认）
+                        if _is_tts_echo(verify_text):
+                            logger.info(f"🔇 唤醒词验证拒绝 (TTS回声): {verify_text[:40]}")
+                            await ws.send_json({"type": "wake_rejected", "text": verify_text, "reason": "tts_echo"})
+                            continue
+                        chinese_chars = sum(1 for c in verify_text if '一' <= c <= '鿿')
+                        # 至少 2 个中文字符 → 确认真实人声（过滤单字碎片/纯英文/纯噪声）
+                        if chinese_chars >= 2:
+                            # ★ D: 唤醒词相关字符检测 — 短文本（<6 中文字符）需包含唤醒词相关字符
+                            #   过滤音乐歌词/环境噪声等非用户语音的碎片中文（如"嫂子嫂子"、"小鸡小鸡"）
+                            #   长文本（≥6 中文字符）通常是完整语句，无需此约束
+                            _WAKE_RELATED_CHARS = set('小智')
+                            if chinese_chars < 6:
+                                _text_chars = set(c for c in verify_text if '一' <= c <= '鿿')
+                                _overlap = _text_chars & _WAKE_RELATED_CHARS
+                                if not _overlap:
+                                    logger.info(
+                                        f"❌ 唤醒词验证拒绝 (短文本无唤醒词相关字符 chinese={chinese_chars}): "
+                                        f"{verify_text[:40]}"
+                                    )
+                                    await ws.send_json({
+                                        "type": "wake_rejected",
+                                        "text": verify_text,
+                                        "reason": "no_wake_related_chars",
+                                    })
+                                    continue
+                            logger.info(f"✅ 唤醒词验证通过 (中文字符={chinese_chars}): {verify_text[:40]}")
+                            _wake_just_verified = True  # ★ 标记：跳过后续 cancel 的静默期
+                            await ws.send_json({"type": "wake_verified", "text": verify_text})
+                        else:
+                            logger.info(f"❌ 唤醒词验证拒绝 (中文字符不足={chinese_chars}): {verify_text[:40]}")
+                            await ws.send_json({"type": "wake_rejected", "text": verify_text or ""})
+                    else:
+                        logger.info("唤醒词验证: STT 返回空/静音，拒绝")
+                        await ws.send_json({"type": "wake_rejected", "text": "", "reason": "silence"})
+                else:
+                    logger.info("唤醒词验证: 音频数据为空或过短，拒绝")
+                    await ws.send_json({"type": "wake_rejected", "text": "", "reason": "no_audio"})
                 continue
 
             if msg_type == "cancel":
-                # 唤醒词打断：取消正在进行的 LLM 流式生成
+                # 唤醒词防抖：生成开始后 5 秒内忽略取消信号，防止假阳性打断
+                _elapsed = time.monotonic() - _chat_handler._last_gen_started_at
+                if _elapsed < 5.0:
+                    logger.info(
+                        "唤醒词打断被防抖忽略 (生成已开始 %.1fs，< 5s)",
+                        _elapsed,
+                    )
+                    continue
                 logger.info("收到取消信号（唤醒词打断）")
                 cancel_event.set()
+                # ★ PCM 缓冲方案下，cancel 仅由已验证的唤醒词触发，
+                # 后续录音始终是用户意图，无需静默期
+                _wake_just_verified = False
                 await ws.send_json({"type": "cancelled"})
                 continue
 
             if msg_type == "reset":
                 for h in conversation_histories.values():
                     h.clear()
-                cancel_event.clear()  # 重置取消信号
+                cancel_event.clear()
                 logger.info("对话历史已重置")
                 await ws.send_json({"type": "chat_reset", "message": "对话已重置"})
                 continue
 
-            # ===== CET-6 在线搜索（前端直接触发） =====
+            # CET-6 在线搜索
             if msg_type == "cet6_online_search":
-                query = data.get("query", "")
-                year = data.get("year")
-                month = data.get("month")
-                logger.info(f"CET-6 在线搜索: query={query}, year={year}, month={month}")
-
-                await fetch_online_index()
-                results = search_papers(year=year, month=month, exclude_downloaded=False)
-                await ws.send_json({
-                    "type": "cet6_search_results",
-                    "results": [
-                        {
-                            "paper_id": r["paper_id"],
-                            "title": r["title"],
-                            "year": r["year"],
-                            "month": r["month"],
-                            "set_num": r["set_num"],
-                            "downloaded": r.get("downloaded", False),
-                        }
-                        for r in results
-                    ],
-                })
+                await handle_cet6_online_search(ws, data)
                 continue
 
-            # ===== CET-6 下载试卷（前端直接触发） =====
+            # CET-6 下载
             if msg_type == "cet6_download_paper":
-                paper_id = data.get("paper_id", "")
-                if not paper_id:
-                    await ws.send_json({"type": "error", "error": "缺少 paper_id"})
-                    continue
-                logger.info(f"CET-6 下载试卷: {paper_id}")
-                await ws.send_json({"type": "route", "path": "cet6", "reason": "下载试卷"})
-                downloaded = await download_paper(paper_id)
-                if downloaded:
-                    sess = get_cet6_session(id(ws))
-                    sess.clear()
-                    sess["paper_id"] = downloaded["id"]
-                    await ws.send_json({
-                        "type": "cet6_paper",
-                        "paper_id": downloaded["id"],
-                        "title": downloaded["title"],
-                        "pdf_url": downloaded["pdf_url"],
-                        "has_audio": downloaded.get("has_audio", False),
-                        "audio_url": downloaded.get("audio_url", ""),
-                        "has_answers": downloaded.get("has_answers", False),
-                    })
-                    # 同步发送附件消息到聊天气泡
-                    await ws.send_json({
-                        "type": "chat_attachment",
-                        "label": f"📎 下载 {downloaded['title']} 真题",
-                        "url": downloaded["pdf_url"],
-                    })
-                    if downloaded.get("has_audio") and downloaded.get("audio_url"):
-                        await ws.send_json({
-                            "type": "music_control", "action": "play",
-                            "song_name": downloaded["title"] + " 听力音频",
-                            "download_url": downloaded["audio_url"],
-                            "source": "local",
-                        })
-                    await ws.send_json({
-                        "type": "done", "path": "cet6",
-                        "reply": f"已下载 {downloaded['title']}",
-                        "model": "cet6",
-                    })
-                else:
-                    await ws.send_json({
-                        "type": "done", "path": "cet6",
-                        "reply": "下载失败，请稍后重试",
-                        "model": "cet6",
-                    })
+                await handle_cet6_download_paper(ws, data)
                 continue
 
-            # ===== CET-6 关闭面板：清除后端会话状态 =====
+            # CET-6 关闭
             if msg_type == "cet6_close":
-                get_cet6_session(id(ws)).clear()
-                logger.info("CET-6 会话已清除")
+                await handle_cet6_close(ws)
                 continue
 
-            # ===== 🆕 网易云按需获取播放 URL（前端切歌时实时请求） =====
+            # 网易云播放 URL
             if msg_type == "get_netease_url":
                 song_id = data.get("song_id", "")
                 if song_id:
@@ -656,72 +754,49 @@ async def websocket_endpoint(ws: WebSocket):
                         })
                 continue
 
-            # ===== B-3: 完整音频一次转写 =====
+            # 音频流
             if msg_type == "audio_stream":
-                audio_b64 = data.get("audio", "")
-                is_final = data.get("final", False)
-
-                # B-3 主路径：完整音频（final=true, audio=完整WAV）
-                if is_final and audio_b64:
-                    logger.info("STT 完整转写 (%d bytes)", len(audio_b64))
-                    text = await stt_transcribe(audio_b64)
-                    if text:
-                        text = stt_correct(text)
-                    await ws.send_json({"type": "stt_result", "text": text or "", "final": True})
-                    continue
-
-                # 兼容旧增量模式：final=true 无音频 → 刷新缓冲区
-                if is_final and not audio_b64:
-                    final_text = _stt_buffer.strip()
-                    _stt_buffer = ""
-                    if final_text:
-                        await ws.send_json({"type": "stt_result", "text": final_text, "final": True})
-                    continue
-
-                # 旧增量模式：非 final 音频片段
-                if not audio_b64:
-                    continue
-                logger.info("STT 增量转写 (%d bytes)", len(audio_b64))
-                text = await stt_transcribe(audio_b64)
-                if text:
-                    text = stt_correct(text)
-                    _stt_buffer += " " if _stt_buffer and not _stt_buffer.endswith(("。","！","？","，")) else ""
-                    _stt_buffer += text
-                    await ws.send_json({"type": "stt_result", "text": _stt_buffer, "final": False})
+                _stt_buffer = await handle_audio_stream(ws, data, _stt_buffer)
                 continue
 
-
+            # ═══════════════════════════════════
+            # 聊天消息 —— 核心路由分发
+            # ═══════════════════════════════════
             if msg_type == "chat":
                 text = data.get("text", "").strip()
                 if not text:
                     await ws.send_json({"type": "error", "error": "文本不能为空"})
                     continue
 
+                # Cancel 后静默期：防止虚假唤醒触发的噪音录音被当作 chat 处理
+                _since_cancel = time.monotonic() - _last_cancel_at
+                if _since_cancel < _cancel_cooldown_s:
+                    logger.info(
+                        "Chat 消息被静默期拦截 (cancel 后 %.1fs，< %.0fs): %s",
+                        _since_cancel, _cancel_cooldown_s, text[:40],
+                    )
+                    continue
+
                 logger.info(f"收到消息: {text[:60]}...")
 
-                # ==== 审批检测（优先于意图分类，零延迟）====
-                # 口语化确认词，去掉标点后精确匹配或短句前缀匹配
+                # ── 审批检测 ──
                 APPROVAL_WORDS = {
-                    "允许", "批准",                                    # 正式
-                    "开始", "开始吧", "开工", "开干", "搞起", "走起",   # 启动
-                    "可以", "可以了", "行", "行吧",                     # 同意
-                    "好的", "好啊", "好吧", "好呀", "好嘞",             # 好字辈
-                    "来吧", "上吧",                                    # 来/上
-                    "做吧", "弄吧", "干吧",                             # 干活
-                    "确定", "确认",                                     # 确认
-                    "就这样", "就这么办",                               # 就这样
-                    "ok", "OK", "okay", "go", "yes",                   # 英文
+                    "允许", "批准",
+                    "开始", "开始吧", "开工", "开干", "搞起", "走起",
+                    "可以", "可以了", "行", "行吧",
+                    "好的", "好啊", "好吧", "好呀", "好嘞",
+                    "来吧", "上吧",
+                    "做吧", "弄吧", "干吧",
+                    "确定", "确认",
+                    "就这样", "就这么办",
+                    "ok", "OK", "okay", "go", "yes",
                 }
-                _clean = re.sub(r'[\s,，。！？、；：""''《》!?;:\'()\u3000]+', '', text)
-                # 精确匹配，避免口语短词误触发
-                _matched = _clean in APPROVAL_WORDS
-                if _matched:
-                    # 先检查是否有待安全确认的任务
+                _clean = re.sub(r'[\s,，。！？、；：""''《》!?;:\'()　]+', '', text)
+                if _clean in APPROVAL_WORDS:
                     pm = get_pending_manager()
                     task = pm.pop_next()
                     if task:
                         logger.info(f"Reasonix 任务已批准: {task.prompt[:50]}...")
-                        # 安全过滤检查：对任务 prompt 做风险评估
                         risk = assess_risk(task.prompt)
                         if risk.level == "high":
                             logger.warning(f"安全拦截高风险任务: {risk.reasons}")
@@ -736,393 +811,41 @@ async def websocket_endpoint(ws: WebSocket):
                             continue
 
                         await ws.send_json({
-                            "type": "route", "path": "reasonix", "reason": "Reasonix已批准，开始执行",
+                            "type": "route", "path": "reasonix", "reason": "Reasonix已批准",
                         })
                         full_output = ""
-                        async for line in reasonix_execute(task.prompt, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+                        async for line in reasonix_execute(
+                            task.prompt,
+                            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ):
                             await ws.send_json({"type": "token", "text": line})
                             full_output += line
-                        await ws.send_json({"type": "done", "path": "reasonix", "reply": full_output.strip(), "model": "reasonix"})
+                        await ws.send_json({
+                            "type": "done", "path": "reasonix",
+                            "reply": full_output.strip(), "model": "reasonix",
+                        })
                         await _maybe_tts(ws, full_output.strip(), "reasonix")
                         continue
 
-                # ===== CET-6 会话前置拦截 =====
-                _cet6_state = get_cet6_session(id(ws))
-
-
-                # 答案请求
-                if _cet6_state and _cet6_state.get("paper_id") and any(kw in text for kw in ["答案", "对答案", "核对答案", "检查答案", "参考答案", "看看答案"]):
-                    logger.info(f"CET-6 答案请求: paper={_cet6_state['paper_id']}")
-                    answers = cet6_get_answers(_cet6_state["paper_id"])
-                    await ws.send_json({
-                        "type": "cet6_answers",
-                        "paper_id": _cet6_state["paper_id"],
-                        "pdf_url": answers.get("pdf_url", ""),
-                        "error": answers.get("error", ""),
-                    })
-                    await ws.send_json({
-                        "type": "done", "path": "cet6",
-                        "reply": "已展示答案，请核对" if "pdf_url" in answers else "抱歉，这份试卷暂无答案解析",
-                        "model": "cet6",
-                    })
+                # ── CET-6 会话拦截 ──
+                if await handle_cet6_answers_in_chat(ws, text):
+                    continue
+                if await handle_cet6_download_in_chat(ws, text):
                     continue
 
-                # 在线搜索结果中选择下载
-                if _cet6_state and _cet6_state.get("search_results") and any(kw in text for kw in ["下载", "就要", "就选", "要这个", "这套", "选这个", "第一套", "第二套", "第三套", "就要这个"]):
-                    results = _cet6_state["search_results"]
-                    # 尝试从文本中匹配套号
-                    matched = None
-                    set_map = {"第一套": "1", "第二套": "2", "第三套": "3", "1": "1", "2": "2", "3": "3"}
-                    for kw, sn in set_map.items():
-                        if kw in text:
-                            matched = next((r for r in results if r.get("set_num") == sn), None)
-                            if matched:
-                                break
-                    # 如果只有一个搜索结果，直接用
-                    if not matched and len(results) == 1:
-                        matched = results[0]
-                    # 用 LLM 简短回复匹配信息，然后执行下载
-                    if matched:
-                        logger.info(f"CET-6 用户选择下载: {matched['paper_id']}")
-                        await ws.send_json({"type": "route", "path": "cet6", "reason": "在线下载试卷"})
-                        downloaded = await download_paper(matched["paper_id"])
-                        if downloaded:
-                            _cet6_state["paper_id"] = downloaded["id"]
-                            _cet6_state.pop("search_results", None)
-                            await ws.send_json({
-                                "type": "cet6_paper",
-                                "paper_id": downloaded["id"],
-                                "title": downloaded["title"],
-                                "pdf_url": downloaded["pdf_url"],
-                                "has_audio": downloaded.get("has_audio", False),
-                                "audio_url": downloaded.get("audio_url", ""),
-                                "has_answers": downloaded.get("has_answers", False),
-                            })
-                            # 同步发送附件消息到聊天气泡
-                            await ws.send_json({
-                                "type": "chat_attachment",
-                                "label": f"📎 下载 {downloaded['title']} 真题",
-                                "url": downloaded["pdf_url"],
-                            })
-                            if downloaded.get("has_audio") and downloaded.get("audio_url"):
-                                await ws.send_json({
-                                    "type": "music_control", "action": "play",
-                                    "song_name": downloaded["title"] + " 听力音频",
-                                    "download_url": downloaded["audio_url"],
-                                    "source": "local",
-                                })
-                            await ws.send_json({
-                                "type": "done", "path": "cet6",
-                                "reply": f"已下载 {downloaded['title']}，请开始练习吧",
-                                "model": "cet6",
-                            })
-                        else:
-                            await ws.send_json({
-                                "type": "done", "path": "cet6",
-                                "reply": "抱歉，下载失败了，请稍后重试",
-                                "model": "cet6",
-                            })
-                    else:
-                        # 模糊匹配，提示用户明确选择
-                        titles = ", ".join(r.get("set_num", "?") for r in results)
-                        await ws.send_json({
-                            "type": "done", "path": "cet6",
-                            "reply": f"请明确要哪一套？（可选: {titles}）",
-                            "model": "cet6",
-                        })
-                    continue
-
-                # ===== 意图分类 =====
+                # ── 意图分类 ──
                 decision = classify(text)
                 logger.info(f"路由决策: path={decision.path}, reason={decision.reason}")
 
-                # 通知前端路由路径
                 await ws.send_json({
                     "type": "route",
                     "path": decision.path,
                     "reason": decision.reason,
                 })
 
-                # ===== 定义 LLM 调用（含缓存逻辑） =====
-                cache = get_cache()
                 memory = get_memory()
 
-                async def call_llm(prompt: str, route_path: str = "llm", auto_search: bool = False, prefer_cloud: bool = False, extra_context: str = ""):
-                    # 0. 查缓存
-                    cached = cache.check_and_get(prompt)
-                    if cached:
-                        logger.info(f"缓存命中: {prompt[:30]}...")
-                        reply_text = cached["reply"]
-                        # 防御：兼容旧缓存（reply 中可能残留 [ACTIONS] 标签）
-                        clean_reply, cached_actions = parse_actions(reply_text)
-                        if cached_actions:
-                            reply_text = clean_reply
-                            logger.info(f"缓存 [ACTIONS] 兜底解析: {json.dumps(cached_actions, ensure_ascii=False)[:200]}")
-                        else:
-                            # 新缓存：ACTIONS 存储在独立字段
-                            actions_json = cached.get("actions_json")
-                            if actions_json:
-                                try:
-                                    cached_actions = json.loads(actions_json)
-                                    logger.info(f"缓存 [ACTIONS] 恢复: {actions_json[:200]}")
-                                except json.JSONDecodeError:
-                                    logger.warning(f"缓存 actions_json 解析失败: {actions_json[:100]}")
-                        # 发送回复（防御性剥离 ACTIONS 标签）
-                        reply_text = _strip_actions_tags(reply_text)
-                        await ws.send_json({"type": "token", "text": reply_text})
-                        await ws.send_json({"type": "done", "path": "cache", "reply": reply_text, "model": "cache"})
-                        asyncio.create_task(_maybe_tts(ws, reply_text, "cache"))
-                        # 执行缓存中的音乐/设备操作
-                        if cached_actions:
-                            music_act = cached_actions.get("music")
-                            device_acts = cached_actions.get("devices", [])
-                            if music_act and isinstance(music_act, dict):
-                                if _user_requested_music(prompt):
-                                    await send_music_control(ws, music_act, tts_callback=_maybe_tts)
-                                    logger.info(f"[缓存] 执行音乐: {music_act}")
-                                else:
-                                    logger.warning(
-                                        f"[缓存] 跳过幻觉音乐标签: {json.dumps(music_act, ensure_ascii=False)[:120]} "
-                                        f"| 用户原文未包含音乐请求: {prompt[:80]}"
-                                    )
-                            if device_acts:
-                                for da in device_acts:
-                                    virtual_home.execute(da.get("device", ""), da.get("action", "toggle"))
-                                await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
-                        return
-
-                    # 0.5 自动搜索（信息查询类）
-                    mem_ctx = memory.get_context()
-                    if extra_context:
-                        mem_ctx = extra_context + "\n" + mem_ctx if mem_ctx else extra_context
-
-                    # 注入当前可用歌单列表（供 LLM 做歌单匹配）
-                    try:
-                        playlists_available = list_playlists()
-                        if playlists_available:
-                            names = "、".join(playlists_available.keys())
-                            mem_ctx += (
-                                f"\n\n【当前可用歌单 — 必须原样使用】{names}\n"
-                                "规则：当用户请求播放音乐且未指定具体歌名时，你必须从上面列表中**原样复制**一个歌单名。\n"
-                                "不确定选哪个时：学习/专注/焦虑/助眠→优先选含'轻音乐'的；日常/随便→优先选'收藏'。\n"
-                                "**绝对不要**自己编造歌单名，不确定就留空 playlist 让后端自己选。"
-                            )
-                    except Exception:
-                        pass  # 歌单目录可能尚未创建
-
-                    if auto_search:
-                        logger.info(f"自动搜索: {prompt[:40]}...")
-                        await ws.send_json({
-                            "type": "search_status",
-                            "status": "searching",
-                            "message": "正在联网搜索...",
-                        })
-                        search_ctx = await search_to_context(prompt)
-                        if search_ctx:
-                            mem_ctx += "\n" + search_ctx
-                            await ws.send_json({
-                                "type": "search_status",
-                                "status": "done",
-                                "message": "已获取搜索结果",
-                                "result": search_ctx[:200] + ("..." if len(search_ctx) > 200 else ""),
-                            })
-
-                    # 1. 调大模型（记录实际使用的模型）
-                    model_used: list[str] = []
-                    actions_out: list[str] = []  # 侧通道：收集流式中的 [ACTIONS] 标签
-                    full_reply = ""
-                    cancel_event.clear()  # 重置取消信号（新请求开始）
-                    try:
-                        async for token in generate_stream(
-                            prompt,
-                            memory_context=mem_ctx,
-                            conversation_history=_get_history(route_path),
-                            prefer_cloud=prefer_cloud,
-                            model_used=model_used,
-                            actions_out=actions_out,
-                            cancel_event=cancel_event,
-                        ):
-                            await ws.send_json({"type": "token", "text": token})
-                            full_reply += token
-                    except RuntimeError as e:
-                        full_reply = strip_search_tags(full_reply)
-                        logger.error(f"大模型调用失败: {e}")
-                        await ws.send_json({"type": "error", "error": str(e)})
-                        await ws.send_json({"type": "done", "path": route_path, "reply": full_reply, "model": model_used[0] if model_used else "unknown"})
-                        await _maybe_tts(ws, full_reply, route_path)
-                        return
-
-                    # 检查是否被取消（唤醒词打断）
-                    if cancel_event.is_set():
-                        logger.info("LLM 流被取消（唤醒词打断），丢弃部分回复")
-                        await ws.send_json({"type": "cancelled"})
-                        return
-
-                    # 处理 [ACTIONS] 标签：模型主动输出的设备/音乐操作
-                    # 优先从侧通道读取（流式层已收集），兜底检查 full_reply
-                    llm_actions = None
-                    for action_text in actions_out:
-                        _, actions = parse_actions(action_text)
-                        if actions:
-                            llm_actions = actions
-                            logger.info(f"LLM 输出 [ACTIONS] (侧通道): {json.dumps(actions, ensure_ascii=False)[:200]}")
-                            break
-                    if not llm_actions and '[ACTIONS]' in full_reply:
-                        full_reply, llm_actions = parse_actions(full_reply)
-                        if llm_actions:
-                            logger.info(f"LLM 输出 [ACTIONS] (兜底): {json.dumps(llm_actions, ensure_ascii=False)[:200]}")
-
-                    full_reply = strip_search_tags(full_reply)
-                    # 分离显示文本与 TTS 文本：
-                    # 显示文本：只剥离 ACTIONS 标签，保留 emoji 和轻量格式（有人情味）
-                    # TTS 文本：彻底清洗所有格式字符（纯文本朗读）
-                    display_reply = _strip_actions_tags(full_reply)
-                    tts_reply = clean_for_tts(display_reply)  # clean_for_tts 已内置 _strip_actions_tags
-                    actual_model = model_used[0] if model_used else "unknown"
-                    logger.info(f"大模型回复完成, 模型: {actual_model}")
-                    await ws.send_json({"type": "done", "path": route_path, "reply": display_reply.strip(), "model": actual_model})
-
-                    asyncio.create_task(_maybe_tts(ws, tts_reply.strip(), route_path))
-
-                    # 执行 LLM 通过 [ACTIONS] 标签输出的操作
-                    if llm_actions:
-                        music_act = llm_actions.get("music")
-                        device_acts = llm_actions.get("devices", [])
-                        if music_act and isinstance(music_act, dict):
-                            # 交叉验证：检查用户原文是否真的包含音乐请求
-                            # 防止 LLM 将回复中的短语幻觉成歌曲名（如鼓励语中的"相信自己"）
-                            if _user_requested_music(prompt):
-                                await send_music_control(ws, music_act, tts_callback=_maybe_tts)
-                                logger.info(f"[ACTIONS] 执行音乐: {music_act}")
-                            else:
-                                logger.warning(
-                                    f"[ACTIONS] 跳过幻觉音乐标签: {json.dumps(music_act, ensure_ascii=False)[:120]} "
-                                    f"| 用户原文未包含音乐请求: {prompt[:80]}"
-                                )
-                        if device_acts:
-                            for da in device_acts:
-                                virtual_home.execute(da.get("device", ""), da.get("action", "toggle"))
-                            await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
-
-                        # 执行 LLM 通过 [ACTIONS] 输出的 CET-6 操作（与音乐/设备控制一致的模式）
-                        cet6_act = llm_actions.get("cet6")
-                        if cet6_act and isinstance(cet6_act, dict):
-                            await handle_cet6_action(ws, cet6_act, id(ws), tts_callback=_maybe_tts)
-
-
-                    # 4.5 兜底音乐检测：LLM 未输出 ACTIONS 但回复确认了播放
-                    # 场景：小模型（qwen2.5:7b）有时忽略 ACTIONS 指令但仍会在文字中确认"轻音乐已就位"
-                    if not llm_actions and route_path == "llm" and full_reply.strip():
-                        music_reply_hints = [
-                            "已经在放", "已就位", "已开始播放", "音乐已经", "已经为你",
-                            "正在播放", "轻音乐已", "背景音乐已", "歌单已", "已为你播放",
-                            "给你放", "为你放", "放点", "来点音乐", "帮你播放",
-                        ]
-                        reply_hints = any(hint in full_reply for hint in music_reply_hints)
-                        user_music_kw = ["歌", "音乐", "音樂", "听歌", "聽歌", "放点", "放點",
-                                        "来点", "來點", "播点", "播點", "放首", "来首", "來首",
-                                        "放点", "放些", "播放", "想听", "想聽"]
-                        user_wants = any(kw in prompt for kw in user_music_kw)
-                        if reply_hints and user_wants:
-                            logger.info("兜底音乐检测：LLM 回复暗示播放 + 用户请求音乐 → 触发歌单播放")
-                            # 尝试从 LLM 回复中匹配可用歌单名
-                            playlist_name = ""
-                            try:
-                                from playlist_service import list_playlists as _list_playlists
-                                available = _list_playlists()
-                                for pname in available:
-                                    if pname in full_reply:
-                                        playlist_name = pname
-                                        logger.info(f"兜底歌单匹配: LLM 回复含 '{pname}'")
-                                        break
-                                if not playlist_name and available:
-                                    # 无匹配 → 根据用户 prompt 关键词选
-                                    prompt_lower = prompt.lower()
-                                    for pname in available:
-                                        if any(kw in prompt_lower for kw in ["学习", "专注", "轻音乐", "安静", "助眠"]):
-                                            if "轻音乐" in pname:
-                                                playlist_name = pname
-                                                break
-                                    if not playlist_name:
-                                        playlist_name = list(available.keys())[0]
-                                        logger.info(f"兜底歌单: 无匹配，默认选 '{playlist_name}'")
-                            except Exception:
-                                pass
-                            await send_music_control(ws, {"action": "play", "playlist": playlist_name}, tts_callback=_maybe_tts)
-
-                    # 5. 更新对话历史（非缓存路径）
-                    reply_text = full_reply.strip()
-                    if reply_text:
-                        history = _get_history(route_path)
-                        history.append({"role": "user", "content": prompt})
-                        history.append({"role": "assistant", "content": reply_text})
-                        # 限制最大对话轮数（最近 5 轮 = 10 条消息，各路径独立）
-                        if len(history) > 10:
-                            history[:2] = []  # 裁掉最早的一轮（user+assistant）
-
-                    # 2. 用户原文隐含意图提取（仅从用户输入提取，不碰 LLM 回复）
-                    #    LLM 若判定用户有明确操作意图 → 必须通过 [ACTIONS] 标签输出（上方已处理）
-                    #    此处的 classify(prompt) 只处理用户原文中已有关键词但走了 llm 路由的情况
-                    if route_path == "llm" and full_reply.strip():
-                        implicit = classify(prompt)
-                        if implicit.path == "xiaoai" and (implicit.device_actions or implicit.music_action):
-                            # 校验音乐查询质量：拒绝明显不是歌曲名的 query
-                            if implicit.music_action:
-                                q = implicit.music_action.get("query", "")
-                                if q and (len(q) > 30 or any(p in q for p in ["。", "！", "？", "，", "希望", "如果", "推荐", "告诉", "比如", "或", "之类"])):
-                                    logger.info(f"用户原文音乐查询无效({q[:40]})，清空 query 走歌单回退")
-                                    implicit.music_action["query"] = ""  # 不丢弃 action，清空 query 让后端走歌单/随机回退
-                            if implicit.device_actions or implicit.music_action:
-                                implicit_result = xiaoai_execute(
-                                    virtual_home=virtual_home,
-                                    device_actions=implicit.device_actions,
-                                    text=prompt,
-                                    matched_key=implicit.matched_key,
-                                    music_action=implicit.music_action,
-                                )
-                                if implicit_result["handled"]:
-                                    if implicit_result.get("music_action"):
-                                        await send_music_control(ws, implicit_result["music_action"], tts_callback=_maybe_tts)
-                                    if implicit_result["results"]:
-                                        await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
-                                    logger.info(f"用户原文隐含操作执行: devices={implicit.device_actions} music={implicit.music_action}")
-
-                    # 3. 记忆提取（用户原文 + LLM 回复双向提取）
-                    if route_path == "llm" and full_reply.strip():
-                        # 过滤低质量/幻觉 STT 文本，避免存入误识别记忆
-                        if not is_low_quality_stt(prompt) and not _is_hallucination(prompt):
-                            new_memories = memory.extract_and_store(prompt)
-                        else:
-                            logger.info(f"记忆跳过（低质量/幻觉文本）: {prompt[:40]}")
-                            new_memories = []
-                        # 也从 LLM 回复中提取（LLM 可能复述了用户信息）
-                        if not _is_hallucination(full_reply.strip()):
-                            new_memories += memory.extract_and_store(full_reply.strip())
-                        if new_memories:
-                            logger.info(f"新记忆（正则）: {new_memories}")
-                            await ws.send_json({
-                                "type": "memory_learned",
-                                "memories": new_memories,
-                                "message": "我记住了关于你的新信息",
-                            })
-                        # LLM 辅助记忆提取（异步，不阻塞主回复）
-                        asyncio.create_task(memory.extract_with_llm(prompt, full_reply.strip()))
-
-                    # 4. 计数 + 可能缓存
-                    if route_path == "llm" and full_reply.strip():
-                        count, reached = cache.increment_and_check(prompt)
-                        logger.info(f"LLM 计数: {prompt[:30]}... -> {count}/3")
-                        if reached:
-                            actions_json = json.dumps(llm_actions, ensure_ascii=False) if llm_actions else None
-                            cache.store_reply(prompt, full_reply.strip(), actions_json=actions_json)
-                            logger.info(f"缓存学习完成: {prompt[:30]}...")
-                            await ws.send_json({
-                                "type": "cache_learned",
-                                "text": prompt[:50],
-                                "message": "我记住了这个对话习惯，下次可以直接回答",
-                            })
-
-                # ===== 路径 A：设备控制 =====
+                # ── 路径 xiaoai：设备控制 ──
                 if decision.path == "xiaoai":
                     result = xiaoai_execute(
                         virtual_home=virtual_home,
@@ -1131,11 +854,12 @@ async def websocket_endpoint(ws: WebSocket):
                         matched_key=decision.matched_key,
                         music_action=decision.music_action,
                     )
-
                     if result["handled"]:
                         await ws.send_json({"type": "token", "text": result["reply"]})
-                        await ws.send_json({"type": "done", "path": "xiaoai", "reply": result["reply"], "model": "xiaoai"})
-                        # 纯音乐动作不播乐观 TTS，由 _send_music_control 按实际结果播报
+                        await ws.send_json({
+                            "type": "done", "path": "xiaoai",
+                            "reply": result["reply"], "model": "xiaoai",
+                        })
                         is_pure_music = result.get("music_action") and not result.get("results")
                         if not is_pure_music:
                             asyncio.create_task(_maybe_tts(ws, result["reply"], "xiaoai"))
@@ -1145,33 +869,45 @@ async def websocket_endpoint(ws: WebSocket):
                             await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
                         continue
                     else:
-                        # 设备无法处理 → 直接调大模型
                         logger.info(f"设备无法处理，直接调用大模型: {text[:50]}")
                         await ws.send_json({"type": "route", "path": "llm", "reason": "设备无法处理，转交大模型"})
-                        await call_llm(text, "llm")
+                        await _chat_handler.call_llm(
+                            ws, text, "llm",
+                            memory=memory,
+                            virtual_home=virtual_home,
+                            conversation_histories=conversation_histories,
+                            cancel_event=cancel_event,
+                            maybe_tts_callback=_maybe_tts,
+                            playlist_list_func=list_playlists,
+                        )
                         continue
 
-                # ===== 路径 noise：音乐串扰过滤，静默忽略 =====
+                # ── 路径 noise：静默忽略 ──
                 if decision.path == "noise":
-                    logger.info(f"噪声过滤: 忽略疑似音乐串扰文本 '{text[:40]}'")
+                    logger.info(f"噪声过滤: {text[:40]}")
                     await ws.send_json({"type": "noise_filtered", "text": text[:40]})
                     continue
 
-                # ===== 路径 B：信息查询（info_query → DeepSeek 云端 + 自动搜索） =====
+                # ── 路径 info_query：信息查询 ──
                 if decision.path == "info_query":
-                    await ws.send_json({
-                        "type": "route", "path": "llm", "reason": "信息查询",
-                    })
-                    await call_llm(text, "llm", auto_search=True)
+                    await ws.send_json({"type": "route", "path": "llm", "reason": "信息查询"})
+                    await _chat_handler.call_llm(
+                        ws, text, "llm", auto_search=True,
+                        memory=memory,
+                        virtual_home=virtual_home,
+                        conversation_histories=conversation_histories,
+                        cancel_event=cancel_event,
+                        maybe_tts_callback=_maybe_tts,
+                        playlist_list_func=list_playlists,
+                    )
                     continue
 
-                # ===== 路径 C：混合意图（先设备后大模型） =====
+                # ── 路径 mixed：混合意图 ──
                 if decision.path == "mixed":
                     await ws.send_json({
                         "type": "route", "path": "mixed",
                         "reason": "混合意图，拆分子任务执行",
                     })
-                    # 1. 先执行设备部分
                     for sub in decision.sub_tasks:
                         if sub["path"] == "xiaoai":
                             sub_result = xiaoai_execute(
@@ -1187,20 +923,33 @@ async def websocket_endpoint(ws: WebSocket):
                                     await send_music_control(ws, sub_result["music_action"], tts_callback=_maybe_tts)
                                 if sub_result["results"]:
                                     await ws.send_json({"type": "device_state", "devices": virtual_home.get_all_states()})
-
-                    # 2. 再调大模型处理剩余部分（走 DeepSeek）
-                    await call_llm(text, "llm", auto_search=True)
+                    await _chat_handler.call_llm(
+                        ws, text, "llm", auto_search=True,
+                        memory=memory,
+                        virtual_home=virtual_home,
+                        conversation_histories=conversation_histories,
+                        cancel_event=cancel_event,
+                        maybe_tts_callback=_maybe_tts,
+                        playlist_list_func=list_playlists,
+                    )
                     continue
 
-                # ===== 路径 D：Reasonix 执行（需审批） =====
+                # ── 路径 reasonix ──
                 if decision.path == "reasonix":
                     if not is_reasonix_available():
                         logger.info("Reasonix CLI 不可用，fallback 到大模型")
-                        await ws.send_json({"type": "route", "path": "llm", "reason": "Reasonix 未安装，转交大模型"})
-                        await call_llm(text, "llm")
+                        await ws.send_json({"type": "route", "path": "llm", "reason": "Reasonix 未安装"})
+                        await _chat_handler.call_llm(
+                            ws, text, "llm",
+                            memory=memory,
+                            virtual_home=virtual_home,
+                            conversation_histories=conversation_histories,
+                            cancel_event=cancel_event,
+                            maybe_tts_callback=_maybe_tts,
+                            playlist_list_func=list_playlists,
+                        )
                         continue
 
-                    # 创建待审批任务，等用户说"允许"
                     pm = get_pending_manager()
                     pm.add(text)
                     await ws.send_json({
@@ -1218,9 +967,36 @@ async def websocket_endpoint(ws: WebSocket):
                     })
                     continue
 
-                # ===== 路径 C：大模型处理 =====
+                # ── 路径 cet6：六级备考 ──
+                if decision.path == "cet6":
+                    # LLM 先行：文字回复 + [ACTIONS] 标签同时输出，试卷和文字一起到达
+                    await _chat_handler.call_llm(
+                        ws, text, "cet6",
+                        memory=memory,
+                        virtual_home=virtual_home,
+                        conversation_histories=conversation_histories,
+                        cancel_event=cancel_event,
+                        maybe_tts_callback=_maybe_tts,
+                        playlist_list_func=list_playlists,
+                    )
+                    # 兜底：小模型可能未输出 [ACTIONS] 标签，检查是否已发送试卷
+                    session = get_cet6_session(id(ws))
+                    if not session.get("paper_id"):
+                        logger.info("CET-6 LLM 未触发试卷操作，执行兜底直接发送")
+                        await _handle_cet6_route(ws, text)
+                    continue
+
+                # ── 路径 llm：大模型兜底 ──
                 if decision.path == "llm":
-                    await call_llm(text, "llm")
+                    await _chat_handler.call_llm(
+                        ws, text, "llm",
+                        memory=memory,
+                        virtual_home=virtual_home,
+                        conversation_histories=conversation_histories,
+                        cancel_event=cancel_event,
+                        maybe_tts_callback=_maybe_tts,
+                        playlist_list_func=list_playlists,
+                    )
                     continue
 
             # 未知消息类型
@@ -1233,10 +1009,9 @@ async def websocket_endpoint(ws: WebSocket):
         logger.error(f"WebSocket 异常: {e}")
         get_cet6_session(id(ws)).clear()
     finally:
-        # 停止情境引擎
         await ce.stop()
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run("main:app", host=BACKEND_HOST, port=PORT, log_level="info")

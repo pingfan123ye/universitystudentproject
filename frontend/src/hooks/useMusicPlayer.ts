@@ -345,15 +345,21 @@ export function useMusicPlayer() {
   // ── 录音时降低音乐音量（ducking），避免扬声器内容被麦克风拾取 ──
   const _volumeBeforeRec = useRef(0.7);
   const _wasPlayingBeforeRec = useRef(false);
+  const _isDuckedRef = useRef(false);  // ★ 防止重复保存原始音量（Light Duck → Deep Duck 会覆盖）
 
-  const duckForRecording = useCallback(() => {
+  const duckForRecording = useCallback((factor: number = 0.08) => {
     const audio = audioRef.current;
-    if (audio) {
-      _volumeBeforeRec.current = audio.volume;
-      _wasPlayingBeforeRec.current = !audio.paused;
-      const duckedVolume = Math.max(0.03, audio.volume * 0.08);
+    if (audio && !audio.paused) {
+      // ★ 只在首次进入 Duck 状态时保存原始音量，防止 Light Duck(0.35) 保存 0.70
+      //   后被 Deep Duck(0.08) 覆盖为 0.245，导致恢复时只能恢复到 0.245
+      if (!_isDuckedRef.current) {
+        _volumeBeforeRec.current = audio.volume;
+        _wasPlayingBeforeRec.current = true;
+        _isDuckedRef.current = true;
+      }
+      const duckedVolume = Math.max(0.03, _volumeBeforeRec.current * factor);
       audio.volume = duckedVolume;
-      console.log(`[音频Ducking] 录音开始，音量 ${_volumeBeforeRec.current.toFixed(2)} → ${duckedVolume.toFixed(2)}`);
+      console.log(`[音频Ducking] 音量 ${_volumeBeforeRec.current.toFixed(2)} → ${duckedVolume.toFixed(2)} (factor=${factor})`);
     }
   }, []);
 
@@ -362,6 +368,8 @@ export function useMusicPlayer() {
     if (audio && _wasPlayingBeforeRec.current) {
       audio.volume = _volumeBeforeRec.current;
       setVolumeState(_volumeBeforeRec.current);
+      _isDuckedRef.current = false;  // ★ 重置标记，下次 Duck 重新保存原始音量
+      _wasPlayingBeforeRec.current = false;
       console.log(`[音频Ducking] 录音结束，恢复音量 → ${_volumeBeforeRec.current.toFixed(2)}`);
     }
   }, []);

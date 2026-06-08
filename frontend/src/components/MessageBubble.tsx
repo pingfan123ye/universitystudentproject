@@ -28,12 +28,15 @@ const modelLabel: Record<string, string> = {
   'deepseek:deepseek-v4-pro': 'DeepSeek',
   'ollama:qwen2.5:7b': 'Qwen',
   'ollama:qwen2.5:14b': 'Qwen',
+  'ollama:qwen3:8b': 'Qwen3',
   xiaoai: '小智', reasonix: 'Reasonix', cache: '缓存',
 };
 const modelColor: Record<string, string> = {
   'deepseek:deepseek-v4-flash': 'bg-green-100 text-green-700',
   'deepseek:deepseek-v4-pro': 'bg-green-100 text-green-700',
   'ollama:qwen2.5:7b': 'bg-orange-100 text-orange-700',
+  'ollama:qwen2.5:14b': 'bg-orange-100 text-orange-700',
+  'ollama:qwen3:8b': 'bg-orange-100 text-orange-700',
   xiaoai: 'bg-blue-100 text-blue-700',
   reasonix: 'bg-teal-100 text-teal-700',
   cache: 'bg-green-100 text-green-700',

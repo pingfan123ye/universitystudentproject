@@ -14,17 +14,11 @@ from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
 
-# ── 尝试加载用户配置 ──
-_APPID = ""
-_API_KEY = ""
-_API_SECRET = ""
-try:
-    from services.stt_config import IFT_APPID, IFT_API_KEY, IFT_API_SECRET
-    _APPID = IFT_APPID
-    _API_KEY = IFT_API_KEY
-    _API_SECRET = IFT_API_SECRET
-except Exception as e:
-    logger.warning("讯飞配置未设置或无效: %s — STT 不可用", e)
+# ── 从统一配置加载 ──
+from config import IFT_APPID as _APPID, IFT_API_KEY as _API_KEY, IFT_API_SECRET as _API_SECRET
+
+if not _APPID or _APPID in ("你的APPID", "your_appid"):
+    logger.info("讯飞 API 未配置（IFT_APPID 未设置），云端 STT fallback 不可用")
 
 _HOST = "iat-api.xfyun.cn"
 _PATH = "/v2/iat"

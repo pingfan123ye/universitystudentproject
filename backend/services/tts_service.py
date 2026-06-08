@@ -1,26 +1,106 @@
 """
 TTS 语音合成服务
-优先级：
-  1. pyttsx3（Windows 本地 SAPI，零延迟直接发声）
-  2. Edge TTS（云端，网络不可达时超时降级）
+fallback 链（由 TTS_FALLBACK_CHAIN 环境变量控制）:
+  1. Edge TTS（微软 Xiaoxiao 神经语音，云端高质量主力）
+  2. VITS MeloTTS（sherpa-onnx 离线备选，中英双语）
+  3. pyttsx3（Windows SAPI 本地引擎，最后兜底）
 """
 import asyncio
 import base64
 import io
 import logging
+import os
+import re as _re
 import threading
+import time
 
 import edge_tts
 
 logger = logging.getLogger(__name__)
 
-# ── pyttsx3 本地引擎 ──
+from config import TTS_FALLBACK_CHAIN
+
+# 解析 fallback 链顺序
+_FALLBACK_ENGINES = [e.strip() for e in TTS_FALLBACK_CHAIN.split(",") if e.strip()]
+
+
+# ═══════════════════════════════════════
+# 引擎 2: VITS MeloTTS (sherpa-onnx 离线备选)
+# ═══════════════════════════════════════
+
+_kokoro_loaded = False
+
+def _ensure_kokoro_imported():
+    global _kokoro_loaded
+    if _kokoro_loaded:
+        return True
+    try:
+        from services.qwen3_tts import text_to_speech_base64 as _kokoro_tts
+        from services.qwen3_tts import is_available as _kokoro_available
+        _kokoro_loaded = True
+        return True
+    except ImportError:
+        return False
+
+
+async def _kokoro_base64(text: str) -> str | None:
+    if not _ensure_kokoro_imported():
+        return None
+    from services.qwen3_tts import text_to_speech_base64
+    from services.qwen3_tts import is_available
+    if not await is_available():
+        return None
+    return await text_to_speech_base64(text)
+
+
+# ═══════════════════════════════════════
+# 引擎 1: Edge TTS (微软云端，最高优先级)
+# ═══════════════════════════════════════
+
+ZH_VOICES = [
+    "zh-CN-XiaoxiaoNeural",
+    "zh-CN-XiaoyiNeural",
+    "zh-CN-YunxiNeural",
+    "zh-CN-YunjianNeural",
+    "zh-CN-YunxiaNeural",
+]
+
+
+async def _edge_tts_base64(text: str, voice: str | None = None) -> str | None:
+    """Edge TTS 转 base64，直接合成 + 10s 超时 + 一次重试"""
+    _voice = voice or ZH_VOICES[0]
+    for attempt in range(2):
+        try:
+            communicate = edge_tts.Communicate(text, _voice)
+
+            async def _collect() -> bytes:
+                buf = io.BytesIO()
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        buf.write(chunk["data"])
+                return buf.getvalue()
+
+            audio_data = await asyncio.wait_for(_collect(), timeout=10.0)
+            if audio_data:
+                logger.info("Edge TTS 合成成功 (%d bytes, 尝试 %d/2)", len(audio_data), attempt + 1)
+                return base64.b64encode(audio_data).decode("utf-8")
+        except asyncio.TimeoutError:
+            logger.warning("Edge TTS 超时 (尝试 %d/2)", attempt + 1)
+            break  # 一次超时就说明网络不通，不用再试
+        except Exception as e:
+            logger.warning("Edge TTS 异常 (尝试 %d/2): %s", attempt + 1, str(e)[:60])
+    return None
+
+
+# ═══════════════════════════════════════
+# 引擎 3: pyttsx3 (Windows SAPI，最后兜底)
+# ═══════════════════════════════════════
+
 _pyttsx3_engine = None
 _pyttsx3_lock = threading.Lock()
 
 
 def _get_pyttsx3_engine():
-    """线程安全地获取/初始化 pyttsx3 引擎"""
     global _pyttsx3_engine
     if _pyttsx3_engine is not None:
         return _pyttsx3_engine
@@ -30,14 +110,13 @@ def _get_pyttsx3_engine():
         try:
             import pyttsx3
             engine = pyttsx3.init()
-            # 尝试设置中文语音
             voices = engine.getProperty('voices')
             for v in voices:
                 if 'zh-CN' in str(v.languages) or 'HUIHUI' in v.id:
                     engine.setProperty('voice', v.id)
                     break
-            engine.setProperty('rate', 130)   # 语速（调慢更自然）
-            engine.setProperty('volume', 1.0) # 音量
+            engine.setProperty('rate', 130)
+            engine.setProperty('volume', 1.0)
             _pyttsx3_engine = engine
             logger.info("pyttsx3 引擎已就绪: %s", engine.getProperty('voice'))
         except Exception as e:
@@ -47,7 +126,6 @@ def _get_pyttsx3_engine():
 
 
 def _speak_sync(text: str):
-    """同步阻塞调用 pyttsx3 发音（在后台线程执行）"""
     engine = _get_pyttsx3_engine()
     if engine is None:
         raise RuntimeError("pyttsx3 不可用")
@@ -67,146 +145,95 @@ async def pyttsx3_speak(text: str) -> bool:
 
 
 async def is_pyttsx3_available() -> bool:
-    """检查 pyttsx3 是否可用"""
     engine = _get_pyttsx3_engine()
     return engine is not None
 
 
-# ── Edge TTS 后备引擎 ──
-
-# 中文发音人（按自然度降序）
-ZH_VOICES = [
-    "zh-CN-XiaoxiaoNeural",
-    "zh-CN-XiaoyiNeural",
-    "zh-CN-YunxiNeural",
-    "zh-CN-YunjianNeural",
-    "zh-CN-YunxiaNeural",
-]
-
-
-async def _edge_tts_base64(text: str, voice: str | None = None) -> str | None:
-    """Edge TTS 转 base64，带整体超时和重试"""
-    _voice = voice or ZH_VOICES[0]
-    for attempt in range(2):
-        try:
-            communicate = edge_tts.Communicate(text, _voice)
-            audio_bytes = io.BytesIO()
-            async with asyncio.timeout(5.0):
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        audio_bytes.write(chunk["data"])
-            audio_data = audio_bytes.getvalue()
-            if audio_data:
-                logger.info("Edge TTS 合成成功 (%d bytes, 尝试 %d/2)", len(audio_data), attempt + 1)
-                return base64.b64encode(audio_data).decode("utf-8")
-        except asyncio.TimeoutError:
-            logger.warning("Edge TTS 整体超时 (尝试 %d/2, text=%s)", attempt + 1, text[:30])
-        except Exception as e:
-            logger.warning("Edge TTS 异常 (尝试 %d/2): %s — %s", attempt + 1, type(e).__name__, str(e)[:60])
-    return None
-
+# ═══════════════════════════════════════
+# 主入口: 按配置的 fallback 链合成语音
+# ═══════════════════════════════════════
 
 async def text_to_speech_base64(text: str, voice: str | None = None) -> str | None:
     """
-    主入口：优先 Edge TTS（自然语音），pyttsx3 本地后备（离线时用）。
+    主入口：按 TTS_FALLBACK_CHAIN 顺序尝试合成语音。
+
+    Returns:
+        base64 编码的音频数据（WAV/mp3），或 None（pyttsx3 直接发音时）
     """
     text = text.strip()
     if not text:
         return None
 
-    # 1. 优先 Edge TTS 云端引擎（免费，音质自然）
-    audio_b64 = await _edge_tts_base64(text, voice)
-    if audio_b64:
-        return audio_b64
-
-    # 2. pyttsx3 本地引擎（离线后备，直接扬声器发音）
-    spoken = await pyttsx3_speak(text)
-    if spoken:
-        return None  # 已通过扬声器发音，不需要返回音频
-
-    # 3. ChatTTS 本地自然语音（音质最佳但加载慢，最后后备）
-    try:
-        audio_b64 = await _chattts_base64(text)
-        if audio_b64:
-            return audio_b64
-    except Exception as e:
-        logger.warning("ChatTTS 失败: %s", e)
-
-    return None
-
-
-# ── ChatTTS 自然语音引擎 ──
-_chattts_instance = None
-_chattts_lock = threading.Lock()
-
-
-def _get_chattts():
-    global _chattts_instance
-    if _chattts_instance is not None:
-        return _chattts_instance
-    with _chattts_lock:
-        if _chattts_instance is not None:
-            return _chattts_instance
+    for engine_name in _FALLBACK_ENGINES:
         try:
-            from ChatTTS import Chat
-            _chattts_instance = Chat()
-            _chattts_instance.load(compile=False, device="cpu", source="huggingface")
-            logger.info("ChatTTS 引擎已就绪 (CPU)")
+            if engine_name == "qwen3_tts":
+                audio_b64 = await _kokoro_base64(text)
+                if audio_b64:
+                    return audio_b64
+
+            elif engine_name == "edge_tts":
+                audio_b64 = await _edge_tts_base64(text, voice)
+                if audio_b64:
+                    return audio_b64
+
+            elif engine_name == "pyttsx3":
+                spoken = await pyttsx3_speak(text)
+                if spoken:
+                    return None  # 已通过扬声器发音
+
         except Exception as e:
-            logger.warning("ChatTTS 初始化失败: %s", e)
-            _chattts_instance = None
-    return _chattts_instance
+            logger.warning("TTS 引擎 %s 失败: %s", engine_name, e)
+            continue
 
-
-async def _chattts_base64(text: str) -> str | None:
-    """
-    使用 ChatTTS 合成语音，返回 base64 编码的 WAV 音频。
-    如果 ChatTTS 不可用返回 None。
-    """
-    chat = _get_chattts()
-    if chat is None:
-        return None
-
-    import scipy.io.wavfile
-    loop = asyncio.get_event_loop()
-
-    def _sync_infer():
-        wavs = chat.infer([text])
-        wav = wavs[0]
-        buf = io.BytesIO()
-        scipy.io.wavfile.write(buf, 24000, wav.astype("float32"))
-        return base64.b64encode(buf.getvalue()).decode()
-
-    return await loop.run_in_executor(None, _sync_infer)
+    logger.warning("所有 TTS 引擎均失败")
+    return None
 
 
 async def is_available() -> bool:
     """检查是否有任一 TTS 引擎可用"""
-    return await is_pyttsx3_available() or await _edge_tts_check()
+    for engine_name in _FALLBACK_ENGINES:
+        try:
+            if engine_name == "qwen3_tts":
+                if _ensure_kokoro_imported():
+                    from services.qwen3_tts import is_available as _a
+                    if await _a():
+                        return True
+            elif engine_name == "edge_tts":
+                # 不调 list_voices()（可能被墙），直接尝试即可
+                # Edge TTS 在合成时自带 10s 超时，这里只检查网络可达性
+                try:
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_connection("speech.platform.bing.com", 443),
+                        timeout=3.0,
+                    )
+                    writer.close()
+                    return True
+                except Exception:
+                    pass
+            elif engine_name == "pyttsx3":
+                if await is_pyttsx3_available():
+                    return True
+        except Exception:
+            pass
+    return False
 
 
-async def _edge_tts_check() -> bool:
-    try:
-        await asyncio.wait_for(edge_tts.list_voices(), timeout=5.0)
-        return True
-    except Exception:
-        return False
-
-
-# ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════
 # TTS 文本清洗
-# ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════
 
 def clean_for_tts(text: str) -> str:
     """清洗 Markdown / 结构化格式字符 + Emoji，让 TTS 只朗读纯文本"""
-    import re as _re
-
-    # 0. 最终防线：清除所有 [ACTIONS] 标签（防止泄露到 TTS 朗读）
-    from services.llm_service import _strip_actions_tags
-    text = _strip_actions_tags(text)
+    # 0. 最终防线：清除所有 [ACTIONS] 标签
+    #    内联正则避免依赖 llm_service 的 import（llm_service 依赖 ollama 等重型包）
+    _ACTIONS_STRIP_RE = _re.compile(
+        r'[\[【]ACTIONS[]】].*?[\[【]/ACTIONS[]】]', _re.DOTALL
+    )
+    text = _ACTIONS_STRIP_RE.sub('', text).strip()
     if not text:
         return ""
-    # 0.5 去除 Emoji 表情符号（TTS 无法朗读，避免读出乱码）
+
+    # 0.5 去除 Emoji 表情符号
     _EMOJI_BLOCKS = _re.compile(
         '['
         '\U0001F600-\U0001F64F'
@@ -238,23 +265,24 @@ def clean_for_tts(text: str) -> str:
     text = _EXTRA_SYMBOLS.sub('', text)
     if not text.strip():
         return ""
-    # 1. 去掉代码块（```...```）
+
+    # 1. 去掉代码块
     text = _re.sub(r'```[\s\S]*?```', '', text)
-    # 2. 去掉行内代码 (`code`)
+    # 2. 去掉行内代码
     text = _re.sub(r'`([^`]+)`', r'\1', text)
-    # 3. 去掉粗体标记（**text**, __text__）
+    # 3. 去掉粗体标记
     text = _re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
     text = _re.sub(r'__([^_]+)__', r'\1', text)
-    # 4. 去掉斜体标记（*text* / _text_）
+    # 4. 去掉斜体标记
     text = _re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'\1', text)
     text = _re.sub(r'(?<!_)_([^_\n]+)_(?!_)', r'\1', text)
-    # 5. 去掉标题标记（# ## ### 等，只在行首匹配）
+    # 5. 去掉标题标记
     text = _re.sub(r'^#{1,6}\s+', '', text, flags=_re.MULTILINE)
-    # 6. 去掉无序列表标记（- * + 开头）
+    # 6. 去掉无序列表标记
     text = _re.sub(r'^[\-\*\+]\s+', '', text, flags=_re.MULTILINE)
-    # 7. 去掉有序列表标记（1. 2. 等）
+    # 7. 去掉有序列表标记
     text = _re.sub(r'^\d+\.\s+', '', text, flags=_re.MULTILINE)
-    # 8. 去掉删除线（~~text~~）
+    # 8. 去掉删除线
     text = _re.sub(r'~~([^~]+)~~', r'\1', text)
     # 9. 去掉多余空白行
     text = _re.sub(r'\n{3,}', '\n\n', text)

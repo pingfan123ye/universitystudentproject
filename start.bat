@@ -21,7 +21,7 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":5173" ^| findstr "LISTENING
 REM ---- backend ----
 echo.
 echo [1] Starting backend on http://localhost:8000
-start "Backend" cmd /k "cd /d %~dp0backend && E:\python\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000"
+start "Backend" cmd /k "cd /d %~dp0backend && .venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000"
 
 REM ---- frontend ----
 echo [2] Starting frontend on http://localhost:5173

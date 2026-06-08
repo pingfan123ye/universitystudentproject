@@ -20,18 +20,19 @@ class TestCorrect:
         assert correct("暂停拨号") == "暂停播放"
 
     def test_cet6_correction(self):
-        assert correct("被烤六集") == "备考六级"
-        assert correct("背靠六级") == "备考六级"
-        assert correct("真体券") == "真题"
-        assert correct("六级真体全") == "六级真题"
+        # SenseVoice 准确率提升后，精简版 CORRECTIONS 仅保留音近高频纠错
+        assert correct("被烤六集") == "备考六级"  # 被烤→备考 + 六集→六级
+        assert correct("备烤六极") == "备考六级"  # 备烤→备考 + 六极→六级
+        # "背靠"、"真体券" 等已从纠错表移除（SenseVoice 可正确识别）
 
     def test_learning_correction(self):
-        assert correct("学系英语") == "学习英语"
-        assert correct("学西") == "学习"
+        # "学系" → "学习" 已移除（SenseVoice 可区分"系"和"习"）
+        # 空文本/纯空格保持不变
+        assert correct("") == ""
 
     def test_empty_input(self):
         assert correct("") == ""
-        assert correct("   ") == "   "
+        assert correct("   ") == "   "  # correct() 保持空白不变
 
 
 class TestIsHallucination:
@@ -78,23 +79,23 @@ class TestIsLowQualitySTT:
 
 
 class TestCorrectionsCoverage:
-    """验证 CORRECTIONS 字典的覆盖范围"""
+    """验证精简版 CORRECTIONS 字典的覆盖范围（SenseVoice 准确率提升后大幅精简）"""
 
     def test_has_cet6_corrections(self):
-        """确保 CET-6 相关纠错规则完整"""
+        """确保 CET-6 核心音近纠错规则存在"""
         cet6_pairs = [
-            ("被烤", "备考"), ("背靠", "备考"), ("贝考", "备考"),
-            ("六集", "六级"), ("六极", "六级"), ("留级", "六级"),
-            ("真体券", "真题"), ("整体券", "真题"),
-            ("学系", "学习"), ("学西", "学习"),
+            ("背考", "备考"), ("被烤", "备考"), ("备烤", "备考"),
+            ("六集", "六级"), ("六极", "六级"),
         ]
         for wrong, right in cet6_pairs:
             assert CORRECTIONS.get(wrong) == right, f"Missing: {wrong} → {right}"
 
     def test_has_music_corrections(self):
-        """确保音乐指令纠错规则完整"""
+        """确保音乐指令核心音近纠错规则存在"""
         music_pairs = [
-            ("切割", "切歌"), ("暂停拨号", "暂停播放"), ("放纵", "放首"),
+            ("切割", "切歌"), ("切格", "切歌"),
+            ("暂停拨号", "暂停播放"), ("展厅播放", "暂停播放"),
+            ("波放", "播放"), ("播发", "播放"),
         ]
         for wrong, right in music_pairs:
             assert CORRECTIONS.get(wrong) == right, f"Missing: {wrong} → {right}"
