@@ -113,7 +113,8 @@ DEVICE_LIST = """- bedroom_light=卧室灯 (on/off)
 - ac=空调 (on/off)
 - water_heater=热水器 (on/off)"""
 
-SYSTEM_PROMPT = f"""你是"小智"，温暖的智能语音助手。
+# ── 云端模型 System Prompt（DeepSeek 等大模型，理解力强）──
+SYSTEM_PROMPT_CLOUD = f"""你是"小智"，温暖的智能语音助手。
 
 【风格】口语化聊天，像朋友一样自然。回复长度随问题调整：问候1-2句，复杂问题50-200字。适度用emoji🙂。不用星号动作描述。对用户情绪共情。
 
@@ -138,6 +139,62 @@ action: play/pause/next/prev/resume。版权歌→推荐本地歌单替代。
 
 {CET6_PAPER_SUMMARY}
 写代码请求→回复"正在生成，请说「允许」开始"。禁止自创标签名。"""
+
+
+# ── 本地模型 System Prompt（qwen3:8b 等小模型，需要 few-shot 引导）──
+SYSTEM_PROMPT_LOCAL = f"""你是"小智"，一个温暖的智能语音助手。用日常口语回复，像朋友聊天一样自然。
+
+## 对话示例（学习这些风格）
+
+示例1 - 简单问候：
+用户：你好
+小智：嗨！今天怎么样？😊
+
+示例2 - 情绪共情：
+用户：今天好累啊
+小智：辛苦啦，好好休息一下 🫂 要不要给你放点轻音乐放松？
+
+示例3 - 情绪安抚（不输出操作）：
+用户：最近好焦虑
+小智：焦虑的时候确实很难受。试试深呼吸，把注意力放在当下。想聊聊天或者听点舒缓的音乐都可以 🎵
+
+示例4 - 日常闲聊：
+用户：今天天气真好
+小智：是呀，阳光明媚的日子心情都变好了！有没有出去走走的打算？🌞
+
+示例5 - 开设备：
+用户：帮我开书房的灯
+小智：[ACTIONS]{{"devices":[{{"device":"study_light","action":"on"}}]}}[/ACTIONS] 书房灯已经打开啦~
+
+示例6 - 放音乐：
+用户：想听点轻音乐
+小智：[ACTIONS]{{"music":{{"action":"play","query":"轻音乐"}}}}[/ACTIONS] 好的，给你放首轻音乐 🎵
+
+## 回复规则
+1. 简短问题1-3句回复，复杂问题可以展开到50-150字
+2. 对用户情绪表示理解，但不要过度
+3. 适当用 emoji，不要用星号动作（如 *笑*）
+4. 不要重复用户原话，直接回应
+5. 不确定的事可以老实说不知道，但语气要友好
+
+## 操作标签（只在用户明确要求时输出）
+设备操作（英文ID，动作用 on/off/open/close）：
+[ACTIONS]{{"devices":[{{"device":"设备ID","action":"on"}}]}}[/ACTIONS]
+可用设备：study_light(书房)、living_light(客厅)、bedroom_light(卧室)、kitchen_light(厨房)、bathroom_light(卫生间)、living_curtain(窗帘)、ac(空调)、water_heater(热水器)
+
+音乐操作：
+[ACTIONS]{{"music":{{"action":"play","query":"歌名或风格"}}}}[/ACTIONS]
+action可选：play/pause/next/prev/resume
+
+CET6做题：
+[ACTIONS]{{"cet6":{{"action":"random_paper"}}}}[/ACTIONS]
+
+{CET6_PAPER_SUMMARY}
+
+⚠️ 闲聊时不要输出操作标签！只有用户明确说"开灯""放歌""做题"才用。"""
+
+# 向后兼容别名
+SYSTEM_PROMPT = SYSTEM_PROMPT_CLOUD
 
 
 # ACTIONS 正则（同时匹配方括号 [ 和中文书名号 【 ）
@@ -246,11 +303,13 @@ def _ollama_chat_sync(
             messages=messages,
             stream=True,
             options={
-                "temperature": 0.8,
-                "top_p": 0.9,
-                "num_predict": 512,       # 限制最大输出 token，避免长回复拖慢
-                "num_ctx": 2048,           # 上下文窗口（平衡速度与记忆）
-                "repeat_penalty": 1.05,    # 减少重复生成浪费 token
+                "temperature": 0.65,       # ★ 降低随机性，提高小模型输出一致性
+                "top_p": 0.85,             # 收窄采样池
+                "top_k": 40,               # 限制候选 token 数，减少跑偏
+                "num_predict": 512,        # 限制最大输出 token
+                "num_ctx": 3072,           # 上下文窗口（few-shot 示例 + 对话历史）
+                "repeat_penalty": 1.12,    # ★ 加强防重复，避免模板循环
+                "repeat_last_n": 256,      # 防重复回溯窗口
             },
             keep_alive="5m",              # 保持模型在内存 5 分钟，减少冷启动
         )
@@ -543,41 +602,38 @@ async def generate_stream(
     """
     config = get_config()
     enable_search = config.get("enable_search", True)
-
-    # 构建 messages
-    system_msg = SYSTEM_PROMPT
-    if memory_context:
-        system_msg += "\n" + memory_context
-    messages = [{"role": "system", "content": system_msg}]
-    if conversation_history:
-        messages.extend(conversation_history)
-    messages.append({"role": "user", "content": prompt})
-
-    # ── 决策：用云端还是本地 ──
-    use_cloud = False
     cloud_model = config.get("cloud_model")
-    cloud_available = deepseek_provider.is_available()
     user_mode = config.get("user_mode", "auto")
+    cloud_available = deepseek_provider.is_available()
 
+    # ── 引擎决策（只算一次，同时用于 Prompt 选择和路由）──
+    use_cloud = False
     if not cloud_available:
         use_cloud = False
     elif user_mode == "cloud":
-        # 用户手动强制云端
         use_cloud = True
-        logger.info("双引擎 → 用户强制云端模式")
     elif user_mode == "local":
-        # 用户手动强制本地
         use_cloud = False
     elif prefer_cloud:
-        # 调用方要求优先云端（info_query 等）
         use_cloud = True
     elif config.resolve_mode(prompt) == "cloud":
-        # 关键词触发云端（新闻/天气/股票等）
         use_cloud = True
     elif _is_complex_query(prompt):
-        # 智能检测：复杂自然语言查询走云端以获得更好回复质量
         use_cloud = True
         logger.info(f"双引擎 → 智能检测复杂查询，路由云端: {prompt[:40]}...")
+
+    # ── 构建 messages（本地小模型用 few-shot 版 Prompt）──
+    def _build_messages(sys_prompt: str) -> list[dict]:
+        msg = sys_prompt
+        if memory_context:
+            msg += "\n" + memory_context
+        msgs = [{"role": "system", "content": msg}]
+        if conversation_history:
+            msgs.extend(conversation_history)
+        msgs.append({"role": "user", "content": prompt})
+        return msgs
+
+    messages = _build_messages(SYSTEM_PROMPT_CLOUD if use_cloud else SYSTEM_PROMPT_LOCAL)
 
     # ── 云端路径 ──
     if use_cloud:
@@ -596,7 +652,10 @@ async def generate_stream(
             return
         except Exception as e:
             logger.warning(f"云端失败，切回本地: {e}")
-            # 降级到本地
+            # 降级到本地：重建 messages 用本地 few-shot Prompt
+            messages = _build_messages(SYSTEM_PROMPT_LOCAL)
+            if model_used is not None:
+                model_used[-1] = f"ollama:{model}"
 
     # ── 本地路径（首 token 超时自动切云端）──
     logger.info(f"双引擎 → 本地 (model={model})")
@@ -608,6 +667,8 @@ async def generate_stream(
 
     def _fallback_to_cloud():
         """超时/失败时切云端的内联函数"""
+        nonlocal messages
+        messages = _build_messages(SYSTEM_PROMPT_CLOUD)
         if model_used is not None and len(model_used) > 0:
             model_used[-1] = f"deepseek:{config.get('cloud_model')}"
         if actions_out is not None:
@@ -688,6 +749,82 @@ async def check_model_available(model: str = DEFAULT_LOCAL_MODEL) -> bool:
 async def check_deepseek_available() -> bool:
     """检查 DeepSeek API 是否可用"""
     return await deepseek_provider.check_available()
+
+
+# ===== 本地模型输出后处理（清洗小模型常见模板残渣）=====
+
+# 小模型常见模板前缀（有实质内容时剥离）
+_TEMPLATE_PREFIXES = [
+    r'^好的[，,]\s*我?(?:来|给你|帮你|为您)?',
+    r'^明白了?[，,]\s*',
+    r'^知道了?[，,]\s*',
+    r'^收到[，,]\s*',
+    r'^嗯嗯[，,]\s*',
+    r'^哦哦[，,]\s*',
+    r'^好的呀[，,]\s*',
+]
+
+# 小模型常见困惑后缀（剥除）
+_TEMPLATE_SUFFIXES = [
+    r'需要我帮你(?:做|处理|解决).{0,10}吗[？?]?$',
+    r'还需要我帮你做什么吗[？?]?$',
+    r'你是指.{0,20}吗[？?]?$',
+]
+
+def polish_local_reply(text: str) -> str:
+    """清洗本地小模型（qwen3:8b）回复中常见的模板残渣。
+
+    只做安全清洗：有实质内容时才剥离模板前缀/后缀。
+    如果整条回复就是模板本身（无信息量），不做修改（交给 quality gate 判断）。
+    """
+    if not text or not text.strip():
+        return text
+
+    t = text.strip()
+
+    # ── 剥离模板前缀（前提：前面 15 字内是模板，且剩余内容 > 10 字）──
+    for pat in _TEMPLATE_PREFIXES:
+        m = re.match(pat, t)
+        if m:
+            remaining = t[m.end():].strip()
+            # 只有剩余内容足够长（有实质信息）才剥离
+            if len(remaining) >= 10:
+                logger.info(f"qwen3 后处理: 剥离模板前缀 '{t[:m.end()]}'")
+                t = remaining
+                break
+
+    # ── 剥离困惑后缀 ──
+    for pat in _TEMPLATE_SUFFIXES:
+        m = re.search(pat, t)
+        if m:
+            before = t[:m.start()].strip()
+            if len(before) >= 15:  # 前面有足够内容才剥离
+                logger.info(f"qwen3 后处理: 剥离困惑后缀 '{m.group()}'")
+                t = before
+                break
+
+    # ── 去除连续重复句子（"好的好的。好的好的。" → "好的。"）──
+    # 按句末标点分割，去重连续相同句子
+    sentences = re.split(r'([。！？!?，,；;])', t)
+    # sentences 现在是 [s0, punct0, s1, punct1, ...]
+    cleaned_parts = []
+    prev_sentence = ""
+    for i in range(0, len(sentences) - 1, 2):
+        s = sentences[i].strip()
+        punct = sentences[i + 1] if i + 1 < len(sentences) else ""
+        if s and s == prev_sentence:
+            continue  # 跳过重复句子
+        if s:
+            prev_sentence = s
+            cleaned_parts.append(s + punct)
+
+    # 处理最后一个没有标点的片段
+    if len(sentences) % 2 == 1 and sentences[-1].strip():
+        if sentences[-1].strip() != prev_sentence:
+            cleaned_parts.append(sentences[-1].strip())
+
+    result = ''.join(cleaned_parts).strip()
+    return result if result else t
 
 
 # 兼容旧导入名

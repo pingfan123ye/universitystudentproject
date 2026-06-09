@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # 上次 LLM 生成开始时间（供 main.py 唤醒词防抖使用）
 _last_gen_started_at: float = 0.0
 
-from services.llm_service import generate_stream, parse_actions, _strip_actions_tags, strip_search_tags
+from services.llm_service import generate_stream, parse_actions, _strip_actions_tags, strip_search_tags, polish_local_reply
 from services.music_service import send_music_control, _user_requested_music
 from services.cache_engine import get_cache, is_low_quality_reply
 
@@ -203,6 +203,14 @@ async def call_llm(
     full_reply = strip_search_tags(full_reply)
     display_reply = _strip_actions_tags(full_reply)
     actual_model = model_used[0] if model_used else "unknown"
+
+    # ★ 本地小模型后处理：清洗模板残渣（前缀/后缀/重复句）
+    if actual_model.startswith("ollama:") or actual_model.startswith("local:"):
+        polished = polish_local_reply(display_reply.strip())
+        if polished != display_reply.strip():
+            logger.info(f"本地模型输出已清洗: {display_reply.strip()[:50]}... → {polished[:50]}...")
+            display_reply = polished
+            full_reply = polished  # 同步更新，后续缓存/历史使用清洗后的版本
 
     await ws.send_json({
         "type": "done", "path": route_path,
